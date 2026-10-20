@@ -1,0 +1,48 @@
+name: Build barcodetyper APK
+
+on:
+  push:
+  workflow_dispatch: # Lets you click "Run workflow" manually in the browser
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Ensure root Gradle config exists
+        run: |
+          if [ ! -f settings.gradle ]; then
+            echo "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }" > settings.gradle
+            echo "dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }" >> settings.gradle
+            echo "rootProject.name = 'barcodetyper'" >> settings.gradle
+            echo "include ':app'" >> settings.gradle
+          fi
+          if [ ! -f build.gradle ]; then
+            echo "plugins { id 'com.android.application' version '8.3.0' apply false }" > build.gradle
+          fi
+
+      - name: Compile & Sign Debug APK
+        run: gradle assembleDebug
+
+      - name: Rename APK to barcodetyper
+        run: mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/barcodetyper.apk
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: barcodetyper
+          path: app/build/outputs/apk/debug/barcodetyper.apk
