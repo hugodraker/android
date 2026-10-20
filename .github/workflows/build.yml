@@ -25,6 +25,10 @@ jobs:
 
       - name: Ensure root Gradle config exists
         run: |
+          if [ ! -f gradle.properties ]; then
+            echo "android.useAndroidX=true" > gradle.properties
+            echo "android.enableJetifier=true" >> gradle.properties
+          fi
           if [ ! -f settings.gradle ]; then
             echo "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }" > settings.gradle
             echo "dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }" >> settings.gradle
