@@ -1,5 +1,5 @@
 /* ============================================================================
- * Clipboard Barcode Scanner 
+ * Android Barcode Typer
  *
  * Compile:
  *   Mac / Linux:
@@ -15,12 +15,12 @@
  * 
  * mkdir build\res build\gen build\apk build\obj build\dex 2>nul
  * 
- * "%BUILD_TOOLS%\aapt2.exe" compile -dir app\src\main\res -o build\res\compiled_res.zip
+ * "%BUILD_TOOLS%\aapt2.exe" compile --dir app\src\main\res -o build\res\compiled_res.zip
  * 
  * "%BUILD_TOOLS%\aapt2.exe" link build\res\compiled_res.zip ^
  *     -I "%PLATFORM%" ^
- *     -manifest app\src\main\AndroidManifest.xml ^
- *     -java build\gen ^
+ *     --manifest app\src\main\AndroidManifest.xml ^
+ *     --java build\gen ^
  *    -o build\apk\app-unaligned.apk
  * 
  * javac -d build\obj ^
@@ -30,8 +30,8 @@
  *     app\src\main\java\com\barcodetyper\*.java
  *
  * call "%BUILD_TOOLS%\d8.bat" ^
- *     -output build\dex ^
- *     -lib "%PLATFORM%" ^
+ *     --output build\dex ^
+ *     --lib "%PLATFORM%" ^
   *    build\obj\com\barcodetyper\*.class
  * 
  * cd build\dex
@@ -44,7 +44,7 @@
  *     keytool -genkeypair -v -keystore my-release-key.keystore -alias my-key-alias -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android, O=Android, C=US"
  * )
  * 
- * call "%BUILD_TOOLS%\apksigner.bat" sign -ks my-release-key.keystore -ks-pass pass:android -out build\apk\barcodetyper.apk build\apk\app-aligned.apk
+ * call "%BUILD_TOOLS%\apksigner.bat" sign --ks my-release-key.keystore --ks-pass pass:android --out build\apk\barcodetyper.apk build\apk\app-aligned.apk
  * 
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
