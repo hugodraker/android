@@ -27,15 +27,14 @@ jobs:
         run: |
           mkdir -p app/src/main/res/layout
           
-          if [ ! -f app/src/main/res/layout/activity_scanner.xml ]; then
-            cat << 'EOF' > app/src/main/res/layout/activity_scanner.xml
+          # Use cat to strictly define the XML containing btnSwitch
+          cat << 'EOF' > app/src/main/res/layout/activity_scanner.xml
           <?xml version="1.0" encoding="utf-8"?>
           <androidx.constraintlayout.widget.ConstraintLayout 
               xmlns:android="http://schemas.android.com/apk/res/android"
               xmlns:app="http://schemas.android.com/apk/res-auto"
               android:layout_width="match_parent"
               android:layout_height="match_parent">
-              
               <androidx.camera.view.PreviewView
                   android:id="@+id/viewFinder"
                   android:layout_width="match_parent"
@@ -44,7 +43,6 @@ jobs:
                   app:layout_constraintEnd_toEndOf="parent"
                   app:layout_constraintStart_toStartOf="parent"
                   app:layout_constraintTop_toTopOf="parent" />
-                  
               <Button
                   android:id="@+id/btnSwitch"
                   android:layout_width="wrap_content"
@@ -53,10 +51,8 @@ jobs:
                   app:layout_constraintBottom_toBottomOf="parent"
                   app:layout_constraintEnd_toEndOf="parent"
                   android:layout_margin="16dp" />
-                  
           </androidx.constraintlayout.widget.ConstraintLayout>
           EOF
-          fi
           
           if [ ! -f gradle.properties ]; then
             echo "android.useAndroidX=true" > gradle.properties
@@ -73,7 +69,6 @@ jobs:
           if [ ! -f build.gradle ]; then
             echo "plugins { id 'com.android.application' version '8.3.0' apply false }" > build.gradle
           fi
-
       - name: Compile & Sign Debug APK
         run: gradle assembleDebug
 
