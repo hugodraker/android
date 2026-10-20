@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.barcodetyper"> <!-- Update this line -->
+
+    <uses-feature android:name="android.hardware.camera.any" />
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <application
+        android:allowBackup="true"
+        android:label="Scan Barcode"
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+        
+        <activity
+            android:name=".ScannerActivity"
+            android:exported="true"
+            android:label="Scan Barcode">
+            
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            
+        </activity>
+    </application>
+</manifest>
