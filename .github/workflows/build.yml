@@ -28,7 +28,7 @@ jobs:
       run: mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/barcodetyper.apk
 
     - name: Upload APK artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: barcodetyper
         path: app/build/outputs/apk/debug/barcodetyper.apks
