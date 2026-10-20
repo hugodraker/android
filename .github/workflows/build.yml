@@ -26,8 +26,11 @@ jobs:
       - name: Ensure project structure and files exist
         run: |
           mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
           
-          # Use cat to strictly define the XML containing btnSwitch
+          echo '<?xml version="1.0" encoding="utf-8"?><resources><string name="app_name">Barcode Typer</string></resources>' > app/src/main/res/values/strings.xml
+
           cat << 'EOF' > app/src/main/res/layout/activity_scanner.xml
           <?xml version="1.0" encoding="utf-8"?>
           <androidx.constraintlayout.widget.ConstraintLayout 
