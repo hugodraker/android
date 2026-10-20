@@ -1,4 +1,4 @@
-package package com.barcodetyper;
+package com.barcodetyper;
 
 import java.util.Arrays;
 

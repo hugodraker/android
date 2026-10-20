@@ -1,4 +1,4 @@
-package package com.barcodetyper;
+package com.barcodetyper;
 
 public class PDF417Matcher {
     public static int matchCodewordRuns(float[] r8, float expectedW, int cluster, float[] outErr) {

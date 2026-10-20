@@ -1,4 +1,4 @@
-package package com.barcodetyper;
+package com.barcodetyper;
 
 public class UnifiedScanner {
     public static String scan(byte[] yPlane, int w, int h, int rowStride) {
