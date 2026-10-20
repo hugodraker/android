@@ -1,6 +1,7 @@
 package com.barcodetyper;
 
 public class PDF417Data {
+public class PDF417Data {
         public static final int[][] CLUSTERS = {
         { // Cluster 0
             0x1d5c0, 0x1eaf0, 0x1f57c, 0x1d4e0, 0x1ea78, 0x1f53e, 0x1a8c0, 0x1d470, 0x1a860, 0x15040, 0x1a830, 0x15020, 
@@ -244,7 +245,6 @@ public class PDF417Data {
             0x10792, 0x10fb2, 0x1c7ea
         }
     };
-
 
     public static final byte[][][] pdfRuns = new byte[3][929][8];
     public static final byte[][][] pdfT = new byte[3][929][7];
