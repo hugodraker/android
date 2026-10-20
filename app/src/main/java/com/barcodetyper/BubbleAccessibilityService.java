@@ -230,6 +230,32 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
         }, ContextCompat.getMainExecutor(this));
     }
 
+    private byte[] rotateYPlane(byte[] source, int width, int height, int rotationDegrees) {
+        if (rotationDegrees == 0) return source;
+        byte[] rotated = new byte[source.length];
+        
+        if (rotationDegrees == 90) {
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    rotated[x * height + (height - 1 - y)] = source[y * width + x];
+                }
+            }
+        } else if (rotationDegrees == 180) {
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    rotated[(height - 1 - y) * width + (width - 1 - x)] = source[y * width + x];
+                }
+            }
+        } else if (rotationDegrees == 270) {
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    rotated[(width - 1 - x) * height + y] = source[y * width + x];
+                }
+            }
+        }
+        return rotated;
+    }
+
     private void bindCameraUseCases() {
         if (cameraProvider == null) return;
         Preview preview = new Preview.Builder().build();
@@ -249,13 +275,21 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
             int rowStride = image.getPlanes()[0].getRowStride();
             int pixelStride = image.getPlanes()[0].getPixelStride();
 
-            // Extract ONLY the exact cropped bytes matching the zoom ratio
+            // Extract ONLY the exact cropped bytes
             for (int row = 0; row < cropHeight; row++) {
                 yBuffer.position((cropRect.top + row) * rowStride + cropRect.left * pixelStride);
                 yBuffer.get(croppedYPlane, row * cropWidth, cropWidth);
             }
 
-            String result = UnifiedScanner.scan(croppedYPlane, cropWidth, cropHeight, cropWidth);
+            // Rotate the byte array based on the device's sensor orientation
+            int rotation = image.getImageInfo().getRotationDegrees();
+            byte[] finalYPlane = rotateYPlane(croppedYPlane, cropWidth, cropHeight, rotation);
+            
+            // Swap width and height for the scanner if rotated 90 or 270 degrees
+            int finalWidth = (rotation == 90 || rotation == 270) ? cropHeight : cropWidth;
+            int finalHeight = (rotation == 90 || rotation == 270) ? cropWidth : cropHeight;
+
+            String result = UnifiedScanner.scan(finalYPlane, finalWidth, finalHeight, finalWidth);
             if (result != null) {
                 new Handler(Looper.getMainLooper()).post(() -> {
                     closeScannerOverlay();
@@ -269,6 +303,7 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
         cameraProvider.unbindAll();
         camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
 
+        // --- Zoom Touch Handling ---
         GestureDetector gestureDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override
             public boolean onSingleTapConfirmed(MotionEvent e) {
