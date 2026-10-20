@@ -19,8 +19,6 @@
             </intent-filter>
         </activity>
 
-        <activity android:name=".ScannerActivity" android:exported="true" />
-
         <service
             android:name=".BubbleAccessibilityService"
             android:exported="true"
