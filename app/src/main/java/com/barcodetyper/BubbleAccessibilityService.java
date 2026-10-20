@@ -57,6 +57,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -68,6 +69,7 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 
 import androidx.annotation.NonNull;
+import androidx.camera.core.Camera;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.Preview;
@@ -179,6 +181,9 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
             scannerOverlay.setPadding(10, 10, 10, 10);
 
             viewFinder = new PreviewView(this);
+            // Crucial fix: Forces TextureView rendering which works properly in WindowManager overlays
+            viewFinder.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE);
+
             FrameLayout.LayoutParams previewParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
             previewParams.bottomMargin = 140; 
@@ -260,7 +265,40 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
 
         CameraSelector cameraSelector = new CameraSelector.Builder().requireLensFacing(lensFacing).build();
         cameraProvider.unbindAll();
-        cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
+        Camera camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
+
+        // --- Zoom Touch Handling ---
+        GestureDetector gestureDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+            @Override
+            public boolean onSingleTapConfirmed(MotionEvent e) {
+                if (camera.getCameraInfo().getZoomState().getValue() != null) {
+                    float currentZoom = camera.getCameraInfo().getZoomState().getValue().getZoomRatio();
+                    float maxZoom = camera.getCameraInfo().getZoomState().getValue().getMaxZoomRatio();
+                    float minZoom = camera.getCameraInfo().getZoomState().getValue().getMinZoomRatio();
+
+                    float newZoom = currentZoom + 1.5f; 
+                    if (newZoom >= maxZoom) {
+                        newZoom = minZoom;
+                    }
+                    camera.getCameraControl().setZoomRatio(newZoom);
+                }
+                return true;
+            }
+
+            @Override
+            public boolean onDoubleTap(MotionEvent e) {
+                if (camera.getCameraInfo().getZoomState().getValue() != null) {
+                    float minZoom = camera.getCameraInfo().getZoomState().getValue().getMinZoomRatio();
+                    camera.getCameraControl().setZoomRatio(minZoom);
+                }
+                return true;
+            }
+        });
+
+        viewFinder.setOnTouchListener((v, event) -> {
+            gestureDetector.onTouchEvent(event);
+            return true;
+        });
     }
 
     private void closeScannerOverlay() {
