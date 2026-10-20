@@ -8,50 +8,15 @@
  *   Windows:
  *   gradlew.bat assembleDebug
  *
- * @echo off
- * set "SDK=%LOCALAPPDATA%\Android\Sdk"
- * set "BUILD_TOOLS=%SDK%\build-tools\34.0.0"
- * set "PLATFORM=%SDK%\platforms\android-34\android.jar"
- * 
- * mkdir build\res build\gen build\apk build\obj build\dex 2>nul
- * 
- * "%BUILD_TOOLS%\aapt2.exe" compile --dir app\src\main\res -o build\res\compiled_res.zip
- * 
- * "%BUILD_TOOLS%\aapt2.exe" link build\res\compiled_res.zip ^
- *     -I "%PLATFORM%" ^
- *     --manifest app\src\main\AndroidManifest.xml ^
- *     --java build\gen ^
- *    -o build\apk\app-unaligned.apk
- * 
- * javac -d build\obj ^
- *     -cp "%PLATFORM%" ^
- *     -source 17 -target 17 ^
- *     build\gen\com\barcodetyper\R.java ^
- *     app\src\main\java\com\barcodetyper\*.java
- *
- * call "%BUILD_TOOLS%\d8.bat" ^
- *     --output build\dex ^
- *     --lib "%PLATFORM%" ^
-  *    build\obj\com\barcodetyper\*.class
- * 
- * cd build\dex
- * jar uf ..\apk\app-unaligned.apk classes.dex
- * cd ..\..
- * 
- * "%BUILD_TOOLS%\zipalign.exe" -p -f 4 build\apk\app-unaligned.apk build\apk\app-aligned.apk
- * 
- * if not exist my-release-key.keystore (
- *     keytool -genkeypair -v -keystore my-release-key.keystore -alias my-key-alias -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android, O=Android, C=US"
- * )
- * 
- * call "%BUILD_TOOLS%\apksigner.bat" sign --ks my-release-key.keystore --ks-pass pass:android --out build\apk\barcodetyper.apk build\apk\app-aligned.apk
- * 
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
 package com.barcodetyper;
 
+import android.Manifest;
 import android.accessibilityservice.AccessibilityService;
+import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -67,6 +32,7 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 
 import androidx.annotation.NonNull;
 import androidx.camera.core.Camera;
@@ -95,6 +61,7 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
     private LifecycleRegistry lifecycleRegistry;
     private ExecutorService cameraExecutor;
     private ProcessCameraProvider cameraProvider;
+    private Camera camera;
     private int lensFacing = CameraSelector.LENS_FACING_BACK;
     private PreviewView viewFinder;
 
@@ -159,7 +126,7 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
                         windowManager.updateViewLayout(bubbleView, bubbleParams);
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (isClick) openScannerOverlay();
+                        if (isClick) checkPermissionsAndOpenScanner();
                         return true;
                 }
                 return false;
@@ -167,6 +134,16 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
         });
 
         windowManager.addView(bubbleView, bubbleParams);
+    }
+
+    private void checkPermissionsAndOpenScanner() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            Intent intent = new Intent(this, SetupActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } else {
+            openScannerOverlay();
+        }
     }
 
     private void openScannerOverlay() {
@@ -181,23 +158,29 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
             scannerOverlay.setPadding(10, 10, 10, 10);
 
             viewFinder = new PreviewView(this);
-            // Crucial fix: Forces TextureView rendering which works properly in WindowManager overlays
             viewFinder.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE);
 
             FrameLayout.LayoutParams previewParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-            previewParams.bottomMargin = 140; 
+            previewParams.bottomMargin = 160; 
             scannerOverlay.addView(viewFinder, previewParams);
+
+            LinearLayout buttonLayout = new LinearLayout(this);
+            buttonLayout.setOrientation(LinearLayout.HORIZONTAL);
+            buttonLayout.setGravity(Gravity.CENTER);
 
             Button btnClose = new Button(this);
             btnClose.setText("Close");
             btnClose.setOnClickListener(v -> closeScannerOverlay());
-            FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            closeParams.gravity = Gravity.BOTTOM | Gravity.START;
-            closeParams.bottomMargin = 20;
-            closeParams.leftMargin = 30;
-            scannerOverlay.addView(btnClose, closeParams);
+            
+            Button btnFlash = new Button(this);
+            btnFlash.setText("Torch");
+            btnFlash.setOnClickListener(v -> {
+                if (camera != null && camera.getCameraInfo().hasFlashUnit()) {
+                    boolean isTorchOn = camera.getCameraInfo().getTorchState().getValue() == androidx.camera.core.TorchState.ON;
+                    camera.getCameraControl().enableTorch(!isTorchOn);
+                }
+            });
             
             Button btnSwitch = new Button(this);
             btnSwitch.setText("Flip");
@@ -206,12 +189,20 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
                     ? CameraSelector.LENS_FACING_FRONT : CameraSelector.LENS_FACING_BACK;
                 bindCameraUseCases();
             });
-            FrameLayout.LayoutParams switchParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            switchParams.gravity = Gravity.BOTTOM | Gravity.END;
-            switchParams.bottomMargin = 20;
-            switchParams.rightMargin = 30;
-            scannerOverlay.addView(btnSwitch, switchParams);
+
+            LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+            btnParams.setMargins(10, 0, 10, 0);
+
+            buttonLayout.addView(btnClose, btnParams);
+            buttonLayout.addView(btnFlash, btnParams);
+            buttonLayout.addView(btnSwitch, btnParams);
+
+            FrameLayout.LayoutParams layoutParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            layoutParams.gravity = Gravity.BOTTOM;
+            layoutParams.bottomMargin = 20;
+            scannerOverlay.addView(buttonLayout, layoutParams);
         }
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
@@ -249,11 +240,22 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
                 .build();
 
         imageAnalysis.setAnalyzer(cameraExecutor, image -> {
-            ByteBuffer yBuffer = image.getPlanes()[0].getBuffer();
-            byte[] yPlane = new byte[yBuffer.remaining()];
-            yBuffer.get(yPlane);
+            android.graphics.Rect cropRect = image.getCropRect();
+            int cropWidth = cropRect.width();
+            int cropHeight = cropRect.height();
+            byte[] croppedYPlane = new byte[cropWidth * cropHeight];
 
-            String result = UnifiedScanner.scan(yPlane, image.getWidth(), image.getHeight(), image.getPlanes()[0].getRowStride());
+            ByteBuffer yBuffer = image.getPlanes()[0].getBuffer();
+            int rowStride = image.getPlanes()[0].getRowStride();
+            int pixelStride = image.getPlanes()[0].getPixelStride();
+
+            // Extract ONLY the exact cropped bytes matching the zoom ratio
+            for (int row = 0; row < cropHeight; row++) {
+                yBuffer.position((cropRect.top + row) * rowStride + cropRect.left * pixelStride);
+                yBuffer.get(croppedYPlane, row * cropWidth, cropWidth);
+            }
+
+            String result = UnifiedScanner.scan(croppedYPlane, cropWidth, cropHeight, cropWidth);
             if (result != null) {
                 new Handler(Looper.getMainLooper()).post(() -> {
                     closeScannerOverlay();
@@ -265,13 +267,12 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
 
         CameraSelector cameraSelector = new CameraSelector.Builder().requireLensFacing(lensFacing).build();
         cameraProvider.unbindAll();
-        Camera camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
+        camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
 
-        // --- Zoom Touch Handling ---
         GestureDetector gestureDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override
             public boolean onSingleTapConfirmed(MotionEvent e) {
-                if (camera.getCameraInfo().getZoomState().getValue() != null) {
+                if (camera != null && camera.getCameraInfo().getZoomState().getValue() != null) {
                     float currentZoom = camera.getCameraInfo().getZoomState().getValue().getZoomRatio();
                     float maxZoom = camera.getCameraInfo().getZoomState().getValue().getMaxZoomRatio();
                     float minZoom = camera.getCameraInfo().getZoomState().getValue().getMinZoomRatio();
@@ -287,7 +288,7 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
 
             @Override
             public boolean onDoubleTap(MotionEvent e) {
-                if (camera.getCameraInfo().getZoomState().getValue() != null) {
+                if (camera != null && camera.getCameraInfo().getZoomState().getValue() != null) {
                     float minZoom = camera.getCameraInfo().getZoomState().getValue().getMinZoomRatio();
                     camera.getCameraControl().setZoomRatio(minZoom);
                 }
