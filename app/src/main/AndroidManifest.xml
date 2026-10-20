@@ -1,33 +1,87 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- ============================================================================
+  Clipboard Barcode Scanner 
+ 
+  Compile:
+    Mac / Linux:
+    ./gradlew assembleDebug
+    
+    Windows:
+    gradlew.bat assembleDebug
+ 
+  @echo off
+  set "SDK=%LOCALAPPDATA%\Android\Sdk"
+  set "BUILD_TOOLS=%SDK%\build-tools\34.0.0"
+  set "PLATFORM=%SDK%\platforms\android-34\android.jar"
+  
+  mkdir build\res build\gen build\apk build\obj build\dex 2>nul
+  
+  "%BUILD_TOOLS%\aapt2.exe" compile --dir app\src\main\res -o build\res\compiled_res.zip
+  
+  "%BUILD_TOOLS%\aapt2.exe" link build\res\compiled_res.zip ^
+      -I "%PLATFORM%" ^
+      --manifest app\src\main\AndroidManifest.xml ^
+      --java build\gen ^
+     -o build\apk\app-unaligned.apk
+  
+  javac -d build\obj ^
+      -cp "%PLATFORM%" ^
+      -source 17 -target 17 ^
+      build\gen\com\barcodetyper\R.java ^
+      app\src\main\java\com\barcodetyper\*.java
+ 
+  call "%BUILD_TOOLS%\d8.bat" ^
+      --output build\dex ^
+      --lib "%PLATFORM%" ^
+      build\obj\com\barcodetyper\*.class
+  
+  cd build\dex
+  jar uf ..\apk\app-unaligned.apk classes.dex
+  cd ..\..
+  
+  "%BUILD_TOOLS%\zipalign.exe" -p -f 4 build\apk\app-unaligned.apk build\apk\app-aligned.apk
+  
+  if not exist my-release-key.keystore (
+      keytool -genkeypair -v -keystore my-release-key.keystore -alias my-key-alias -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android, O=Android, C=US"
+  )
+  
+  call "%BUILD_TOOLS%\apksigner.bat" sign --ks my-release-key.keystore --ks-pass pass:android --out build\apk\barcodetyper.apk build\apk\app-aligned.apk
+  
+  THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+  AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
+  ============================================================================ -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.barcodetyper">
 
-    <uses-feature android:name="android.hardware.camera.any" />
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:allowBackup="true"
-        android:label="Scan Barcode"
+        android:label="Barcode Typer"
+        android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
-        
-        <activity
-            android:name=".ScannerActivity"
-            android:exported="true"
-            android:label="Scan Barcode">
-            
-            <!-- Standard App Launcher (for Clipboard Copying) -->
+
+        <activity android:name=".SetupActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            
-            <!-- Text Selection Context Menu Injector -->
-            <intent-filter>
-                <action android:name="android.intent.action.PROCESS_TEXT" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
-            </intent-filter>
-            
         </activity>
+
+        <activity android:name=".ScannerActivity" android:exported="true" />
+
+        <service
+            android:name=".BubbleAccessibilityService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
     </application>
 </manifest>
