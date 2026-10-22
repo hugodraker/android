@@ -29,6 +29,9 @@ jobs:
           mkdir -p app/src/main/res/xml
           mkdir -p app/src/main/res/values
           
+          # DELETE LEFTOVER MODERN LAYOUTS
+          rm -f app/src/main/res/layout/activity_scanner.xml
+          
           echo '<?xml version="1.0" encoding="utf-8"?><resources><string name="app_name">Barcode Typer Keyboard</string></resources>' > app/src/main/res/values/strings.xml
           
           # Create method.xml (Registers the Input Method)
