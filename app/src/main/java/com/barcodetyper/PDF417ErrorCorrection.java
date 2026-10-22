@@ -1,5 +1,6 @@
 package com.barcodetyper;
 
+
 import java.util.Arrays;
 
 public class PDF417ErrorCorrection {
