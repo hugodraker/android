@@ -1,5 +1,13 @@
 /* ============================================================================
  * Android Barcode Typer
+ *
+ * Compile:
+ *   Mac / Linux:
+ *   ./gradlew assembleDebug
+ *   
+ *   Windows:
+ *   gradlew.bat assembleDebug
+ *
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
@@ -78,7 +86,8 @@ public class DataMatrixScanner {
             if (d == 0) {
                 m++;
             } else if (2 * L <= n) {
-                int[] T = java.util.Arrays.copyOf(C, 128);
+                int[] T = new int[128];
+                System.arraycopy(C, 0, T, 0, 128);
                 int coef = dmMul(d, dmInv(b));
                 for (int i = m; i < 128; i++) C[i] ^= dmMul(coef, B[i - m]);
                 L = n + 1 - L;
@@ -175,7 +184,7 @@ public class DataMatrixScanner {
     }
 
     private static void buildUtahPlacementMap(int[] map, int nrow, int ncol, int wrapOff) {
-        java.util.Arrays.fill(map, 0, nrow * ncol, -1);
+        for (int i = 0; i < nrow * ncol; i++) map[i] = -1;
         int cw = 0, r = 4, c = 0;
         while (r < nrow || c < ncol) {
             if (r == nrow && c == 0) {
@@ -358,7 +367,8 @@ public class DataMatrixScanner {
         int[] placeMap = new int[64 * 64];
         byte[] grid = new byte[64 * 64];
 
-        for (DMSymbolInfo sym : DM_SYMBOLS) {
+        for (int s = 0; s < DM_SYMBOLS.length; s++) {
+            DMSymbolInfo sym = DM_SYMBOLS[s];
             int srCnt = sym.symR, scCnt = sym.symC;
             float aspectBox = (float) bw / (float) bh;
 
@@ -400,7 +410,8 @@ public class DataMatrixScanner {
                 int subR = nrow / regR, subC = ncol / regC;
 
                 final int[] wrapOffsets = { 3, 4 };
-                for (int wrapOff : wrapOffsets) {
+                for (int wo = 0; wo < wrapOffsets.length; wo++) {
+                    int wrapOff = wrapOffsets[wo];
                     buildUtahPlacementMap(placeMap, nrow, ncol, wrapOff);
                     int[] cw = new int[512];
 
@@ -425,4 +436,185 @@ public class DataMatrixScanner {
         return null;
     }
 
-    private static
+    private static String tryDecodeQuadBox(byte[] bin, int w, int h, int[] outer) {
+        int bw = outer[2] - outer[0] + 1;
+        int bh = outer[3] - outer[1] + 1;
+        if (bw < 22 || bh < 22) return null;
+        float aspect = (float) bw / (float) bh;
+        if (aspect < 0.75f || aspect > 1.33f) return null;
+
+        int midX = (outer[0] + outer[2]) / 2;
+        int midY = (outer[1] + outer[3]) / 2;
+        int searchX = Math.max(2, bw / 8);
+        int searchY = Math.max(2, bh / 8);
+
+        int bestVx = midX, minVSum = 999999;
+        for (int x = midX - searchX; x <= midX + searchX; x++) {
+            int sum = 0;
+            for (int y = outer[1]; y <= outer[3]; y++) sum += bin[y * w + x];
+            if (sum < minVSum || (sum == minVSum && Math.abs(x - midX) < Math.abs(bestVx - midX))) {
+                minVSum = sum;
+                bestVx = x;
+            }
+        }
+
+        int bestHy = midY, minHSum = 999999;
+        for (int y = midY - searchY; y <= midY + searchY; y++) {
+            int sum = 0;
+            int row = y * w;
+            for (int x = outer[0]; x <= outer[2]; x++) sum += bin[row + x];
+            if (sum < minHSum || (sum == minHSum && Math.abs(y - midY) < Math.abs(bestHy - midY))) {
+                minHSum = sum;
+                bestHy = y;
+            }
+        }
+
+        if (minVSum > bh / 6 || minHSum > bw / 6) return null;
+
+        int[][] qRaw = {
+            { outer[0],    outer[1],    bestVx - 1, bestHy - 1 },
+            { bestVx + 1,  outer[1],    outer[2],   bestHy - 1 },
+            { outer[0],    bestHy + 1,  bestVx - 1, outer[3] },
+            { bestVx + 1,  bestHy + 1,  outer[2],   outer[3] }
+        };
+
+        StringBuilder sb = new StringBuilder();
+        int[] qTight = new int[4];
+        for (int q = 0; q < 4; q++) {
+            if (!tightenBinaryBox(bin, w, h, qRaw[q], qTight)) return null;
+            String chunk = tryDecodeCandidateBoxEx(bin, w, h, qTight, q > 0);
+            if (chunk == null) return null;
+            sb.append(chunk);
+        }
+        return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    public static String scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
+        int scale = (w > 960) ? (w / 720) : 1;
+        if (scale < 1) scale = 1;
+        int sw = w / scale, sh = h / scale;
+
+        byte[] gray = new byte[sw * sh];
+        int[] integ = new int[(sw + 1) * (sh + 1)];
+        byte[] bin  = new byte[sw * sh];
+        byte[] vis  = new byte[sw * sh];
+
+        int minG = 255, maxG = 0;
+        for (int y = 0; y < sh; y++) {
+            int rowSum = 0;
+            int srcRow = (y * scale) * rowStride;
+            int dstRow = y * sw;
+            int integRow = (y + 1) * (sw + 1);
+            int prevIntegRow = y * (sw + 1);
+
+            for (int x = 0; x < sw; x++) {
+                int g = yPlane[srcRow + (x * scale)] & 0xFF;
+                gray[dstRow + x] = (byte) g;
+                if (g < minG) minG = g;
+                if (g > maxG) maxG = g;
+                rowSum += g;
+                integ[integRow + (x + 1)] = integ[prevIntegRow + (x + 1)] + rowSum;
+            }
+        }
+
+        int globalMid = (minG + maxG) / 2;
+        int rad = Math.max(16, Math.min(sw, sh) / 6);
+        int gMinX = sw, gMinY = sh, gMaxX = -1, gMaxY = -1;
+
+        for (int y = 0; y < sh; y++) {
+            int y0 = Math.max(0, y - rad), y1 = Math.min(sh - 1, y + rad);
+            int row = y * sw;
+            for (int x = 0; x < sw; x++) {
+                int x0 = Math.max(0, x - rad), x1 = Math.min(sw - 1, x + rad);
+                int area = (x1 - x0 + 1) * (y1 - y0 + 1);
+                int sum = integ[(y1 + 1) * (sw + 1) + (x1 + 1)]
+                        - integ[y0 * (sw + 1) + (x1 + 1)]
+                        - integ[(y1 + 1) * (sw + 1) + x0]
+                        + integ[y0 * (sw + 1) + x0];
+                int localMean = sum / area;
+                int thr = (localMean + globalMid) / 2 - 6;
+
+                if ((gray[row + x] & 0xFF) < thr) {
+                    bin[row + x] = 1;
+                    if (x < gMinX) gMinX = x; if (x > gMaxX) gMaxX = x;
+                    if (y < gMinY) gMinY = y; if (y > gMaxY) gMaxY = y;
+                }
+            }
+        }
+
+        if (gMaxX > gMinX + 20 && gMaxY > gMinY + 20) {
+            int[] gRc = { gMinX, gMinY, gMaxX, gMaxY };
+            String quadResult = tryDecodeQuadBox(bin, sw, sh, gRc);
+            if (quadResult != null) return quadResult;
+        }
+
+        int[][] cands = new int[32][4];
+        int numCands = 0;
+        if (gMaxX > gMinX + 8 && gMaxY > gMinY + 8) {
+            cands[numCands++] = new int[]{ gMinX, gMinY, gMaxX, gMaxY };
+        }
+
+        int[] qx = new int[sw * sh];
+        int[] qy = new int[sw * sh];
+
+        for (int y = 1; y < sh - 1; y++) {
+            int row = y * sw;
+            for (int x = 1; x < sw - 1; x++) {
+                if (bin[row + x] != 0 && vis[row + x] == 0) {
+                    int head = 0, tail = 0;
+                    qx[tail] = x; qy[tail] = y; tail++;
+                    vis[row + x] = 1;
+                    int minX = x, maxX = x, minY = y, maxY = y;
+
+                    while (head < tail) {
+                        int cx = qx[head];
+                        int cy = qy[head++];
+                        if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
+                        if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+
+                        for (int dy = -2; dy <= 2; dy++) {
+                            for (int dx = -2; dx <= 2; dx++) {
+                                int nx = cx + dx, ny = cy + dy;
+                                if (nx >= 0 && nx < sw && ny >= 0 && ny < sh) {
+                                    int nPos = ny * sw + nx;
+                                    if (bin[nPos] != 0 && vis[nPos] == 0) {
+                                        vis[nPos] = 1;
+                                        qx[tail] = nx;
+                                        qy[tail] = ny;
+                                        tail++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    int bw = maxX - minX + 1, bh = maxY - minY + 1;
+                    if (bw >= 10 && bh >= 10 && tail >= 25) {
+                        if (numCands < 32) {
+                            cands[numCands++] = new int[]{ minX, minY, maxX, maxY };
+                        } else {
+                            int minIdx = 1, minArea = 9999999;
+                            for (int k = 1; k < 32; k++) {
+                                int a = (cands[k][2] - cands[k][0]) * (cands[k][3] - cands[k][1]);
+                                if (a < minArea) { minArea = a; minIdx = k; }
+                            }
+                            if (bw * bh > minArea) {
+                                cands[minIdx] = new int[]{ minX, minY, maxX, maxY };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < numCands; i++) {
+            String res = tryDecodeQuadBox(bin, sw, sh, cands[i]);
+            if (res == null) {
+                res = tryDecodeCandidateBoxEx(bin, sw, sh, cands[i], false);
+            }
+            if (res != null) return res;
+        }
+
+        return null;
+    }
+}
