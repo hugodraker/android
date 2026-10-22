@@ -84,7 +84,7 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
         
         GradientDrawable shape = new GradientDrawable();
         shape.setShape(GradientDrawable.OVAL);
-        shape.setColor(0xBB000000); 
+        shape.setColor(0xAA808080); // Transparent Gray
         shape.setStroke(4, 0xFFFFFFFF); 
         btn.setBackground(shape);
 
@@ -275,17 +275,14 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
             int rowStride = image.getPlanes()[0].getRowStride();
             int pixelStride = image.getPlanes()[0].getPixelStride();
 
-            // Extract ONLY the exact cropped bytes
             for (int row = 0; row < cropHeight; row++) {
                 yBuffer.position((cropRect.top + row) * rowStride + cropRect.left * pixelStride);
                 yBuffer.get(croppedYPlane, row * cropWidth, cropWidth);
             }
 
-            // Rotate the byte array based on the device's sensor orientation
             int rotation = image.getImageInfo().getRotationDegrees();
             byte[] finalYPlane = rotateYPlane(croppedYPlane, cropWidth, cropHeight, rotation);
             
-            // Swap width and height for the scanner if rotated 90 or 270 degrees
             int finalWidth = (rotation == 90 || rotation == 270) ? cropHeight : cropWidth;
             int finalHeight = (rotation == 90 || rotation == 270) ? cropWidth : cropHeight;
 
@@ -303,7 +300,6 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
         cameraProvider.unbindAll();
         camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
 
-        // --- Zoom Touch Handling ---
         GestureDetector gestureDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override
             public boolean onSingleTapConfirmed(MotionEvent e) {
