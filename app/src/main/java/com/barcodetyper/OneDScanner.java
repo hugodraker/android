@@ -1,7 +1,6 @@
 package com.barcodetyper;
 
-public class OneDScanner {
-    public static String scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
+public class OneDScanner {public static String scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
         int step = Math.max(1, h / 32);
         int[] lineGray = new int[w];
         float[] slopes = {0.0f, 0.176f, -0.176f};
@@ -20,60 +19,63 @@ public class OneDScanner {
     }
 
     private static String scanLineRobust(int[] grayPixels, int length) {
-        if (length < 60) return null;
-        int[] smooth = new int[length];
-        for (int x = 0; x < length; x++) {
-            smooth[x] = (x == 0 || x == length - 1) ? grayPixels[x] : (grayPixels[x-1] + grayPixels[x]*2 + grayPixels[x+1]) / 4;
-        }
-
-        int window = Math.max(5, length / 15);
-        int[] thresh = new int[length];
-        long sum = 0;
-        for (int x = 0; x < window && x < length; x++) sum += smooth[x];
-        for (int x = 0; x < length; x++) {
-            thresh[x] = (int)(sum / window);
-            int left = x - window / 2, right = x + window / 2 + 1;
-            sum += (right < length ? smooth[right] : smooth[length-1]) - (left >= 0 ? smooth[left] : smooth[0]);
-        }
-
-        float[] runs = new float[length];
-        int numRuns = 0, firstColor = -1, currentVal = -1;
-        float lastCrossX = 0.0f;
-
-        for (int x = 0; x < length; x++) {
-            float diffCurr = (float)smooth[x] - (float)(thresh[x] - 5);
-            int val = (diffCurr < 0.0f) ? 1 : 0;
-
-            if (firstColor == -1) firstColor = val;
-            if (currentVal == -1) currentVal = val;
-
-            if (val != currentVal && x > 0) {
-                float diffPrev = (float)smooth[x-1] - (float)(thresh[x-1] - 5);
-                float denom = diffPrev - diffCurr;
-                float frac = (Math.abs(denom) > 0.001f) ? (diffPrev / denom) : 0.5f;
-                runs[numRuns++] = ((float)(x - 1) + Math.max(0.0f, Math.min(1.0f, frac))) - lastCrossX;
-                lastCrossX = (float)(x - 1) + Math.max(0.0f, Math.min(1.0f, frac));
-                currentVal = val;
-            }
-        }
-
-        for (int i = 0; i <= numRuns - 59; i++) {
-            if ((firstColor + i) % 2 != 1) continue;
-            float qzLeft = (i > 0) ? runs[i - 1] : 999.0f;
-            float qzRight = (i + 59 < numRuns) ? runs[i + 59] : 999.0f;
-            
-            float[] r59 = new float[59];
-            System.arraycopy(runs, i, r59, 0, 59);
-            
-            String code = tryDecodeSequence(r59, qzLeft, qzRight, true);
-            if (code != null) return code;
-            code = tryDecodeSequence(r59, qzLeft, qzRight, false);
-            if (code != null) return code;
-        }
-        return null;
+    if (length < 60) return null;
+    int[] smooth = new int[length];
+    for (int x = 0; x < length; x++) {
+        smooth[x] = (x == 0 || x == length - 1) ? grayPixels[x] : (grayPixels[x-1] + grayPixels[x]*2 + grayPixels[x+1]) / 4;
     }
 
-    private static String tryDecodeSequence(float[] r, float qzLeft, float qzRight, boolean forward) {
+    int window = Math.max(5, length / 15);
+    int[] thresh = new int[length];
+    long sum = 0;
+    int half = window / 2;
+    for (int i = -half; i <= half; i++) {
+        sum += (i >= 0 && i < length) ? smooth[i] : smooth[0];
+    }
+    for (int x = 0; x < length; x++) {
+        thresh[x] = (int)(sum / (half * 2 + 1));
+        int left = x - half;
+        int right = x + half + 1;
+        sum += (right < length ? smooth[right] : smooth[length-1]) - (left >= 0 ? smooth[left] : smooth[0]);
+    }
+
+    float[] runs = new float[length];
+    int numRuns = 0, firstColor = -1, currentVal = -1;
+    float lastCrossX = 0.0f;
+
+    for (int x = 0; x < length; x++) {
+        float diffCurr = (float)smooth[x] - (float)(thresh[x] - 5);
+        int val = (diffCurr < 0.0f) ? 1 : 0;
+
+        if (firstColor == -1) firstColor = val;
+        if (currentVal == -1) currentVal = val;
+
+        if (val != currentVal && x > 0) {
+            float diffPrev = (float)smooth[x-1] - (float)(thresh[x-1] - 5);
+            float denom = diffPrev - diffCurr;
+            float frac = (Math.abs(denom) > 0.001f) ? (diffPrev / denom) : 0.5f;
+            runs[numRuns++] = ((float)(x - 1) + Math.max(0.0f, Math.min(1.0f, frac))) - lastCrossX;
+            lastCrossX = (float)(x - 1) + Math.max(0.0f, Math.min(1.0f, frac));
+            currentVal = val;
+        }
+    }
+
+    for (int i = 0; i <= numRuns - 59; i++) {
+        if ((firstColor + i) % 2 != 1) continue;
+        float qzLeft = (i > 0) ? runs[i - 1] : 999.0f;
+        float qzRight = (i + 59 < numRuns) ? runs[i + 59] : 999.0f;
+        
+        float[] r59 = new float[59];
+        System.arraycopy(runs, i, r59, 0, 59);
+        
+        String code = tryDecodeSequence(r59, qzLeft, qzRight, true);
+        if (code != null) return code;
+        code = tryDecodeSequence(r59, qzLeft, qzRight, false);
+        if (code != null) return code;
+    }
+    return null;
+}
+private static String tryDecodeSequence(float[] r, float qzLeft, float qzRight, boolean forward) {
         float[] runs = new float[59];
         for (int k = 0; k < 59; k++) runs[k] = forward ? r[k] : r[58 - k];
 

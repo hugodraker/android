@@ -5,9 +5,7 @@
  * ============================================================================ */
 package com.barcodetyper;
 
-public class QRScanner {
-
-    private static final int[] expTable = new int[512];
+public class QRScanner {private static final int[] expTable = new int[512];
     private static final int[] logTable = new int[256];
     private static boolean gfInit = false;
 
@@ -190,190 +188,199 @@ public class QRScanner {
     }
 
     public static String scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
-        byte[] bin = new byte[w * h];
-        int rad = Math.max(12, Math.min(w, h) / 8);
-        int[] intImg = new int[(w + 1) * (h + 1)];
+    byte[] bin = new byte[w * h];
+    int rad = Math.max(12, Math.min(w, h) / 8);
+    int[] intImg = new int[(w + 1) * (h + 1)];
 
-        for (int y = 0; y < h; y++) {
-            int rowSum = 0;
-            int srcRow = y * rowStride;
-            for (int x = 0; x < w; x++) {
-                int g = yPlane[srcRow + x] & 0xFF;
-                rowSum += g;
-                intImg[(y + 1) * (w + 1) + (x + 1)] = intImg[y * (w + 1) + (x + 1)] + rowSum;
+    for (int y = 0; y < h; y++) {
+        int rowSum = 0;
+        int srcRow = y * rowStride;
+        for (int x = 0; x < w; x++) {
+            int g = yPlane[srcRow + x] & 0xFF;
+            rowSum += g;
+            intImg[(y + 1) * (w + 1) + (x + 1)] = intImg[y * (w + 1) + (x + 1)] + rowSum;
+        }
+    }
+
+    for (int y = 0; y < h; y++) {
+        int y0 = Math.max(0, y - rad), y1 = Math.min(h - 1, y + rad);
+        int row = y * w;
+        for (int x = 0; x < w; x++) {
+            int x0 = Math.max(0, x - rad), x1 = Math.min(w - 1, x + rad);
+            int area = (x1 - x0 + 1) * (y1 - y0 + 1);
+            int sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
+                    - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
+            if ((yPlane[y * rowStride + x] & 0xFF) < (sum / area) - 5) {
+                bin[row + x] = 1;
             }
         }
+    }
 
-        for (int y = 0; y < h; y++) {
-            int y0 = Math.max(0, y - rad), y1 = Math.min(h - 1, y + rad);
-            int row = y * w;
-            for (int x = 0; x < w; x++) {
-                int x0 = Math.max(0, x - rad), x1 = Math.min(w - 1, x + rad);
-                int area = (x1 - x0 + 1) * (y1 - y0 + 1);
-                int sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
-                        - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
-                if ((yPlane[y * rowStride + x] & 0xFF) < (sum / area) - 5) {
-                    bin[row + x] = 1;
-                }
-            }
-        }
+    float[] fx = new float[16], fy = new float[16], fmod = new float[16];
+    int fCount = 0;
+    int[] state = new int[5];
 
-        float[] fx = new float[16], fy = new float[16], fmod = new float[16];
-        int fCount = 0;
-        int[] state = new int[5];
+    for (int y = 3; y < h - 3; y += 2) {
+        state[0] = state[1] = state[2] = state[3] = state[4] = 0;
+        int currentState = 0;
+        int row = y * w;
 
-        for (int y = 3; y < h - 3; y += 2) {
-            state[0] = state[1] = state[2] = state[3] = state[4] = 0;
-            int currentState = 0;
-            int row = y * w;
-
-            for (int x = 0; x < w; x++) {
-                if (bin[row + x] != 0) {
-                    if ((currentState & 1) == 1) currentState++;
-                    state[currentState]++;
-                } else {
-                    if ((currentState & 1) == 0) {
-                        if (currentState == 4) {
-                            if (checkRatio(state)) {
-                                int[] vState = new int[5];
-                                float centerX = centerFromEnd(state, x);
-                                if (crossCheckVertical(bin, w, h, (int) centerX, y, state[2], vState)) {
-                                    float centerY = centerFromEnd(vState, y + vState[3] + vState[4]);
-                                    float modSize = (state[0] + state[1] + state[2] + state[3] + state[4]) / 7.0f;
-                                    boolean duplicate = false;
-                                    for (int i = 0; i < fCount; i++) {
-                                        if (Math.abs(fx[i] - centerX) < 10 && Math.abs(fy[i] - centerY) < 10) {
-                                            duplicate = true; break;
-                                        }
-                                    }
-                                    if (!duplicate && fCount < 16) {
-                                        fx[fCount] = centerX; fy[fCount] = centerY; fmod[fCount] = modSize;
-                                        fCount++;
+        for (int x = 0; x < w; x++) {
+            if (bin[row + x] != 0) {
+                if ((currentState & 1) == 1) currentState++;
+                state[currentState]++;
+            } else {
+                if ((currentState & 1) == 0) {
+                    if (currentState == 4) {
+                        if (checkRatio(state)) {
+                            int[] vState = new int[5];
+                            float centerX = centerFromEnd(state, x);
+                            if (crossCheckVertical(bin, w, h, (int) centerX, y, state[2], vState)) {
+                                float centerY = centerFromEnd(vState, y + vState[3] + vState[4]);
+                                float modSize = (state[0] + state[1] + state[2] + state[3] + state[4]) / 7.0f;
+                                boolean duplicate = false;
+                                for (int i = 0; i < fCount; i++) {
+                                    if (Math.abs(fx[i] - centerX) < 10 && Math.abs(fy[i] - centerY) < 10) {
+                                        duplicate = true; break;
                                     }
                                 }
-                                state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
-                                state[3] = 1; state[4] = 0; currentState = 3;
-                            } else {
-                                state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
-                                state[3] = 1; state[4] = 0; currentState = 3;
+                                if (!duplicate && fCount < 16) {
+                                    fx[fCount] = centerX; fy[fCount] = centerY; fmod[fCount] = modSize;
+                                    fCount++;
+                                }
                             }
+                            state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
+                            state[3] = 1; state[4] = 0; currentState = 3;
                         } else {
-                            currentState++; state[currentState]++;
+                            state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
+                            state[3] = 1; state[4] = 0; currentState = 3;
                         }
                     } else {
-                        state[currentState]++;
+                        currentState++; state[currentState]++;
                     }
+                } else {
+                    state[currentState]++;
                 }
             }
         }
+    }
 
-        if (fCount >= 3) {
-            float tlX = fx[0], tlY = fy[0], trX = fx[1], trY = fy[1], blX = fx[2], blY = fy[2];
-            if (tlX > trX) { float tx = tlX; tlX = trX; trX = tx; float ty = tlY; tlY = trY; trY = ty; }
-            if (tlY > blY) { float tx = tlX; tlX = blX; blX = tx; float ty = tlY; tlY = blY; blY = ty; }
+    if (fCount >= 3) {
+        float tlX = fx[0], tlY = fy[0], trX = fx[1], trY = fy[1], blX = fx[2], blY = fy[2];
+        if (tlX > trX) { float tx = tlX; tlX = trX; trX = tx; float ty = tlY; tlY = trY; trY = ty; }
+        if (tlY > blY) { float tx = tlX; tlX = blX; blX = tx; float ty = tlY; tlY = blY; blY = ty; }
 
-            float modSize = (fmod[0] + fmod[1] + fmod[2]) / 3.0f;
-            int dim = (int) (Math.sqrt((trX - tlX)*(trX - tlX) + (trY - tlY)*(trY - tlY)) / modSize) + 7;
-            if (dim < 21) dim = 21;
-            
-            // Round dimension to nearest valid QR size (21, 25, 29...)
-            dim = 21 + 4 * ((dim - 19) / 4);
-            if (dim > 57) return null; // Restrict to Version 1-10 for affine stability
+        float modSize = (fmod[0] + fmod[1] + fmod[2]) / 3.0f;
+        int dim = (int) (Math.sqrt((trX - tlX)*(trX - tlX) + (trY - tlY)*(trY - tlY)) / modSize) + 7;
+        if (dim < 21) dim = 21;
+        
+        dim = 21 + 4 * ((dim - 19) / 4);
+        if (dim > 57) return null;
 
-            byte[] grid = new byte[dim * dim];
-            sampleGrid(bin, w, h, tlX, tlY, trX, trY, blX, blY, dim, grid);
+        byte[] grid = new byte[dim * dim];
+        sampleGrid(bin, w, h, tlX, tlY, trX, trY, blX, blY, dim, grid);
 
-            // Extract Format Information (Top-Left)
-            int formatInfo = 0;
-            for (int i = 0; i < 6; i++) formatInfo = (formatInfo << 1) | grid[8 * dim + i];
-            formatInfo = (formatInfo << 1) | grid[8 * dim + 7];
-            formatInfo = (formatInfo << 1) | grid[8 * dim + 8];
-            formatInfo = (formatInfo << 1) | grid[7 * dim + 8];
-            for (int i = 5; i >= 0; i--) formatInfo = (formatInfo << 1) | grid[i * dim + 8];
-            formatInfo ^= 0x5412;
-            
-            int mask = formatInfo & 0x07;
-            
-            // Unmask and Zig-Zag Read
-            byte[] rawBytes = new byte[256];
-            int bitCount = 0, byteIdx = 0, currentByte = 0;
-            boolean upward = true;
+        int formatInfo = 0;
+        for (int i = 0; i < 6; i++) formatInfo = (formatInfo << 1) | grid[8 * dim + i];
+        formatInfo = (formatInfo << 1) | grid[8 * dim + 7];
+        formatInfo = (formatInfo << 1) | grid[8 * dim + 8];
+        formatInfo = (formatInfo << 1) | grid[7 * dim + 8];
+        for (int i = 5; i >= 0; i--) formatInfo = (formatInfo << 1) | grid[i * dim + 8];
+        formatInfo ^= 0x5412;
+        
+        int mask = formatInfo & 0x07;
+        
+        // Expanded to 512 for V6-V10 support
+        byte[] rawBytes = new byte[512];
+        int bitCount = 0, byteIdx = 0, currentByte = 0;
+        boolean upward = true;
 
-            for (int x = dim - 1; x > 0; x -= 2) {
-                if (x == 6) x--; // Skip vertical timing pattern
-                for (int y = 0; y < dim; y++) {
-                    int r = upward ? dim - 1 - y : y;
-                    for (int col = 0; col < 2; col++) {
-                        int c = x - col;
-                        // Skip Finder & Format Patterns
-                        if ((r < 9 && c < 9) || (r < 9 && c >= dim - 8) || (r >= dim - 8 && c < 9) || r == 6 || c == 6) continue;
-                        
-                        int bit = grid[r * dim + c];
-                        if (applyMask(mask, c, r)) bit ^= 1;
-                        
-                        currentByte = (currentByte << 1) | bit;
-                        bitCount++;
-                        if (bitCount == 8) {
-                            if (byteIdx < rawBytes.length) rawBytes[byteIdx++] = (byte) currentByte;
-                            bitCount = 0; currentByte = 0;
-                        }
+        for (int x = dim - 1; x > 0; x -= 2) {
+            if (x == 6) x--;
+            for (int y = 0; y < dim; y++) {
+                int r = upward ? dim - 1 - y : y;
+                for (int col = 0; col < 2; col++) {
+                    int c = x - col;
+                    if ((r < 9 && c < 9) || (r < 9 && c >= dim - 8) || (r >= dim - 8 && c < 9) || r == 6 || c == 6) continue;
+                    
+                    int bit = grid[r * dim + c];
+                    if (applyMask(mask, c, r)) bit ^= 1;
+                    
+                    currentByte = (currentByte << 1) | bit;
+                    bitCount++;
+                    if (bitCount == 8) {
+                        if (byteIdx < rawBytes.length) rawBytes[byteIdx++] = (byte) currentByte;
+                        bitCount = 0; currentByte = 0;
                     }
                 }
-                upward = !upward;
             }
+            upward = !upward;
+        }
 
-            // Minimal ECC Block Assumption (Version 1-10 fallback)
-            int dataBytes = byteIdx / 2; 
-            int eccBytes = byteIdx - dataBytes;
+        int eccLevel = (formatInfo >> 3) & 0x03;
+        int eccIdx = (eccLevel == 1) ? 0 : (eccLevel == 0) ? 1 : (eccLevel == 3) ? 2 : 3;
+        int version = (dim - 17) / 4;
+        
+        int dataBytes = byteIdx / 2;
+        int eccBytes = byteIdx - dataBytes;
+
+        if (version >= 1 && version <= 10) {
+            int[][] totalECCPerVersion = {
+                {7, 10, 13, 17}, {10, 16, 22, 28}, {15, 26, 36, 44}, {20, 36, 52, 64}, 
+                {26, 48, 72, 88}, {36, 64, 96, 112}, {40, 72, 108, 130}, {48, 88, 132, 156}, 
+                {60, 110, 160, 192}, {72, 130, 192, 224}
+            };
+            eccBytes = totalECCPerVersion[version - 1][eccIdx];
+            dataBytes = byteIdx - eccBytes;
+            if (dataBytes < 0) dataBytes = byteIdx / 2;
+        }
+        
+        int[] rsBlock = new int[byteIdx];
+        for(int i=0; i<byteIdx; i++) rsBlock[i] = rawBytes[i] & 0xFF;
+        
+        if (correctErrors(rsBlock, dataBytes, eccBytes)) {
+            StringBuilder result = new StringBuilder();
+            int bitStream = 0, bitsAvailable = 0, readIdx = 0;
             
-            int[] rsBlock = new int[byteIdx];
-            for(int i=0; i<byteIdx; i++) rsBlock[i] = rawBytes[i] & 0xFF;
-            
-            if (correctErrors(rsBlock, dataBytes, eccBytes)) {
-                // Decode Byte/Alphanum Modes
-                StringBuilder result = new StringBuilder();
-                int bitStream = 0, bitsAvailable = 0, readIdx = 0;
+            while (readIdx < dataBytes) {
+                while (bitsAvailable < 8 && readIdx < dataBytes) {
+                    bitStream = (bitStream << 8) | rsBlock[readIdx++];
+                    bitsAvailable += 8;
+                }
+                int mode = (bitStream >> (bitsAvailable - 4)) & 0x0F;
+                bitsAvailable -= 4;
+                if (mode == 0) break;
                 
-                while (readIdx < dataBytes) {
+                if (mode == 4) { 
                     while (bitsAvailable < 8 && readIdx < dataBytes) {
                         bitStream = (bitStream << 8) | rsBlock[readIdx++];
                         bitsAvailable += 8;
                     }
-                    int mode = (bitStream >> (bitsAvailable - 4)) & 0x0F;
-                    bitsAvailable -= 4;
-                    if (mode == 0) break; // Terminator
+                    int length = (bitStream >> (bitsAvailable - 8)) & 0xFF;
+                    bitsAvailable -= 8;
                     
-                    if (mode == 4) { // Byte Mode
+                    for (int i = 0; i < length && readIdx <= dataBytes; i++) {
                         while (bitsAvailable < 8 && readIdx < dataBytes) {
                             bitStream = (bitStream << 8) | rsBlock[readIdx++];
                             bitsAvailable += 8;
                         }
-                        int length = (bitStream >> (bitsAvailable - 8)) & 0xFF;
+                        result.append((char) ((bitStream >> (bitsAvailable - 8)) & 0xFF));
                         bitsAvailable -= 8;
-                        
-                        for (int i = 0; i < length && readIdx <= dataBytes; i++) {
-                            while (bitsAvailable < 8 && readIdx < dataBytes) {
-                                bitStream = (bitStream << 8) | rsBlock[readIdx++];
-                                bitsAvailable += 8;
-                            }
-                            result.append((char) ((bitStream >> (bitsAvailable - 8)) & 0xFF));
-                            bitsAvailable -= 8;
-                        }
-                    } else if (mode == 2) { // Alphanumeric Mode
-                        while (bitsAvailable < 9 && readIdx < dataBytes) {
-                            bitStream = (bitStream << 8) | rsBlock[readIdx++];
-                            bitsAvailable += 8;
-                        }
-                        int length = (bitStream >> (bitsAvailable - 9)) & 0x1FF;
-                        bitsAvailable -= 9;
-                        // A simplified fallback for alphanum if needed
-                    } else {
-                        break; // Unsupported mode for this dense implementation
                     }
+                } else if (mode == 2) { 
+                    while (bitsAvailable < 9 && readIdx < dataBytes) {
+                        bitStream = (bitStream << 8) | rsBlock[readIdx++];
+                        bitsAvailable += 8;
+                    }
+                    int length = (bitStream >> (bitsAvailable - 9)) & 0x1FF;
+                    bitsAvailable -= 9;
+                } else {
+                    break;
                 }
-                if (result.length() > 0) return result.toString();
             }
+            if (result.length() > 0) return result.toString();
         }
-        return null;
     }
+    return null;
+}
 }
