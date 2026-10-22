@@ -350,6 +350,15 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
                 CharSequence currentText = focused.getText();
                 if (currentText == null) currentText = "";
                 
+                // CRITICAL FIX: Ignore phantom hint text like "Type a message" when the field is empty
+                if (android.os.Build.VERSION.SDK_INT >= 26 && focused.isShowingHintText()) {
+                    currentText = "";
+                } else if (currentText.toString().trim().equalsIgnoreCase("type a message") || 
+                           currentText.toString().trim().equalsIgnoreCase("message")) {
+                    // Manual fallback for apps that don't correctly flag their hints
+                    currentText = "";
+                }
+                
                 int start = focused.getTextSelectionStart();
                 int end = focused.getTextSelectionEnd();
                 
@@ -365,10 +374,14 @@ public class BubbleAccessibilityService extends AccessibilityService implements 
                 args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, updatedText);
                 focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
                 
-                Bundle selectionArgs = new Bundle();
-                selectionArgs.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, min + newText.length());
-                selectionArgs.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, min + newText.length());
-                focused.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs);
+                try {
+                    Bundle selectionArgs = new Bundle();
+                    selectionArgs.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, min + newText.length());
+                    selectionArgs.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, min + newText.length());
+                    focused.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs);
+                } catch (Exception e) {
+                    // Safely ignore selection targeting errors on heavily customized OEM keyboards
+                }
             }
         }
     }
