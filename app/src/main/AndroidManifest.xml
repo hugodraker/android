@@ -1,34 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.barcodetyper">
+    package="com.barcodetyper"
+    android:versionCode="1"
+    android:versionName="1.0">
 
-    <uses-feature android:name="android.hardware.camera" android:required="true" />
+    <uses-sdk android:minSdkVersion="4" android:targetSdkVersion="4" />
+
+    <uses-feature android:name="android.hardware.camera" />
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:allowBackup="true"
-        android:label="Barcode Typer"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
-
-        <activity android:name=".SetupActivity" android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-
+        android:label="Barcode Typer Keyboard"
+        android:theme="@android:style/Theme.NoTitleBar">
+        
         <service
-            android:name=".BubbleAccessibilityService"
-            android:exported="true"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            android:name=".BarcodeKeyboardService"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true">
             <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
+                <action android:name="android.view.InputMethod" />
             </intent-filter>
             <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
+                android:name="android.view.im"
+                android:resource="@xml/method" />
         </service>
+        
     </application>
 </manifest>
