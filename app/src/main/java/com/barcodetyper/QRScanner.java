@@ -1,8 +1,6 @@
 package com.barcodetyper;
 
-public class QRScanner {
-
-    private static final int[] expTable = new int[512];
+public class QRScanner {private static final int[] expTable = new int[512];
     private static final int[] logTable = new int[256];
     private static boolean gfInit = false;
 
@@ -102,14 +100,14 @@ public class QRScanner {
             }
             if (den == 0) return false;
             int errVal = gfMul(num, gfInv(den));
-            // QR Codes require multiplying the Forney magnitude by X_k
-            errVal = gfMul(errVal, expTable[p % 255]);
+            errVal = gfMul(errVal, expTable[p % 255]); 
             cw[idx] ^= errVal;
         }
         return true;
     }
 
-    private static boolean checkRatio(int[] state) {
+    
+private static boolean checkRatio(int[] state) {
         int total = 0;
         for (int i = 0; i < 5; i++) {
             if (state[i] == 0) return false;
@@ -118,6 +116,8 @@ public class QRScanner {
         if (total < 7) return false;
         int moduleSize = (total << 8) / 7;
         int maxVariance = moduleSize / 2;
+        if (maxVariance < 200) maxVariance = 200; 
+        
         return Math.abs(moduleSize - (state[0] << 8)) < maxVariance &&
                Math.abs(moduleSize - (state[1] << 8)) < maxVariance &&
                Math.abs(3 * moduleSize - (state[2] << 8)) < 3 * maxVariance &&
@@ -125,7 +125,8 @@ public class QRScanner {
                Math.abs(moduleSize - (state[4] << 8)) < maxVariance;
     }
 
-    private static float centerFromEnd(int[] state, int end) {
+    
+private static float centerFromEnd(int[] state, int end) {
         return (end - state[4] - state[3]) - state[2] / 2.0f;
     }
 
@@ -162,7 +163,7 @@ public class QRScanner {
             for (int x = 0; x < dim; x++) {
                 float px = rowStartX + xStepTR * (x - 3.5f);
                 float py = rowStartY + yStepTR * (x - 3.5f);
-                int ix = (int) px, iy = (int) py;
+                int ix = (int) (px + 0.5f), iy = (int) (py + 0.5f);
                 if (ix >= 0 && ix < w && iy >= 0 && iy < h) {
                     grid[y * dim + x] = bin[iy * w + ix];
                 } else {
@@ -173,7 +174,8 @@ public class QRScanner {
         return 1;
     }
 
-    private static boolean applyMask(int mask, int x, int y) {
+    
+private static boolean applyMask(int mask, int x, int y) {
         switch (mask) {
             case 0: return (x + y) % 2 == 0;
             case 1: return y % 2 == 0;
@@ -235,7 +237,9 @@ public class QRScanner {
                 int area = (x1 - x0 + 1) * (y1 - y0 + 1);
                 int sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
                         - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
-                if ((yPlane[y * rowStride + x] & 0xFF) < (sum / area) - 5) {
+                int mean = sum / area;
+                int threshold = mean - (mean >> 4);
+                if ((yPlane[y * rowStride + x] & 0xFF) < threshold) {
                     bin[row + x] = 1;
                 }
             }
@@ -308,7 +312,10 @@ public class QRScanner {
             float blX = fx[blIdx], blY = fy[blIdx];
 
             float modSize = (fmod[0] + fmod[1] + fmod[2]) / 3.0f;
-            int dim = (int) (Math.sqrt((trX - tlX)*(trX - tlX) + (trY - tlY)*(trY - tlY)) / modSize) + 7;
+            float distTop = (float) Math.sqrt((trX - tlX)*(trX - tlX) + (trY - tlY)*(trY - tlY));
+            float distLeft = (float) Math.sqrt((blX - tlX)*(blX - tlX) + (blY - tlY)*(blY - tlY));
+            
+            int dim = (int) (((distTop + distLeft) / 2.0f) / modSize) + 7;
             if (dim < 21) dim = 21;
             
             dim = 21 + 4 * ((dim - 19) / 4);
@@ -341,7 +348,7 @@ public class QRScanner {
                     for (int col = 0; col < 2; col++) {
                         int c = x - col;
                         if ((r < 9 && c < 9) || (r < 9 && c >= dim - 8) || (r >= dim - 8 && c < 9) || r == 6 || c == 6) continue;
-                        if (isAlignment(c, r, version, dim)) continue;
+                        if (isAlignment(c, r, version, dim)) continue; 
                         
                         int bit = grid[r * dim + c];
                         if (applyMask(mask, c, r)) bit ^= 1;
@@ -492,10 +499,12 @@ public class QRScanner {
                             int val = (bitStream >> (bitsAvailable - bitsToRead)) & ((1 << bitsToRead) - 1);
                             bitsAvailable -= bitsToRead;
                             if (bitsToRead == 11) {
-                                result.append(alphaMap.charAt(val / 45));
-                                result.append(alphaMap.charAt(val % 45));
+                                int c1 = val / 45;
+                                int c2 = val % 45;
+                                result.append(c1 < alphaMap.length() ? alphaMap.charAt(c1) : '?');
+                                result.append(c2 < alphaMap.length() ? alphaMap.charAt(c2) : '?');
                             } else {
-                                result.append(alphaMap.charAt(val));
+                                result.append(val < alphaMap.length() ? alphaMap.charAt(val) : '?');
                             }
                         }
                     } else if (mode == 1) { 
