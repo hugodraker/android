@@ -452,3 +452,4 @@ public class QRScanner {
         }
         return null;
     }
+}
