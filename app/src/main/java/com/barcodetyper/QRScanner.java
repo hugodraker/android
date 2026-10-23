@@ -101,7 +101,10 @@ public class QRScanner {
                 xPow = gfMul(xPow, xInv2);
             }
             if (den == 0) return false;
-            cw[idx] ^= gfMul(num, gfInv(den));
+            int errVal = gfMul(num, gfInv(den));
+            // QR Codes require multiplying the Forney magnitude by X_k
+            errVal = gfMul(errVal, expTable[p % 255]);
+            cw[idx] ^= errVal;
         }
         return true;
     }
@@ -288,9 +291,21 @@ public class QRScanner {
         }
 
         if (fCount >= 3) {
-            float tlX = fx[0], tlY = fy[0], trX = fx[1], trY = fy[1], blX = fx[2], blY = fy[2];
-            if (tlX > trX) { float tx = tlX; tlX = trX; trX = tx; float ty = tlY; tlY = trY; trY = ty; }
-            if (tlY > blY) { float tx = tlX; tlX = blX; blX = tx; float ty = tlY; tlY = blY; blY = ty; }
+            float d01 = (fx[0]-fx[1])*(fx[0]-fx[1]) + (fy[0]-fy[1])*(fy[0]-fy[1]);
+            float d12 = (fx[1]-fx[2])*(fx[1]-fx[2]) + (fy[1]-fy[2])*(fy[1]-fy[2]);
+            float d02 = (fx[0]-fx[2])*(fx[0]-fx[2]) + (fy[0]-fy[2])*(fy[0]-fy[2]);
+
+            int tlIdx = 0, trIdx = 1, blIdx = 2;
+            if (d01 > d12 && d01 > d02) { tlIdx = 2; trIdx = 0; blIdx = 1; }
+            else if (d02 > d01 && d02 > d12) { tlIdx = 1; trIdx = 0; blIdx = 2; }
+            
+            if ((fx[trIdx] - fx[tlIdx]) * (fy[blIdx] - fy[tlIdx]) - (fy[trIdx] - fy[tlIdx]) * (fx[blIdx] - fx[tlIdx]) < 0) {
+                int temp = trIdx; trIdx = blIdx; blIdx = temp;
+            }
+            
+            float tlX = fx[tlIdx], tlY = fy[tlIdx];
+            float trX = fx[trIdx], trY = fy[trIdx];
+            float blX = fx[blIdx], blY = fy[blIdx];
 
             float modSize = (fmod[0] + fmod[1] + fmod[2]) / 3.0f;
             int dim = (int) (Math.sqrt((trX - tlX)*(trX - tlX) + (trY - tlY)*(trY - tlY)) / modSize) + 7;
@@ -310,7 +325,6 @@ public class QRScanner {
             for (int i = 5; i >= 0; i--) formatInfo = (formatInfo << 1) | grid[i * dim + 8];
             formatInfo ^= 0x5412;
             
-            // Mask and ECC are located in the top 5 bits of the 15-bit format string
             int mask = (formatInfo >> 10) & 0x07;
             int eccLevel = (formatInfo >> 13) & 0x03;
             int eccIdx = (eccLevel == 1) ? 0 : (eccLevel == 0) ? 1 : (eccLevel == 3) ? 2 : 3;
@@ -327,7 +341,7 @@ public class QRScanner {
                     for (int col = 0; col < 2; col++) {
                         int c = x - col;
                         if ((r < 9 && c < 9) || (r < 9 && c >= dim - 8) || (r >= dim - 8 && c < 9) || r == 6 || c == 6) continue;
-                        if (isAlignment(c, r, version, dim)) continue; // Crucial skip for V2+
+                        if (isAlignment(c, r, version, dim)) continue;
                         
                         int bit = grid[r * dim + c];
                         if (applyMask(mask, c, r)) bit ^= 1;
@@ -364,7 +378,6 @@ public class QRScanner {
                 if (dataBytes < 0) dataBytes = byteIdx / 2;
             }
             
-            // Unpack interleaved RS Blocks for Version 3+ Codes
             int eccPerBlock = eccBytes / blocks;
             int shortBlockData = dataBytes / blocks;
             int numLongBlocks = dataBytes % blocks;
