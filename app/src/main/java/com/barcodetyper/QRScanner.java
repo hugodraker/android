@@ -272,7 +272,7 @@ public class QRScanner {
             if (dim < 21) dim = 21;
             
             dim = 21 + 4 * ((dim - 19) / 4);
-            if (dim > 57) return null;
+            if (dim > 57) return null; 
 
             byte[] grid = new byte[dim * dim];
             sampleGrid(bin, w, h, tlX, tlY, trX, trY, blX, blY, dim, grid);
@@ -292,7 +292,7 @@ public class QRScanner {
             boolean upward = true;
 
             for (int x = dim - 1; x > 0; x -= 2) {
-                if (x == 6) x--;
+                if (x == 6) x--; 
                 for (int y = 0; y < dim; y++) {
                     int r = upward ? dim - 1 - y : y;
                     for (int col = 0; col < 2; col++) {
@@ -338,38 +338,62 @@ public class QRScanner {
                 StringBuilder result = new StringBuilder();
                 int bitStream = 0, bitsAvailable = 0, readIdx = 0;
                 
-                while (readIdx < dataBytes) {
-                    while (bitsAvailable < 8 && readIdx < dataBytes) {
+                while (readIdx < dataBytes || bitsAvailable >= 4) {
+                    while (bitsAvailable < 4 && readIdx < dataBytes) {
                         bitStream = (bitStream << 8) | rsBlock[readIdx++];
                         bitsAvailable += 8;
                     }
+                    if (bitsAvailable < 4) break;
                     int mode = (bitStream >> (bitsAvailable - 4)) & 0x0F;
                     bitsAvailable -= 4;
-                    if (mode == 0) break;
                     
-                    if (mode == 4) { 
+                    if (mode == 0) break; 
+                    
+                    if (mode == 7) { 
                         while (bitsAvailable < 8 && readIdx < dataBytes) {
                             bitStream = (bitStream << 8) | rsBlock[readIdx++];
                             bitsAvailable += 8;
                         }
-                        int length = (bitStream >> (bitsAvailable - 8)) & 0xFF;
+                        if (bitsAvailable < 8) break;
+                        int eciVal = (bitStream >> (bitsAvailable - 8)) & 0xFF;
                         bitsAvailable -= 8;
+                        if ((eciVal & 0x80) != 0) {
+                            int extraBits = ((eciVal & 0xC0) == 0x80) ? 8 : 16;
+                            while (bitsAvailable < extraBits && readIdx < dataBytes) {
+                                bitStream = (bitStream << 8) | rsBlock[readIdx++];
+                                bitsAvailable += 8;
+                            }
+                            if (bitsAvailable < extraBits) break;
+                            bitsAvailable -= extraBits;
+                        }
+                    } else if (mode == 4) { 
+                        int lenBits = (version < 10) ? 8 : 16;
+                        while (bitsAvailable < lenBits && readIdx < dataBytes) {
+                            bitStream = (bitStream << 8) | rsBlock[readIdx++];
+                            bitsAvailable += 8;
+                        }
+                        if (bitsAvailable < lenBits) break;
+                        int length = (bitStream >> (bitsAvailable - lenBits)) & ((1 << lenBits) - 1);
+                        bitsAvailable -= lenBits;
                         
-                        for (int i = 0; i < length && readIdx <= dataBytes; i++) {
+                        for (int i = 0; i < length; i++) {
                             while (bitsAvailable < 8 && readIdx < dataBytes) {
                                 bitStream = (bitStream << 8) | rsBlock[readIdx++];
                                 bitsAvailable += 8;
                             }
+                            if (bitsAvailable < 8) break;
                             result.append((char) ((bitStream >> (bitsAvailable - 8)) & 0xFF));
                             bitsAvailable -= 8;
                         }
                     } else if (mode == 2) { 
-                        while (bitsAvailable < 9 && readIdx < dataBytes) {
+                        int lenBits = (version < 10) ? 9 : 11;
+                        while (bitsAvailable < lenBits && readIdx < dataBytes) {
                             bitStream = (bitStream << 8) | rsBlock[readIdx++];
                             bitsAvailable += 8;
                         }
-                        int length = (bitStream >> (bitsAvailable - 9)) & 0x1FF;
-                        bitsAvailable -= 9;
+                        if (bitsAvailable < lenBits) break;
+                        int length = (bitStream >> (bitsAvailable - lenBits)) & ((1 << lenBits) - 1);
+                        bitsAvailable -= lenBits;
                         
                         String alphaMap = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
                         for (int i = 0; i < length; i += 2) {
@@ -378,6 +402,7 @@ public class QRScanner {
                                 bitStream = (bitStream << 8) | rsBlock[readIdx++];
                                 bitsAvailable += 8;
                             }
+                            if (bitsAvailable < bitsToRead) break;
                             int val = (bitStream >> (bitsAvailable - bitsToRead)) & ((1 << bitsToRead) - 1);
                             bitsAvailable -= bitsToRead;
                             if (bitsToRead == 11) {
@@ -387,8 +412,39 @@ public class QRScanner {
                                 result.append(alphaMap.charAt(val));
                             }
                         }
+                    } else if (mode == 1) { 
+                        int lenBits = (version < 10) ? 10 : 12;
+                        while (bitsAvailable < lenBits && readIdx < dataBytes) {
+                            bitStream = (bitStream << 8) | rsBlock[readIdx++];
+                            bitsAvailable += 8;
+                        }
+                        if (bitsAvailable < lenBits) break;
+                        int length = (bitStream >> (bitsAvailable - lenBits)) & ((1 << lenBits) - 1);
+                        bitsAvailable -= lenBits;
+                        
+                        for (int i = 0; i < length; i += 3) {
+                            int rem = length - i;
+                            int bitsToRead = (rem >= 3) ? 10 : (rem == 2) ? 7 : 4;
+                            while (bitsAvailable < bitsToRead && readIdx < dataBytes) {
+                                bitStream = (bitStream << 8) | rsBlock[readIdx++];
+                                bitsAvailable += 8;
+                            }
+                            if (bitsAvailable < bitsToRead) break;
+                            int val = (bitStream >> (bitsAvailable - bitsToRead)) & ((1 << bitsToRead) - 1);
+                            bitsAvailable -= bitsToRead;
+                            if (rem >= 3) {
+                                result.append((char)('0' + (val / 100)));
+                                result.append((char)('0' + ((val / 10) % 10)));
+                                result.append((char)('0' + (val % 10)));
+                            } else if (rem == 2) {
+                                result.append((char)('0' + (val / 10)));
+                                result.append((char)('0' + (val % 10)));
+                            } else {
+                                result.append((char)('0' + val));
+                            }
+                        }
                     } else {
-                        break;
+                        break; 
                     }
                 }
                 if (result.length() > 0) return result.toString();
@@ -396,4 +452,3 @@ public class QRScanner {
         }
         return null;
     }
-}
