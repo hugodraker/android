@@ -184,6 +184,31 @@ public class QRScanner {
         return false;
     }
 
+    private static boolean isAlignment(int c, int r, int version, int dim) {
+        if (version < 2) return false;
+        int[][] alignCoords = {
+            {},
+            {6, 18},
+            {6, 22},
+            {6, 26},
+            {6, 30},
+            {6, 34},
+            {6, 22, 38},
+            {6, 24, 42},
+            {6, 26, 46},
+            {6, 28, 50}
+        };
+        int[] coords = alignCoords[version - 1];
+        for (int cx : coords) {
+            for (int cy : coords) {
+                // Skip bounding check inside finder patterns
+                if ((cx == 6 && cy == 6) || (cx == 6 && cy >= dim - 9) || (cx >= dim - 9 && cy == 6)) continue;
+                if (c >= cx - 2 && c <= cx + 2 && r >= cy - 2 && r <= cy + 2) return true;
+            }
+        }
+        return false;
+    }
+
     public static String scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
         byte[] bin = new byte[w * h];
         int rad = Math.max(12, Math.min(w, h) / 8);
@@ -285,7 +310,11 @@ public class QRScanner {
             for (int i = 5; i >= 0; i--) formatInfo = (formatInfo << 1) | grid[i * dim + 8];
             formatInfo ^= 0x5412;
             
-            int mask = formatInfo & 0x07;
+            // Mask and ECC are located in the top 5 bits of the 15-bit format string
+            int mask = (formatInfo >> 10) & 0x07;
+            int eccLevel = (formatInfo >> 13) & 0x03;
+            int eccIdx = (eccLevel == 1) ? 0 : (eccLevel == 0) ? 1 : (eccLevel == 3) ? 2 : 3;
+            int version = (dim - 17) / 4;
             
             byte[] rawBytes = new byte[512];
             int bitCount = 0, byteIdx = 0, currentByte = 0;
@@ -298,6 +327,7 @@ public class QRScanner {
                     for (int col = 0; col < 2; col++) {
                         int c = x - col;
                         if ((r < 9 && c < 9) || (r < 9 && c >= dim - 8) || (r >= dim - 8 && c < 9) || r == 6 || c == 6) continue;
+                        if (isAlignment(c, r, version, dim)) continue; // Crucial skip for V2+
                         
                         int bit = grid[r * dim + c];
                         if (applyMask(mask, c, r)) bit ^= 1;
@@ -313,12 +343,9 @@ public class QRScanner {
                 upward = !upward;
             }
 
-            int eccLevel = (formatInfo >> 3) & 0x03;
-            int eccIdx = (eccLevel == 1) ? 0 : (eccLevel == 0) ? 1 : (eccLevel == 3) ? 2 : 3;
-            int version = (dim - 17) / 4;
-            
             int dataBytes = byteIdx / 2;
             int eccBytes = byteIdx - dataBytes;
+            int blocks = 1;
 
             if (version >= 1 && version <= 10) {
                 int[][] totalECCPerVersion = {
@@ -326,15 +353,61 @@ public class QRScanner {
                     {26, 48, 72, 88}, {36, 64, 96, 112}, {40, 72, 108, 130}, {48, 88, 132, 156}, 
                     {60, 110, 160, 192}, {72, 130, 192, 224}
                 };
+                int[][] numBlocksPerVersion = {
+                    {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 2, 2}, {1, 2, 2, 4}, 
+                    {1, 2, 4, 4}, {2, 4, 4, 4}, {2, 4, 6, 5}, {2, 4, 6, 6}, 
+                    {2, 5, 8, 8}, {4, 5, 8, 8}
+                };
                 eccBytes = totalECCPerVersion[version - 1][eccIdx];
+                blocks = numBlocksPerVersion[version - 1][eccIdx];
                 dataBytes = byteIdx - eccBytes;
                 if (dataBytes < 0) dataBytes = byteIdx / 2;
             }
             
-            int[] rsBlock = new int[byteIdx];
-            for(int i=0; i<byteIdx; i++) rsBlock[i] = rawBytes[i] & 0xFF;
+            // Unpack interleaved RS Blocks for Version 3+ Codes
+            int eccPerBlock = eccBytes / blocks;
+            int shortBlockData = dataBytes / blocks;
+            int numLongBlocks = dataBytes % blocks;
+            int numShortBlocks = blocks - numLongBlocks;
             
-            if (correctErrors(rsBlock, dataBytes, eccBytes)) {
+            int[] deinterleavedData = new int[dataBytes];
+            int[] deinterleavedEcc = new int[eccBytes];
+            
+            int rawIdx = 0;
+            for (int col = 0; col < shortBlockData + 1; col++) {
+                for (int b = 0; b < blocks; b++) {
+                    if (col == shortBlockData && b < numShortBlocks) continue;
+                    int destIdx = 0;
+                    for (int i = 0; i < b; i++) destIdx += shortBlockData + (i >= numShortBlocks ? 1 : 0);
+                    destIdx += col;
+                    if (rawIdx < byteIdx) deinterleavedData[destIdx] = rawBytes[rawIdx++] & 0xFF;
+                }
+            }
+            for (int col = 0; col < eccPerBlock; col++) {
+                for (int b = 0; b < blocks; b++) {
+                    if (rawIdx < byteIdx) deinterleavedEcc[b * eccPerBlock + col] = rawBytes[rawIdx++] & 0xFF;
+                }
+            }
+            
+            boolean eccOk = true;
+            for (int b = 0; b < blocks; b++) {
+                int dLen = shortBlockData + (b >= numShortBlocks ? 1 : 0);
+                int eLen = eccPerBlock;
+                int[] rs = new int[dLen + eLen];
+                int dOff = 0;
+                for (int i = 0; i < b; i++) dOff += shortBlockData + (i >= numShortBlocks ? 1 : 0);
+                System.arraycopy(deinterleavedData, dOff, rs, 0, dLen);
+                System.arraycopy(deinterleavedEcc, b * eLen, rs, dLen, eLen);
+                
+                if (!correctErrors(rs, dLen, eLen)) {
+                    eccOk = false;
+                    break;
+                }
+                System.arraycopy(rs, 0, deinterleavedData, dOff, dLen);
+            }
+            
+            if (eccOk) {
+                int[] rsBlock = deinterleavedData;
                 StringBuilder result = new StringBuilder();
                 int bitStream = 0, bitsAvailable = 0, readIdx = 0;
                 
