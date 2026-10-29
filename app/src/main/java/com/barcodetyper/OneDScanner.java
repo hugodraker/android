@@ -15,18 +15,20 @@
  * ============================================================================ */
 package com.barcodetyper;
 
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+
 public class OneDScanner {
 
-    // Code 39 Character Set: 0-9, A-Z, -, ., space, $, /, +, %, *
     private static final String ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%*";
     
-    // 9-bit binary representation of Code 39 characters (1 = wide, 0 = narrow)
     private static final int[] CODE39_CHARACTER_ENCODINGS = {
-        0x034, 0x121, 0x061, 0x160, 0x031, 0x130, 0x070, 0x025, 0x124, 0x064, // 0-9
-        0x109, 0x049, 0x148, 0x019, 0x118, 0x058, 0x00D, 0x10C, 0x04C, 0x01C, // A-J
-        0x103, 0x043, 0x142, 0x013, 0x112, 0x052, 0x007, 0x106, 0x046, 0x016, // K-T
-        0x181, 0x0C1, 0x1C0, 0x091, 0x190, 0x0D0, 0x085, 0x184, 0x0C4, 0x094, // U-Z, -, ., space
-        0x0A8, 0x0A2, 0x08A, 0x02A, 0x094  // $, /, +, %, * (asterisk is 0x094)
+        0x034, 0x121, 0x061, 0x160, 0x031, 0x130, 0x070, 0x025, 0x124, 0x064, 
+        0x109, 0x049, 0x148, 0x019, 0x118, 0x058, 0x00D, 0x10C, 0x04C, 0x01C, 
+        0x103, 0x043, 0x142, 0x013, 0x112, 0x052, 0x007, 0x106, 0x046, 0x016, 
+        0x181, 0x0C1, 0x1C0, 0x091, 0x190, 0x0D0, 0x085, 0x184, 0x0C4, 0x094, 
+        0x0A8, 0x0A2, 0x08A, 0x02A, 0x094 
     };
     
     private static final int ASTERISK_ENCODING = 0x094;
@@ -35,8 +37,10 @@ public class OneDScanner {
         int step = Math.max(1, h / 32);
         int[] lineGray = new int[w];
         
-        // ZXing Upgrade: Expand slopes to cover aggressive pitch/yaw on boxes
         float[] slopes = {0.0f, 0.088f, -0.088f, 0.176f, -0.176f, 0.264f, -0.264f};
+
+        // ZXing Upgrade: Consensus voting map for checksum-less symbologies (Code 39)
+        Map<String, Integer> code39Votes = new HashMap<>();
 
         for (int y = step; y < h - step; y += step) {
             for (float slope : slopes) {
@@ -44,14 +48,15 @@ public class OneDScanner {
                     int cy = y + (int) ((x - w / 2) * slope);
                     lineGray[x] = (cy >= 0 && cy < h) ? (yPlane[cy * rowStride + x] & 0xFF) : 255;
                 }
-                String code = scanLineRobust(lineGray, w);
+                
+                String code = scanLineRobust(lineGray, w, code39Votes);
                 if (code != null) return code;
             }
         }
         return null;
     }
 
-    private static String scanLineRobust(int[] grayPixels, int length) {
+    private static String scanLineRobust(int[] grayPixels, int length, Map<String, Integer> code39Votes) {
         if (length < 60) return null;
         int[] smooth = new int[length];
         for (int x = 0; x < length; x++) {
@@ -78,7 +83,7 @@ public class OneDScanner {
 
         for (int x = 0; x < length; x++) {
             float diffCurr = (float)smooth[x] - (float)(thresh[x] - 5);
-            int val = (diffCurr < 0.0f) ? 1 : 0; // 1 is Black
+            int val = (diffCurr < 0.0f) ? 1 : 0; 
 
             if (firstColor == -1) firstColor = val;
             if (currentVal == -1) currentVal = val;
@@ -93,16 +98,22 @@ public class OneDScanner {
             }
         }
         
-        // Ensure last run is captured for quiet zone calculation
         runs[numRuns++] = ((float)(length - 1)) - lastCrossX;
 
         // 1. Attempt Code 39 Scan
         String code39 = tryDecodeCode39(runs, numRuns, firstColor);
-        if (code39 != null) return code39;
+        if (code39 != null) {
+            // ZXing Upgrade: Require 2 identical independent reads to bypass crease/fold distortions
+            int votes = code39Votes.getOrDefault(code39, 0) + 1;
+            if (votes >= 2) {
+                return code39; 
+            }
+            code39Votes.put(code39, votes);
+        }
 
-        // 2. Attempt UPC/EAN Scan (Legacy Logic)
+        // 2. Attempt UPC/EAN Scan (UPC has mod-10 checksum, so 1 read is safe)
         for (int i = 0; i <= numRuns - 59; i++) {
-            if ((firstColor + i) % 2 != 1) continue; // UPC must start on black
+            if ((firstColor + i) % 2 != 1) continue; 
             float qzLeft = (i > 0) ? runs[i - 1] : 999.0f;
             float qzRight = (i + 59 < numRuns) ? runs[i + 59] : 999.0f;
             
@@ -116,25 +127,17 @@ public class OneDScanner {
         }
         return null;
     }
-
-    // --- ZXing Grade Code 39 Engine ---
     
     private static String tryDecodeCode39(float[] runs, int numRuns, int firstColor) {
-        // Code 39 requires at least 1 character + 2 asterisk guards = 3 chars.
-        // Each char is 9 modules + 1 inter-character gap = 10 runs per char (except the last).
-        // Total runs = 9 (Start) + 1 (Gap) + 9 (Data) + 1 (Gap) + 9 (Stop) = 29 runs minimum.
         if (numRuns < 29) return null;
 
-        // Find the starting asterisk
         int startIdx = -1;
         for (int i = 0; i < numRuns - 9; i++) {
-            if ((firstColor + i) % 2 != 1) continue; // Start symbol must begin on a black bar
+            if ((firstColor + i) % 2 != 1) continue; 
 
             int pattern = toCode39Pattern(runs, i);
             if (pattern == ASTERISK_ENCODING) {
-                // Verify left quiet zone
                 float qzLeft = (i > 0) ? runs[i - 1] : 999.0f;
-                // A Code 39 narrow module can be approximated by averaging the 6 narrowest runs
                 float narrowMod = estimateNarrowWidth(runs, i);
                 if (qzLeft >= narrowMod * 3.0f) {
                     startIdx = i;
@@ -146,32 +149,29 @@ public class OneDScanner {
         if (startIdx == -1) return null;
 
         StringBuilder result = new StringBuilder();
-        int idx = startIdx + 9; // Skip start asterisk
+        int idx = startIdx + 9; 
 
         while (idx < numRuns - 9) {
-            // Check for required inter-character gap (white space)
             if ((firstColor + idx) % 2 != 0) return null; 
-            idx++; // Move past the gap
+            idx++; 
             
             if (idx + 9 > numRuns) break;
 
             int pattern = toCode39Pattern(runs, idx);
-            if (pattern == -1) return null; // Invalid character shape
+            if (pattern == -1) return null; 
             
             char decodedChar = decodeCode39Pattern(pattern);
             if (decodedChar == '*') {
-                // We found the stop asterisk
                 float qzRight = (idx + 9 < numRuns) ? runs[idx + 9] : 999.0f;
                 float narrowMod = estimateNarrowWidth(runs, idx);
                 
-                // Verify right quiet zone and ensure payload isn't empty
                 if (qzRight >= narrowMod * 3.0f && result.length() > 0) {
                     return result.toString();
                 }
                 return null;
             }
             
-            if (decodedChar == '\0') return null; // Unrecognized valid bit pattern
+            if (decodedChar == '\0') return null; 
             
             result.append(decodedChar);
             idx += 9;
@@ -181,21 +181,28 @@ public class OneDScanner {
     }
 
     private static int toCode39Pattern(float[] runs, int startIdx) {
-        // Find average width to distinguish Wide vs Narrow
-        float totalWidth = 0.0f;
-        for (int i = 0; i < 9; i++) totalWidth += runs[startIdx + i];
+        float[] elements = new float[9];
+        System.arraycopy(runs, startIdx, elements, 0, 9);
         
-        float averageWidth = totalWidth / 9.0f;
+        // ZXing Upgrade: Strict Margin Sorting
+        float[] sorted = Arrays.copyOf(elements, 9);
+        Arrays.sort(sorted);
         
+        float maxNarrow = sorted[5]; // The largest of the 6 narrow bars
+        float minWide = sorted[6];   // The smallest of the 3 wide bars
+        
+        // If a fold distorts the width, maxNarrow and minWide will collide.
+        // The wide bar must be at least 40% larger than the narrow bar.
+        if (minWide < maxNarrow * 1.4f) {
+            return -1; // Instantly reject distorted character
+        }
+        
+        float threshold = (maxNarrow + minWide) / 2.0f;
         int pattern = 0;
         int wideCount = 0;
         
         for (int i = 0; i < 9; i++) {
-            float run = runs[startIdx + i];
-            
-            // ZXing Proportional Tolerance:
-            // A run is 'wide' if it is significantly thicker than the average.
-            if (run > averageWidth * 1.3f) {
+            if (runs[startIdx + i] > threshold) {
                 pattern = (pattern << 1) | 1;
                 wideCount++;
             } else {
@@ -203,7 +210,6 @@ public class OneDScanner {
             }
         }
         
-        // Code 39 mandates exactly 3 wide elements per character
         if (wideCount != 3) return -1;
         
         return pattern;
