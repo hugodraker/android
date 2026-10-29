@@ -18,7 +18,6 @@ import java.util.List;
 
 public class QRScanner {
 
-    // Galois Field tables for Reed-Solomon
     private static final int[] expTable = new int[512];
     private static final int[] logTable = new int[256];
     
@@ -29,7 +28,15 @@ public class QRScanner {
         0x355F, 0x3068, 0x3F31, 0x3A06, 0x24B4, 0x2183, 0x2EDA, 0x2BED
     };
 
-    // Expanded ECC tables to support Version 1 through Version 40
+    // Valid BCH(18,6) Version Information bitstrings for Versions 7 through 40
+    private static final int[] VERSION_INFO_DECODE = {
+        0x07C94, 0x085BC, 0x09A99, 0x0A4D3, 0x0BBF6, 0x0C762, 0x0D847, 0x0E60D,
+        0x0F928, 0x10B78, 0x1145D, 0x12A17, 0x13532, 0x149A6, 0x15683, 0x168C9,
+        0x177EC, 0x18EC4, 0x191E1, 0x1AFAB, 0x1B08E, 0x1CC1A, 0x1D33F, 0x1ED75,
+        0x1F250, 0x209D5, 0x216F0, 0x228BA, 0x2379F, 0x24B0B, 0x2542E, 0x26A64,
+        0x27541, 0x28C69
+    };
+
     private static final int[][] TOT_ECC = {
         {7,10,13,17}, {10,16,22,28}, {15,26,36,44}, {20,36,52,64}, {26,48,72,88},
         {36,64,96,112}, {40,72,108,130}, {48,88,132,156}, {60,110,160,192}, {72,130,192,224},
@@ -66,7 +73,6 @@ public class QRScanner {
     private static int gfMul(int a, int b) { return (a == 0 || b == 0) ? 0 : expTable[logTable[a] + logTable[b]]; }
     private static int gfInv(int a) { return expTable[255 - logTable[a]]; }
 
-    // --- Primary Execution Shell ---
     public static String scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
         try {
             return new Decoder(yPlane, w, h, rowStride).decode();
@@ -75,7 +81,6 @@ public class QRScanner {
         }
     }
 
-    // --- Object-Oriented QR Decoder ---
     private static class Decoder {
         private final byte[] yPlane;
         private final int w, h, stride;
@@ -97,6 +102,13 @@ public class QRScanner {
 
             int estimatedDim = estimateDimension(finders);
             if (estimatedDim < 21) return null;
+
+            // Phase 1: Robust BCH Version Extraction 
+            // Rather than guessing the dimension from the physical size, we force the mathematical version if found
+            int verifiedVersion = readBCHVersion(finders[0], finders[1], finders[2], estimatedDim);
+            if (verifiedVersion != -1) {
+                estimatedDim = verifiedVersion * 4 + 17;
+            }
 
             int[] offsets = {0, 4, -4, 8, -8, 12, -12};
             
@@ -155,10 +167,36 @@ public class QRScanner {
             if (!Float.isNaN(cy)) {
                 float finalX = crossCheckHorizontal((int) (cx + 0.5f), (int) (cy + 0.5f), state[2] * 2);
                 if (!Float.isNaN(finalX)) {
-                    float modSize = (state[0] + state[1] + state[2] + state[3] + state[4]) / 7.0f;
-                    mergeFinder(finders, finalX, cy, modSize);
+                    // ZXing Upgrade: Diagonal Cross-Check prevents false positives on text/linear barcodes
+                    if (crossCheckDiagonal((int) finalX, (int) cy, state[2] * 2)) {
+                        float modSize = (state[0] + state[1] + state[2] + state[3] + state[4]) / 7.0f;
+                        mergeFinder(finders, finalX, cy, modSize);
+                    }
                 }
             }
+        }
+
+        private boolean crossCheckDiagonal(int startX, int startY, int maxCount) {
+            int[] state = new int[5];
+            int i = 0;
+            // Up-Left
+            while (startX - i >= 0 && startY - i >= 0 && bin[(startY - i) * w + startX - i] != 0) { state[2]++; i++; }
+            if (startX - i < 0 || startY - i < 0) return false;
+            while (startX - i >= 0 && startY - i >= 0 && bin[(startY - i) * w + startX - i] == 0 && state[1] <= maxCount) { state[1]++; i++; }
+            if (startX - i < 0 || startY - i < 0 || state[1] > maxCount) return false;
+            while (startX - i >= 0 && startY - i >= 0 && bin[(startY - i) * w + startX - i] != 0 && state[0] <= maxCount) { state[0]++; i++; }
+            if (state[0] > maxCount) return false;
+
+            i = 1;
+            // Down-Right
+            while (startX + i < w && startY + i < h && bin[(startY + i) * w + startX + i] != 0) { state[2]++; i++; }
+            if (startX + i >= w || startY + i >= h) return false;
+            while (startX + i < w && startY + i < h && bin[(startY + i) * w + startX + i] == 0 && state[3] <= maxCount) { state[3]++; i++; }
+            if (startX + i >= w || startY + i >= h || state[3] > maxCount) return false;
+            while (startX + i < w && startY + i < h && bin[(startY + i) * w + startX + i] != 0 && state[4] <= maxCount) { state[4]++; i++; }
+            if (state[4] > maxCount) return false;
+
+            return checkRatio(state);
         }
 
         private Finder[] locateFinders() {
@@ -188,7 +226,6 @@ public class QRScanner {
                         }
                     }
                 }
-                
                 if (currentState == 4 && checkRatio(state)) handlePossibleCenter(state, y, w, finders);
             }
 
@@ -296,6 +333,52 @@ public class QRScanner {
             if (rem != 1) estimated += (rem == 0 ? 1 : (rem == 2 ? -1 : (estimated % 2 == 0 ? 1 : 2)));
             return estimated;
         }
+        
+        // ZXing Upgrade: BCH(18,6) Version Recovery for warped grids
+        private int readBCHVersion(Finder tl, Finder tr, Finder bl, int estimatedDim) {
+            if (estimatedDim < 45) return -1; // Version 7+ only
+            
+            float pTL = 3.0f, pTR = estimatedDim - 4.0f;
+            float dxTR = (tr.x - tl.x) / (pTR - pTL), dyTR = (tr.y - tl.y) / (pTR - pTL);
+            float dxBL = (bl.x - tl.x) / (pTR - pTL), dyBL = (bl.y - tl.y) / (pTR - pTL);
+
+            int version1 = 0, version2 = 0;
+            
+            // Read Top-Right block
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 3; j++) {
+                    int ix = (int) (tl.x + dxTR * (estimatedDim - 11 + j - pTL) + dxBL * (i - pTL) + 0.5f);
+                    int iy = (int) (tl.y + dyTR * (estimatedDim - 11 + j - pTL) + dyBL * (i - pTL) + 0.5f);
+                    if (ix >= 0 && ix < w && iy >= 0 && iy < h) {
+                        version1 = (version1 << 1) | bin[iy * w + ix];
+                    }
+                }
+            }
+            
+            // Read Bottom-Left block
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 3; j++) {
+                    int ix = (int) (tl.x + dxTR * (i - pTL) + dxBL * (estimatedDim - 11 + j - pTL) + 0.5f);
+                    int iy = (int) (tl.y + dyTR * (i - pTL) + dyBL * (estimatedDim - 11 + j - pTL) + 0.5f);
+                    if (ix >= 0 && ix < w && iy >= 0 && iy < h) {
+                        version2 = (version2 << 1) | bin[iy * w + ix];
+                    }
+                }
+            }
+
+            int bestVersion = -1;
+            int minDiff = 3; 
+            for (int i = 0; i < VERSION_INFO_DECODE.length; i++) {
+                int diff1 = Integer.bitCount(version1 ^ VERSION_INFO_DECODE[i]);
+                int diff2 = Integer.bitCount(version2 ^ VERSION_INFO_DECODE[i]);
+                int diff = Math.min(diff1, diff2);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    bestVersion = i + 7;
+                }
+            }
+            return minDiff <= 3 ? bestVersion : -1;
+        }
 
         private Finder locateAlignment(Finder tl, Finder tr, Finder bl, int targetDim, float modSize) {
             if (targetDim < 25) return null;
@@ -359,6 +442,7 @@ public class QRScanner {
             Perspective transform;
 
             if (align != null) {
+                // Primary 4-point Homography (Quad-to-Quad)
                 transform = Perspective.quadToQuad(
                     3.0f, 3.0f, 
                     targetDim - 4.0f, 3.0f, 
@@ -367,6 +451,7 @@ public class QRScanner {
                     tl.x, tl.y, tr.x, tr.y, align.x, align.y, bl.x, bl.y
                 );
             } else {
+                // ZXing Upgrade: Affine Fallback using 3 points if Alignment is obscured
                 float brX = tr.x - tl.x + bl.x;
                 float brY = tr.y - tl.y + bl.y;
                 transform = Perspective.quadToQuad(
@@ -386,6 +471,7 @@ public class QRScanner {
                 for (int x = 0; x < targetDim; x++) {
                     pt[0] = x; pt[1] = y;
                     transform.transform(pt);
+                    // Sample EXACTLY at sub-pixel center to prevent grid drift
                     int ix = (int) (pt[0] + 0.5f);
                     int iy = (int) (pt[1] + 0.5f);
                     if (ix >= 0 && ix < w && iy >= 0 && iy < h) {
@@ -423,7 +509,7 @@ public class QRScanner {
             if (minDiff > 3) return null; 
             
             int mask = bestFormat & 0x07;
-            byte[] rawBytes = new byte[4096]; // High capacity allocation
+            byte[] rawBytes = new byte[4096]; 
             int bits = 0, current = 0, byteIdx = 0;
             boolean upward = true;
 
@@ -635,7 +721,6 @@ public class QRScanner {
             return false;
         }
 
-        // Dynamically compute Alignment Pattern coordinates to support any QR standard dimension.
         private boolean isAlignment(int c, int r) {
             if (version < 2) return false;
             int intervals = version / 7 + 1;
@@ -656,8 +741,6 @@ public class QRScanner {
         }
     }
 
-    // --- Math & Helper Classes ---
-    
     private static class Perspective {
         float a11, a12, a13, a21, a22, a23, a31, a32, a33;
         
