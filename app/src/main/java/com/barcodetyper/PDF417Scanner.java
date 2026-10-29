@@ -27,7 +27,7 @@ public class PDF417Scanner {
         Point(float x, float y) { this.x = x; this.y = y; }
     }
 
-    public static String scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
+    public static PDF417Compaction.DecoderResult scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
         if (w < 60 || h < 15) return null;
         PDF417Data.initTables();
 
