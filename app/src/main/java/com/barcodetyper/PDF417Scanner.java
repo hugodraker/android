@@ -7,7 +7,9 @@
  *   
  *   Windows:
  *   gradlew.bat assembleDebug
+ * 
  * 2026 HUGO
+ * 
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
@@ -39,10 +41,8 @@ public class PDF417Scanner {
         if (w < 60 || h < 15) return null;
         PDF417Data.initTables();
 
-        // Phase 1: Localized Integral Binarization
         byte[] bin = binarize(yPlane, w, h, rowStride);
 
-        // Phase 2: Locate the Bounding Box Vertices
         Point[] corners = locateCorners(yPlane, w, h, rowStride);
         if (corners == null) return null;
 
@@ -56,13 +56,10 @@ public class PDF417Scanner {
         int[] votesCols = new int[31], votesDiv3 = new int[30];
         int[] votesMod3 = new int[3], votesEcc = new int[9];
 
-        // Phase 3: ZXing Contour-Aligned Row Tracing
-        // Calculate the physical pixel length of the left and right boundaries
         float leftLen = distance(tl, bl);
         float rightLen = distance(tr, br);
         float maxLen = Math.max(leftLen, rightLen);
         
-        // Super-sample the edges (step every ~1-2 pixels down the edge)
         int steps = (int) maxLen;
         if (steps < 10) return null;
 
@@ -79,7 +76,6 @@ public class PDF417Scanner {
             float endX = tr.x + dxRight * i;
             float endY = tr.y + dyRight * i;
 
-            // Draw a precise line between the interpolated left edge and right edge
             float dx = endX - startX;
             float dy = endY - startY;
             float dist = (float) Math.sqrt(dx * dx + dy * dy);
@@ -94,7 +90,6 @@ public class PDF417Scanner {
             int runLen = 0;
             int firstColor = -1;
 
-            // Extract binary runs exactly along the contour line
             for (int j = 0; j <= lineSteps; j++) {
                 int cx = (int) (startX + stepX * j + 0.5f);
                 int cy = (int) (startY + stepY * j + 0.5f);
@@ -126,7 +121,6 @@ public class PDF417Scanner {
             for (int k = 0; k < numRuns; k++) rRuns[k] = fRuns[numRuns - 1 - k];
             int rFirstColor = (firstColor + numRuns - 1) % 2;
 
-            // Extract codewords using ZXing's grid-voting mechanic
             extractLineData(fRuns, firstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, false);
             extractLineData(rRuns, rFirstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, true);
         }
@@ -171,6 +165,121 @@ public class PDF417Scanner {
             return PDF417Compaction.decodeStream(workBuf, workBuf[0]);
         }
         return null;
+    }
+
+    private static void extractLineData(float[] runs, int firstColor, CellTracker[][] grid, int[] vc, int[] vd, int[] vm, int[] ve, boolean isReversed) {
+        int numRuns = runs.length;
+        
+        for (int i = 0; i <= numRuns - 33; i++) {
+            if ((firstColor + i) % 2 != 1) continue;
+            if (!PDF417Matcher.checkStartPattern(Arrays.copyOfRange(runs, i, i + 8), null)) continue;
+
+            for (int j = i + 32; j <= numRuns - 9; j += 8) {
+                if ((firstColor + j) % 2 != 1) continue;
+                int numCw = (j - (i + 8)) / 8;
+                if (numCw < 3 || numCw > 32) continue;
+                if (!PDF417Matcher.checkStopPattern(Arrays.copyOfRange(runs, j, numRuns), numRuns - j, null)) continue;
+
+                float bestScore = 9999.0f;
+                int[] bestSeq = null;
+                float[] bestErrs = null;
+                int bestRowL = -1, bestRowR = -1;
+
+                // DECOUPLED LEFT/RIGHT ANCHOR SEARCH
+                for (int cL = 0; cL < 3; cL++) {
+                    float[] eL = new float[1];
+                    int cwL = PDF417Matcher.matchCodewordRuns(Arrays.copyOfRange(runs, i + 8, i + 16), 0, cL, eL);
+                    if (cwL < 0 || cwL >= 900) continue;
+                    int rowL = 3 * (cwL / 30) + cL;
+
+                    for (int cR = 0; cR < 3; cR++) {
+                        float[] eR = new float[1];
+                        int cwR = PDF417Matcher.matchCodewordRuns(Arrays.copyOfRange(runs, j - 8, j), 0, cR, eR);
+                        if (cwR < 0 || cwR >= 900) continue;
+                        int rowR = 3 * (cwR / 30) + cR;
+
+                        if (Math.abs(rowL - rowR) > numCw / 2 + 1) continue;
+
+                        float sumErr = eL[0] + eR[0];
+                        int[] tempSeq = new int[numCw];
+                        float[] tempErrs = new float[numCw];
+                        tempSeq[0] = cwL; tempSeq[numCw - 1] = cwR;
+                        tempErrs[0] = eL[0]; tempErrs[numCw - 1] = eR[0];
+
+                        int validData = 0;
+                        for (int col = 0; col < numCw - 2; col++) {
+                            // ZXING UPGRADE: Strict Cluster-Drift Detection
+                            int expectedRow = (int) (rowL + (rowR - rowL) * ((col + 1.0f) / (numCw - 1.0f)) + 0.5f);
+                            int expectedCluster = expectedRow % 3;
+                            if (expectedCluster < 0) expectedCluster += 3;
+
+                            float[] ek = new float[1];
+                            int cwk = PDF417Matcher.matchCodewordRuns(
+                                Arrays.copyOfRange(runs, i + 8 + (col + 1) * 8, i + 16 + (col + 1) * 8), 
+                                0, expectedCluster, ek
+                            );
+                            tempSeq[col + 1] = cwk;
+                            tempErrs[col + 1] = ek[0];
+                            
+                            if (cwk >= 0) { 
+                                validData++; 
+                                sumErr += ek[0]; 
+                            } else {
+                                sumErr += 4.0f; // Penalize cluster drift
+                            }
+                        }
+
+                        if (validData * 4 >= (numCw - 2) * 3 && sumErr < bestScore) {
+                            bestScore = sumErr;
+                            bestSeq = tempSeq;
+                            bestErrs = tempErrs;
+                            bestRowL = rowL;
+                            bestRowR = rowR;
+                        }
+                    }
+                }
+
+                if (bestSeq != null) {
+                    int cols = numCw - 2;
+                    if (cols >= 1 && cols <= 30) vc[cols]++;
+                    
+                    int cL = bestRowL % 3;
+                    int cR = bestRowR % 3;
+                    int remL = bestSeq[0] % 30, remR = bestSeq[numCw - 1] % 30;
+
+                    // ZXING UPGRADE: Row Indicator Metadata Voting
+                    if (cL == 0) vd[remL]++;
+                    else if (cL == 1) { if (remL < 27) { ve[remL / 3]++; vm[remL % 3]++; } }
+                    else if (cL == 2) vc[remL + 1]++;
+
+                    if (cR == 0) vc[remR + 1]++;
+                    else if (cR == 1) vd[remR]++;
+                    else if (cR == 2) { if (remR < 27) { ve[remR / 3]++; vm[remR % 3]++; } }
+
+                    for (int col = 0; col < cols; col++) {
+                        int expectedRow = (int) (bestRowL + (bestRowR - bestRowL) * ((col + 1.0f) / (numCw - 1.0f)) + 0.5f);
+                        if (expectedRow < 0 || expectedRow >= 90) continue;
+
+                        int cw = bestSeq[col + 1];
+                        float err = bestErrs[col + 1];
+                        if (cw < 0 || cw >= 929) continue;
+
+                        int mappedCol = isReversed ? (cols - 1 - col) : col;
+                        
+                        CellTracker cell = grid[expectedRow][mappedCol];
+                        int slot = -1;
+                        for (int k = 0; k < 3; k++) if (cell.cw[k] == cw) { slot = k; break; }
+                        if (slot == -1) for (int k = 0; k < 3; k++) if (cell.cw[k] == -1) { slot = k; break; }
+                        if (slot != -1) {
+                            cell.cw[slot] = cw;
+                            cell.votes[slot]++;
+                            if (err < cell.err[slot]) cell.err[slot] = err;
+                        }
+                    }
+                    return; 
+                }
+            }
+        }
     }
 
     private static byte[] binarize(byte[] yPlane, int w, int h, int stride) {
@@ -258,7 +367,6 @@ public class PDF417Scanner {
             if (p.y > br.y) br = p;
         }
 
-        // Expand bounds slightly to ensure full boundary capture
         tl.x -= 8; tr.x += 8;
         bl.x -= 8; br.x += 8;
 
@@ -324,110 +432,5 @@ public class PDF417Scanner {
             if (votes[i] > maxVotes) { maxVotes = votes[i]; bestIdx = i; }
         }
         return maxVotes >= 2 ? bestIdx : -1;
-    }
-
-    private static void extractLineData(float[] runs, int firstColor, CellTracker[][] grid, int[] vc, int[] vd, int[] vm, int[] ve, boolean isReversed) {
-        int numRuns = runs.length;
-        
-        for (int i = 0; i <= numRuns - 33; i++) {
-            if ((firstColor + i) % 2 != 1) continue;
-            if (!PDF417Matcher.checkStartPattern(Arrays.copyOfRange(runs, i, i + 8), null)) continue;
-
-            for (int j = i + 32; j <= numRuns - 9; j += 8) {
-                if ((firstColor + j) % 2 != 1) continue;
-                int numCw = (j - (i + 8)) / 8;
-                if (numCw < 3 || numCw > 32) continue;
-                if (!PDF417Matcher.checkStopPattern(Arrays.copyOfRange(runs, j, numRuns), numRuns - j, null)) continue;
-
-                float bestScore = 9999.0f;
-                int[] bestSeq = null;
-                float[] bestErrs = null;
-                int bestRowL = -1, bestRowR = -1;
-
-                for (int cL = 0; cL < 3; cL++) {
-                    float[] eL = new float[1];
-                    int cwL = PDF417Matcher.matchCodewordRuns(Arrays.copyOfRange(runs, i + 8, i + 16), 0, cL, eL);
-                    if (cwL < 0 || cwL >= 900) continue;
-                    int rowL = 3 * (cwL / 30) + cL;
-
-                    for (int cR = 0; cR < 3; cR++) {
-                        float[] eR = new float[1];
-                        int cwR = PDF417Matcher.matchCodewordRuns(Arrays.copyOfRange(runs, j - 8, j), 0, cR, eR);
-                        if (cwR < 0 || cwR >= 900) continue;
-                        int rowR = 3 * (cwR / 30) + cR;
-
-                        if (Math.abs(rowL - rowR) > numCw / 2 + 1) continue;
-
-                        float sumErr = eL[0] + eR[0];
-                        int[] tempSeq = new int[numCw];
-                        float[] tempErrs = new float[numCw];
-                        tempSeq[0] = cwL; tempSeq[numCw - 1] = cwR;
-                        tempErrs[0] = eL[0]; tempErrs[numCw - 1] = eR[0];
-
-                        int validData = 0;
-                        for (int col = 0; col < numCw - 2; col++) {
-                            int expectedRow = (int) (rowL + (rowR - rowL) * ((col + 1.0f) / (numCw - 1.0f)) + 0.5f);
-                            int c = expectedRow % 3;
-                            if (c < 0) c += 3; 
-
-                            float[] ek = new float[1];
-                            int cwk = PDF417Matcher.matchCodewordRuns(Arrays.copyOfRange(runs, i + 8 + (col + 1) * 8, i + 16 + (col + 1) * 8), 0, c, ek);
-                            tempSeq[col + 1] = cwk;
-                            tempErrs[col + 1] = ek[0];
-                            
-                            if (cwk >= 0) { validData++; sumErr += ek[0]; } 
-                            else sumErr += 4.0f;
-                        }
-
-                        if (validData * 4 >= (numCw - 2) * 3 && sumErr < bestScore) {
-                            bestScore = sumErr;
-                            bestSeq = tempSeq;
-                            bestErrs = tempErrs;
-                            bestRowL = rowL;
-                            bestRowR = rowR;
-                        }
-                    }
-                }
-
-                if (bestSeq != null) {
-                    int cols = numCw - 2;
-                    if (cols >= 1 && cols <= 30) vc[cols]++;
-                    
-                    int cL = bestRowL % 3;
-                    int cR = bestRowR % 3;
-                    int remL = bestSeq[0] % 30, remR = bestSeq[numCw - 1] % 30;
-
-                    if (cL == 0) vd[remL]++;
-                    else if (cL == 1) { if (remL < 27) { ve[remL / 3]++; vm[remL % 3]++; } }
-                    else if (cL == 2) vc[remL + 1]++;
-
-                    if (cR == 0) vc[remR + 1]++;
-                    else if (cR == 1) vd[remR]++;
-                    else if (cR == 2) { if (remR < 27) { ve[remR / 3]++; vm[remR % 3]++; } }
-
-                    for (int col = 0; col < cols; col++) {
-                        int expectedRow = (int) (bestRowL + (bestRowR - bestRowL) * ((col + 1.0f) / (numCw - 1.0f)) + 0.5f);
-                        if (expectedRow < 0 || expectedRow >= 90) continue;
-
-                        int cw = bestSeq[col + 1];
-                        float err = bestErrs[col + 1];
-                        if (cw < 0 || cw >= 929) continue;
-
-                        int mappedCol = isReversed ? (cols - 1 - col) : col;
-                        
-                        CellTracker cell = grid[expectedRow][mappedCol];
-                        int slot = -1;
-                        for (int k = 0; k < 3; k++) if (cell.cw[k] == cw) { slot = k; break; }
-                        if (slot == -1) for (int k = 0; k < 3; k++) if (cell.cw[k] == -1) { slot = k; break; }
-                        if (slot != -1) {
-                            cell.cw[slot] = cw;
-                            cell.votes[slot]++;
-                            if (err < cell.err[slot]) cell.err[slot] = err;
-                        }
-                    }
-                    return; 
-                }
-            }
-        }
     }
 }
