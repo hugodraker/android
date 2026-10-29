@@ -13,7 +13,9 @@
  * ============================================================================ */
 package com.barcodetyper;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 public class PDF417Scanner {
     
@@ -23,12 +25,28 @@ public class PDF417Scanner {
         int[] votes = {0, 0, 0};
     }
 
+    static class Point {
+        float x, y;
+        Point(float x, float y) { this.x = x; this.y = y; }
+    }
+
+    static class RunData {
+        float[] runs;
+        int firstColor;
+    }
+
     public static PDF417Compaction.DecoderResult scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
         if (w < 60 || h < 15) return null;
         PDF417Data.initTables();
 
-        // Phase 1: 2D Integral Image Binarization
+        // Phase 1: Localized Integral Binarization
         byte[] bin = binarize(yPlane, w, h, rowStride);
+
+        // Phase 2: Locate the Bounding Box Vertices
+        Point[] corners = locateCorners(yPlane, w, h, rowStride);
+        if (corners == null) return null;
+
+        Point tl = corners[0], bl = corners[1], tr = corners[2], br = corners[3];
 
         CellTracker[][] grid = new CellTracker[90][30];
         for (int r = 0; r < 90; r++)
@@ -38,56 +56,79 @@ public class PDF417Scanner {
         int[] votesCols = new int[31], votesDiv3 = new int[30];
         int[] votesMod3 = new int[3], votesEcc = new int[9];
 
-        // Phase 2: Stochastic Dense Ray-Casting (-30 to +30 degrees)
-        float[] slopes = new float[31];
-        for (int i = 0; i < 31; i++) slopes[i] = (i - 15) * 0.035f; 
+        // Phase 3: ZXing Contour-Aligned Row Tracing
+        // Calculate the physical pixel length of the left and right boundaries
+        float leftLen = distance(tl, bl);
+        float rightLen = distance(tr, br);
+        float maxLen = Math.max(leftLen, rightLen);
+        
+        // Super-sample the edges (step every ~1-2 pixels down the edge)
+        int steps = (int) maxLen;
+        if (steps < 10) return null;
 
-        int step = Math.max(1, h / 120);
-        int[] lineRuns = new int[w]; 
+        float dxLeft = (bl.x - tl.x) / steps;
+        float dyLeft = (bl.y - tl.y) / steps;
+        float dxRight = (br.x - tr.x) / steps;
+        float dyRight = (br.y - tr.y) / steps;
 
-        for (int y = step; y < h - step; y += step) {
-            for (float slope : slopes) {
-                int numRuns = 0;
-                int currentVal = -1;
-                int runLen = 0;
-                int firstColor = -1;
+        int[] lineRuns = new int[w];
 
-                // Trace the angled ray across the binary image
-                for (int x = 0; x < w; x++) {
-                    int cy = y + (int)((x - w / 2) * slope);
-                    int val = 0; // Default to white out-of-bounds
-                    
-                    if (cy >= 0 && cy < h) {
-                        val = bin[cy * w + x];
-                    }
+        for (int i = 0; i <= steps; i++) {
+            float startX = tl.x + dxLeft * i;
+            float startY = tl.y + dyLeft * i;
+            float endX = tr.x + dxRight * i;
+            float endY = tr.y + dyRight * i;
 
-                    if (currentVal == -1) {
-                        currentVal = val;
-                        firstColor = val;
-                        runLen = 1;
-                    } else if (val == currentVal) {
-                        runLen++;
-                    } else {
-                        lineRuns[numRuns++] = runLen;
-                        currentVal = val;
-                        runLen = 1;
-                    }
+            // Draw a precise line between the interpolated left edge and right edge
+            float dx = endX - startX;
+            float dy = endY - startY;
+            float dist = (float) Math.sqrt(dx * dx + dy * dy);
+            int lineSteps = (int) dist;
+            if (lineSteps < 20) continue;
+
+            float stepX = dx / lineSteps;
+            float stepY = dy / lineSteps;
+
+            int numRuns = 0;
+            int currentVal = -1;
+            int runLen = 0;
+            int firstColor = -1;
+
+            // Extract binary runs exactly along the contour line
+            for (int j = 0; j <= lineSteps; j++) {
+                int cx = (int) (startX + stepX * j + 0.5f);
+                int cy = (int) (startY + stepY * j + 0.5f);
+                int val = 0;
+                
+                if (cx >= 0 && cx < w && cy >= 0 && cy < h) {
+                    val = bin[cy * w + cx];
                 }
-                if (runLen > 0) lineRuns[numRuns++] = runLen;
-                if (numRuns < 17) continue;
 
-                float[] fRuns = new float[numRuns];
-                for(int i = 0; i < numRuns; i++) fRuns[i] = (float) lineRuns[i];
-
-                // Create Reversed runs for 180-degree / Upside-down support
-                float[] rRuns = new float[numRuns];
-                for(int i = 0; i < numRuns; i++) rRuns[i] = fRuns[numRuns - 1 - i];
-                int rFirstColor = (firstColor + numRuns - 1) % 2;
-
-                // Phase 3: Sieve and Extract local codeword fragments in BOTH directions
-                extractLineData(fRuns, firstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, false);
-                extractLineData(rRuns, rFirstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, true);
+                if (currentVal == -1) {
+                    currentVal = val;
+                    firstColor = val;
+                    runLen = 1;
+                } else if (val == currentVal) {
+                    runLen++;
+                } else {
+                    lineRuns[numRuns++] = runLen;
+                    currentVal = val;
+                    runLen = 1;
+                }
             }
+            if (runLen > 0) lineRuns[numRuns++] = runLen;
+            if (numRuns < 17) continue;
+
+            float[] fRuns = new float[numRuns];
+            for (int k = 0; k < numRuns; k++) fRuns[k] = (float) lineRuns[k];
+
+            float[] rRuns = new float[numRuns];
+            for (int k = 0; k < numRuns; k++) rRuns[k] = fRuns[numRuns - 1 - k];
+            int rFirstColor = (firstColor + numRuns - 1) % 2;
+
+            // Extract codewords using ZXing's grid-voting mechanic
+            extractLineData(fRuns, firstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, false);
+            extractLineData(rRuns, rFirstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, true);
         }
 
         int bestCols = getBestVote(votesCols), bestDiv3 = getBestVote(votesDiv3);
@@ -102,10 +143,9 @@ public class PDF417Scanner {
         int payloadLen = totalCw - eccCount;
 
         int[] workBuf = new int[1024];
-        int[] erasures = new int[512]; // Expanded to match fully unlocked Level 8 RS Capacity
+        int[] erasures = new int[512]; 
         int numErasures = 0;
 
-        // Phase 4: Compile the CellTracker votes into the final Read Buffer
         for (int r = 0; r < rows; r++) {
             for (int c = 0; c < bestCols; c++) {
                 CellTracker cell = grid[r][c];
@@ -127,7 +167,6 @@ public class PDF417Scanner {
             }
         }
 
-        // Phase 5: Pass stitched buffer to Unlocked Reed-Solomon Corrector
         if (PDF417ErrorCorrection.verifyAndCorrect(workBuf, payloadLen, eccCount, erasures, numErasures)) {
             return PDF417Compaction.decodeStream(workBuf, workBuf[0]);
         }
@@ -158,7 +197,6 @@ public class PDF417Scanner {
                          - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
                 long mean = sum / area;
                 
-                // Real-world dynamic glare protection: mean - (mean/16) preserves thin modules better
                 if ((yPlane[y * stride + x] & 0xFF) < mean - (mean >> 4)) {
                     bin[row + x] = 1; 
                 } else {
@@ -167,6 +205,117 @@ public class PDF417Scanner {
             }
         }
         return bin;
+    }
+
+    private static Point[] locateCorners(byte[] yPlane, int w, int h, int rowStride) {
+        List<Point> starts = new ArrayList<>();
+        List<Point> stops = new ArrayList<>();
+
+        int step = Math.max(2, h / 60);
+        int[] line = new int[w];
+
+        for (int y = step; y < h - step; y += step) {
+            for (int x = 0; x < w; x++) line[x] = yPlane[y * rowStride + x] & 0xFF;
+            
+            RunData rd = getSubpixelRuns(line, w);
+            
+            for (int i = 0; i <= rd.runs.length - 8; i++) {
+                if ((rd.firstColor + i) % 2 != 1) continue;
+                
+                if (PDF417Matcher.checkStartPattern(Arrays.copyOfRange(rd.runs, i, i + 8), null)) {
+                    float px = 0; for (int k = 0; k < i; k++) px += rd.runs[k]; 
+                    starts.add(new Point(px, y));
+                }
+                
+                if (rd.runs.length - i >= 9 && PDF417Matcher.checkStopPattern(Arrays.copyOfRange(rd.runs, i, i + 9), 9, null)) {
+                    float px = 0; for (int k = 0; k < i + 9; k++) px += rd.runs[k]; 
+                    stops.add(new Point(px, y));
+                }
+            }
+        }
+
+        if (starts.size() < 2 || stops.size() < 2) return null;
+
+        starts.sort((a, b) -> Float.compare(a.x, b.x));
+        float medStartX = starts.get(starts.size() / 2).x;
+        starts.removeIf(p -> Math.abs(p.x - medStartX) > w / 4.0f);
+
+        stops.sort((a, b) -> Float.compare(a.x, b.x));
+        float medStopX = stops.get(stops.size() / 2).x;
+        stops.removeIf(p -> Math.abs(p.x - medStopX) > w / 4.0f);
+
+        if (starts.isEmpty() || stops.isEmpty()) return null;
+
+        Point tl = starts.get(0), bl = starts.get(0);
+        for (Point p : starts) {
+            if (p.y < tl.y) tl = p;
+            if (p.y > bl.y) bl = p;
+        }
+
+        Point tr = stops.get(0), br = stops.get(0);
+        for (Point p : stops) {
+            if (p.y < tr.y) tr = p;
+            if (p.y > br.y) br = p;
+        }
+
+        // Expand bounds slightly to ensure full boundary capture
+        tl.x -= 8; tr.x += 8;
+        bl.x -= 8; br.x += 8;
+
+        if (bl.y - tl.y < 10 || br.y - tr.y < 10) return null;
+
+        return new Point[]{tl, bl, tr, br};
+    }
+
+    private static RunData getSubpixelRuns(int[] line, int w) {
+        int[] smooth = new int[w];
+        for (int x = 0; x < w; x++) {
+            smooth[x] = (x == 0 || x == w - 1) ? line[x] : (line[x - 1] + line[x] * 2 + line[x + 1]) / 4;
+        }
+        
+        int window = Math.max(24, Math.min(w, w / 5));
+        int[] thresh = new int[w];
+        long sum = 0;
+        int half = window / 2;
+        
+        for (int i = -half; i <= half; i++) sum += (i >= 0 && i < w) ? smooth[i] : smooth[0];
+        for (int x = 0; x < w; x++) {
+            thresh[x] = (int)(sum / (half * 2 + 1));
+            int left = x - half;
+            int right = x + half + 1;
+            sum += (right < w ? smooth[right] : smooth[w - 1]) - (left >= 0 ? smooth[left] : smooth[0]);
+        }
+        
+        float[] tempRuns = new float[w + 2];
+        int numRuns = 0, firstColor = -1, currentVal = -1;
+        float lastCrossX = 0.0f;
+        
+        for (int x = 0; x < w; x++) {
+            float diffCurr = (float) smooth[x] - (float) (thresh[x] - 4);
+            int val = (diffCurr < 0.0f) ? 1 : 0;
+            if (firstColor == -1) firstColor = val;
+            if (currentVal == -1) currentVal = val;
+            
+            if (val != currentVal && x > 0) {
+                float diffPrev = (float) smooth[x - 1] - (float) (thresh[x - 1] - 4);
+                float denom = diffPrev - diffCurr;
+                float frac = (Math.abs(denom) > 0.001f) ? (diffPrev / denom) : 0.5f;
+                float crossX = (float) (x - 1) + Math.max(0.0f, Math.min(1.0f, frac));
+                tempRuns[numRuns++] = crossX - lastCrossX;
+                lastCrossX = crossX;
+                currentVal = val;
+            }
+        }
+        if (lastCrossX < (float) (w - 1)) tempRuns[numRuns++] = (float) (w - 1) - lastCrossX;
+        
+        RunData rd = new RunData();
+        rd.runs = Arrays.copyOf(tempRuns, numRuns);
+        rd.firstColor = firstColor == -1 ? 0 : firstColor;
+        return rd;
+    }
+
+    private static float distance(Point p1, Point p2) {
+        return (float) Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
     }
 
     private static int getBestVote(int[] votes) {
@@ -195,8 +344,6 @@ public class PDF417Scanner {
                 float[] bestErrs = null;
                 int bestRowL = -1, bestRowR = -1;
 
-                // DECOUPLED LEFT/RIGHT ANCHOR SEARCH
-                // Allows a scanline to cut diagonally across multiple rows (for severely curved barcodes)
                 for (int cL = 0; cL < 3; cL++) {
                     float[] eL = new float[1];
                     int cwL = PDF417Matcher.matchCodewordRuns(Arrays.copyOfRange(runs, i + 8, i + 16), 0, cL, eL);
@@ -209,7 +356,6 @@ public class PDF417Scanner {
                         if (cwR < 0 || cwR >= 900) continue;
                         int rowR = 3 * (cwR / 30) + cR;
 
-                        // Reject extreme skews, but allow crossing up to ~half the row length
                         if (Math.abs(rowL - rowR) > numCw / 2 + 1) continue;
 
                         float sumErr = eL[0] + eR[0];
@@ -220,7 +366,6 @@ public class PDF417Scanner {
 
                         int validData = 0;
                         for (int col = 0; col < numCw - 2; col++) {
-                            // Dynamically interpolate the mathematical expected row for each column in the slice
                             int expectedRow = (int) (rowL + (rowR - rowL) * ((col + 1.0f) / (numCw - 1.0f)) + 0.5f);
                             int c = expectedRow % 3;
                             if (c < 0) c += 3; 
@@ -252,7 +397,6 @@ public class PDF417Scanner {
                     int cR = bestRowR % 3;
                     int remL = bestSeq[0] % 30, remR = bestSeq[numCw - 1] % 30;
 
-                    // Precisely assign PDF417 Format Information votes independently based on side/cluster
                     if (cL == 0) vd[remL]++;
                     else if (cL == 1) { if (remL < 27) { ve[remL / 3]++; vm[remL % 3]++; } }
                     else if (cL == 2) vc[remL + 1]++;
@@ -269,7 +413,6 @@ public class PDF417Scanner {
                         float err = bestErrs[col + 1];
                         if (cw < 0 || cw >= 929) continue;
 
-                        // Inverse map the columns if reading upside-down 
                         int mappedCol = isReversed ? (cols - 1 - col) : col;
                         
                         CellTracker cell = grid[expectedRow][mappedCol];
