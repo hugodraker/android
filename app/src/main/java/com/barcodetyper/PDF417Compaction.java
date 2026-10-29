@@ -1,3 +1,11 @@
+/* ============================================================================
+ * Android Barcode Scanner
+ *
+ *  2026 HUGO
+ *
+ * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+ * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
+ * ============================================================================ */
 package com.barcodetyper;
 
 import java.math.BigInteger;
@@ -6,17 +14,59 @@ public class PDF417Compaction {
     private static final String MIXED_TBL = "0123456789&\r\t,:#-.$/+%*=^";
     private static final String PUNCT_TBL = ";<>@[\\]_`~!\r\t,:\n-.$/\"|*()?{}'";
 
-    public static String decodeStream(int[] cwBuf, int payloadLen) {
+    public static class DecoderResult {
+        public String payload;
+        public int segmentIndex = -1;
+        public String fileId = null;
+        public boolean isLastSegment = false;
+
+        public boolean isMacro() {
+            return segmentIndex != -1 && fileId != null;
+        }
+    }
+
+    public static DecoderResult decodeStream(int[] cwBuf, int payloadLen) {
         if (payloadLen <= 1 || payloadLen > 928 || cwBuf[0] != payloadLen) return null;
         int realEnd = payloadLen;
         while (realEnd > 1 && cwBuf[realEnd - 1] == 900) realEnd--;
         if (realEnd <= 1) return null;
 
+        DecoderResult result = new DecoderResult();
         StringBuilder out = new StringBuilder();
         int idx = 1;
 
+        // Pre-scan for Macro PDF417 Terminator (Last Segment Indicator)
+        for (int i = 1; i < realEnd; i++) {
+            if (cwBuf[i] == 922) {
+                result.isLastSegment = true;
+                break;
+            }
+        }
+
         while (idx < realEnd) {
             int w = cwBuf[idx];
+            
+            // Handle Macro PDF417 Control Block
+            if (w == 928) {
+                idx++;
+                if (idx < realEnd) {
+                    result.segmentIndex = cwBuf[idx++];
+                    // Extract File ID (Numeric/Text sequence following segment index)
+                    StringBuilder fileIdBuilder = new StringBuilder();
+                    while (idx < realEnd && cwBuf[idx] != 922 && cwBuf[idx] < 900) {
+                        fileIdBuilder.append(cwBuf[idx++]);
+                    }
+                    result.fileId = fileIdBuilder.toString();
+                }
+                continue;
+            }
+            
+            // Skip Macro Terminator in standard data flow
+            if (w == 922) {
+                idx++;
+                continue;
+            }
+
             if (w == 900 || (w >= 0 && w < 900)) {
                 if (w == 900) idx++;
                 idx = decodeTextCompaction(cwBuf, idx, realEnd, out);
@@ -34,10 +84,12 @@ public class PDF417Compaction {
                     out.append((char) cwBuf[idx++]);
                 }
             } else {
-                return null;
+                return null; // Unrecognized mode latch
             }
         }
-        return out.length() > 0 ? out.toString() : null;
+        
+        result.payload = out.length() > 0 ? out.toString() : null;
+        return result.payload != null ? result : null;
     }
 
     private static int decodeTextCompaction(int[] cw, int idx, int limit, StringBuilder out) {
