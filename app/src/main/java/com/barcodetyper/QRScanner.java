@@ -49,7 +49,6 @@ public class QRScanner {
         try {
             return new Decoder(yPlane, w, h, rowStride).decode();
         } catch (Exception e) {
-            // Fail-safe wrapper ensures the app never crashes from malformed/noisy buffers
             return null;
         }
     }
@@ -59,6 +58,7 @@ public class QRScanner {
         private final byte[] yPlane;
         private final int w, h, stride;
         private byte[] bin;
+        private int dim, version;
 
         public Decoder(byte[] yPlane, int w, int h, int stride) {
             this.yPlane = yPlane;
@@ -73,22 +73,35 @@ public class QRScanner {
             Finder[] finders = locateFinders();
             if (finders == null) return null;
 
-            byte[] grid = extractGrid(finders);
-            if (grid == null) return null;
+            int estimatedDim = estimateDimension(finders);
+            if (estimatedDim < 21) return null;
 
-            byte[] rawData = unmaskAndRead(grid);
-            if (rawData == null) return null;
+            // Fix: Multi-pass dimension verification. Stylized finders skew module sizes. 
+            // We search outward from the estimated dimension to find the mathematically valid grid.
+            int[] offsets = {0, 4, -4, 8, -8, 12, -12};
+            
+            for (int offset : offsets) {
+                this.dim = estimatedDim + offset;
+                if (this.dim < 21 || this.dim > 177) continue;
+                this.version = (this.dim - 17) / 4;
 
-            byte[] corrected = errorCorrect(rawData);
-            if (corrected == null) return null;
+                byte[] grid = extractGrid(finders, this.dim);
+                if (grid == null) continue;
 
-            return parseMessage(corrected);
+                byte[] rawData = unmaskAndRead(grid);
+                if (rawData == null) continue;
+
+                byte[] corrected = errorCorrect(rawData);
+                if (corrected == null) continue;
+
+                String result = parseMessage(corrected);
+                if (result != null) return result;
+            }
+            return null;
         }
 
         private void binarize() {
             int rad = Math.max(12, Math.min(w, h) / 8);
-            
-            // Fix: High resolution mobile camera frames overflow a 32-bit integer integral image
             long[] intImg = new long[(w + 1) * (h + 1)];
 
             for (int y = 0; y < h; y++) {
@@ -116,6 +129,18 @@ public class QRScanner {
             }
         }
 
+        private void handlePossibleCenter(int[] state, int y, int x, List<Finder> finders) {
+            float cx = x - state[4] - state[3] - state[2] / 2.0f;
+            float cy = crossCheckVertical((int) (cx + 0.5f), y, state[2] * 2);
+            if (!Float.isNaN(cy)) {
+                float finalX = crossCheckHorizontal((int) (cx + 0.5f), (int) (cy + 0.5f), state[2] * 2);
+                if (!Float.isNaN(finalX)) {
+                    float modSize = (state[0] + state[1] + state[2] + state[3] + state[4]) / 7.0f;
+                    mergeFinder(finders, finalX, cy, modSize);
+                }
+            }
+        }
+
         private Finder[] locateFinders() {
             List<Finder> finders = new ArrayList<>();
             int[] state = new int[5];
@@ -133,21 +158,10 @@ public class QRScanner {
                         if ((currentState & 1) == 0) {
                             if (currentState == 4) {
                                 if (checkRatio(state)) {
-                                    float cx = x - state[4] - state[3] - state[2] / 2.0f;
-                                    float cy = crossCheckVertical((int) (cx + 0.5f), y, state[2] * 2);
-                                    if (!Float.isNaN(cy)) {
-                                        float finalX = crossCheckHorizontal((int) (cx + 0.5f), (int) (cy + 0.5f), state[2] * 2);
-                                        if (!Float.isNaN(finalX)) {
-                                            float modSize = (state[0] + state[1] + state[2] + state[3] + state[4]) / 7.0f;
-                                            mergeFinder(finders, finalX, cy, modSize);
-                                        }
-                                    }
-                                    state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
-                                    state[3] = 1; state[4] = 0; currentState = 3;
-                                } else {
-                                    state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
-                                    state[3] = 1; state[4] = 0; currentState = 3;
+                                    handlePossibleCenter(state, y, x, finders);
                                 }
+                                state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
+                                state[3] = 1; state[4] = 0; currentState = 3;
                             } else {
                                 currentState++; state[currentState]++;
                             }
@@ -155,6 +169,10 @@ public class QRScanner {
                             state[currentState]++;
                         }
                     }
+                }
+                
+                if (currentState == 4 && checkRatio(state)) {
+                    handlePossibleCenter(state, y, w, finders);
                 }
             }
 
@@ -185,9 +203,15 @@ public class QRScanner {
             }
             if (total < 7) return false;
             int mod = (total << 8) / 7;
-            int maxVar = Math.max(mod / 2, 200);
-            return Math.abs(mod - (state[0] << 8)) < maxVar && Math.abs(mod - (state[1] << 8)) < maxVar &&
-                   Math.abs(3 * mod - (state[2] << 8)) < 3 * maxVar && Math.abs(mod - (state[3] << 8)) < maxVar &&
+            
+            // Fix: Relax variance constraint to 100% to support stylized finders 
+            // with irregularly thick rounded borders or extremely thin internal white gaps.
+            int maxVar = Math.max(mod, 256); 
+            
+            return Math.abs(mod - (state[0] << 8)) < maxVar && 
+                   Math.abs(mod - (state[1] << 8)) < maxVar &&
+                   Math.abs(3 * mod - (state[2] << 8)) < 3 * maxVar && 
+                   Math.abs(mod - (state[3] << 8)) < maxVar &&
                    Math.abs(mod - (state[4] << 8)) < maxVar;
         }
 
@@ -251,38 +275,41 @@ public class QRScanner {
             return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
         }
 
-        int dim, version;
-        private byte[] extractGrid(Finder[] f) {
+        private int estimateDimension(Finder[] f) {
             Finder tl = f[0], tr = f[1], bl = f[2];
             float modSize = (tl.modSize + tr.modSize + bl.modSize) / 3.0f;
             float distTop = (float) Math.sqrt(distSq(tl, tr));
             float distLeft = (float) Math.sqrt(distSq(tl, bl));
             
-            dim = Math.round(((distTop + distLeft) / 2.0f) / modSize) + 7;
-            int rem = dim % 4;
-            if (rem != 1) dim += (rem == 0 ? 1 : (rem == 2 ? -1 : (dim % 2 == 0 ? 1 : 2)));
-            if (dim < 21 || dim > 57) return null;
-            version = (dim - 17) / 4;
+            int estimated = Math.round(((distTop + distLeft) / 2.0f) / modSize) + 7;
+            int rem = estimated % 4;
+            if (rem != 1) estimated += (rem == 0 ? 1 : (rem == 2 ? -1 : (estimated % 2 == 0 ? 1 : 2)));
+            return estimated;
+        }
 
-            float pTL = 3.0f, pTR = dim - 4.0f;
+        private byte[] extractGrid(Finder[] f, int targetDim) {
+            Finder tl = f[0], tr = f[1], bl = f[2];
+            
+            float pTL = 3.0f, pTR = targetDim - 4.0f;
             float dxTR = (tr.x - tl.x) / (pTR - pTL), dyTR = (tr.y - tl.y) / (pTR - pTL);
             float dxBL = (bl.x - tl.x) / (pTR - pTL), dyBL = (bl.y - tl.y) / (pTR - pTL);
 
-            byte[] grid = new byte[dim * dim];
-            for (int y = 0; y < dim; y++) {
+            byte[] grid = new byte[targetDim * targetDim];
+            for (int y = 0; y < targetDim; y++) {
                 float rowX = tl.x + dxBL * (y - pTL);
                 float rowY = tl.y + dyBL * (y - pTL);
-                for (int x = 0; x < dim; x++) {
+                for (int x = 0; x < targetDim; x++) {
                     int ix = (int) (rowX + dxTR * (x - pTL) + 0.5f);
                     int iy = (int) (rowY + dyTR * (x - pTL) + 0.5f);
-                    if (ix >= 0 && ix < w && iy >= 0 && iy < h) grid[y * dim + x] = bin[iy * w + ix];
+                    if (ix >= 0 && ix < w && iy >= 0 && iy < h) grid[y * targetDim + x] = bin[iy * w + ix];
                 }
             }
             return grid;
         }
 
+        int dataBytes, eccBytes, blocks;
+        
         private byte[] unmaskAndRead(byte[] grid) {
-            // Fix: Add parsing fallback using redundant Format Information location.
             int fmt1 = 0, fmt2 = 0;
             for (int i = 0; i < 6; i++) fmt1 = (fmt1 << 1) | grid[8 * dim + i];
             fmt1 = (fmt1 << 1) | grid[8 * dim + 7];
@@ -307,7 +334,7 @@ public class QRScanner {
             if (minDiff > 3) return null; 
             
             int mask = bestFormat & 0x07;
-            byte[] rawBytes = new byte[1024]; // Safety net bump
+            byte[] rawBytes = new byte[1024];
             int bits = 0, current = 0, byteIdx = 0;
             boolean upward = true;
 
@@ -317,16 +344,13 @@ public class QRScanner {
                     int r = upward ? dim - 1 - y : y;
                     for (int cOffset = 0; cOffset < 2; cOffset++) {
                         int c = x - cOffset;
-                        // Skip Finder, Format Info, and Timing Patterns
                         if ((r < 9 && c < 9) || (r < 9 && c >= dim - 8) || (r >= dim - 8 && c < 9) || r == 6 || c == 6) continue;
                         
-                        // Fix: Version Information Block overlapping must be explicitly skipped for version >= 7
                         if (version >= 7) {
                             if (r < 6 && c >= dim - 11 && c <= dim - 9) continue;
                             if (c < 6 && r >= dim - 11 && r <= dim - 9) continue;
                         }
                         
-                        // Skip Alignment Patterns
                         if (isAlignment(c, r)) continue;
 
                         int bit = grid[r * dim + c];
@@ -364,7 +388,6 @@ public class QRScanner {
             return trimmed;
         }
 
-        int dataBytes, eccBytes, blocks;
         private byte[] errorCorrect(byte[] rawData) {
             int eccPerBlock = eccBytes / blocks;
             int shortBlock = dataBytes / blocks;
@@ -429,10 +452,9 @@ public class QRScanner {
                 }
             }
             
-            // Fix: Hardcapped RS bounds (`L > 16`) improperly rejected viable recovery blocks
             if (L > eLen / 2) return false;
 
-            int[] errPos = new int[64]; // Fix: Increased maximum position pool
+            int[] errPos = new int[64];
             int errCnt = 0;
             for (int i = 0; i < N; i++) {
                 int p = N - 1 - i, eval = 0, xPow = 1, xInv = expTable[(255 - (p % 255)) % 255];
