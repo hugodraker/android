@@ -13,7 +13,9 @@
  * ============================================================================ */
 package com.barcodetyper;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 public class PDF417Scanner {
     static class CellTracker {
@@ -27,31 +29,65 @@ public class PDF417Scanner {
         Point(float x, float y) { this.x = x; this.y = y; }
     }
 
+    static class RunData {
+        float[] runs;
+        int firstColor;
+    }
+
     public static PDF417Compaction.DecoderResult scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
         if (w < 60 || h < 15) return null;
         PDF417Data.initTables();
 
-        // Phase 1: 2D Integral Image Binarization (Glare/Shadow Immunity)
-        byte[] bin = binarize(yPlane, w, h, rowStride);
-
-        // Phase 2: Boundary Detection (Find 4 Corners)
-        Point[] corners = locateCorners(bin, w, h);
+        // Phase 1: Robust 1D Sub-Pixel Search to locate all Start/Stop pattern fragments
+        Point[] corners = locateCorners(yPlane, w, h, rowStride);
         if (corners == null) return null;
 
         Point tl = corners[0], bl = corners[1], tr = corners[2], br = corners[3];
 
-        // Calculate flattened dimensions
-        int flatWidth = (int) ((distance(tl, tr) + distance(bl, br)) / 2.0f);
-        int flatHeight = (int) ((distance(tl, bl) + distance(tr, br)) / 2.0f);
+        // Expand bounds slightly to ensure we don't crop the outer bars of the guard patterns
+        tl.x -= 4; tl.y -= 4;
+        bl.x -= 4; bl.y += 4;
+        tr.x += 4; tr.y -= 4;
+        br.x += 4; br.y += 4;
+
+        int flatWidth = (int) ((distance(tl, tr) + distance(bl, br)) / 2.0f) + 8;
+        int flatHeight = (int) ((distance(tl, bl) + distance(tr, br)) / 2.0f) + 8;
         if (flatWidth < 50 || flatHeight < 10) return null;
 
-        // Phase 3: Homography / Perspective Unwarping
+        // Phase 2: Calculate Homography Projection
         Perspective transform = Perspective.quadToQuad(
             0, 0, flatWidth, 0, flatWidth, flatHeight, 0, flatHeight,
             tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y
         );
         if (transform == null) return null;
 
+        // Phase 3: Unwarp image as Grayscale via Bilinear Interpolation (Retains Sub-Pixel Accuracy)
+        int[][] flatGrid = new int[flatHeight][flatWidth];
+        float[] pt = new float[2];
+        for (int y = 0; y < flatHeight; y++) {
+            for (int x = 0; x < flatWidth; x++) {
+                pt[0] = x; pt[1] = y;
+                transform.transform(pt);
+                int srcX = (int) pt[0];
+                int srcY = (int) pt[1];
+                
+                if (srcX >= 0 && srcX < w - 1 && srcY >= 0 && srcY < h - 1) {
+                    float dx = pt[0] - srcX;
+                    float dy = pt[1] - srcY;
+                    int p00 = yPlane[srcY * rowStride + srcX] & 0xFF;
+                    int p10 = yPlane[srcY * rowStride + srcX + 1] & 0xFF;
+                    int p01 = yPlane[(srcY + 1) * rowStride + srcX] & 0xFF;
+                    int p11 = yPlane[(srcY + 1) * rowStride + srcX + 1] & 0xFF;
+                    float top = p00 * (1.0f - dx) + p10 * dx;
+                    float bot = p01 * (1.0f - dx) + p11 * dx;
+                    flatGrid[y][x] = (int) (top * (1.0f - dy) + bot * dy);
+                } else {
+                    flatGrid[y][x] = 255;
+                }
+            }
+        }
+
+        // Phase 4: Decode Flattened Grid using mathematical row slicing
         CellTracker[][] grid = new CellTracker[90][30];
         for (int r = 0; r < 90; r++)
             for (int c = 0; c < 30; c++)
@@ -60,25 +96,9 @@ public class PDF417Scanner {
         int[] votesCols = new int[31], votesDiv3 = new int[30];
         int[] votesMod3 = new int[3], votesEcc = new int[9];
 
-        // Phase 4: Row Super-Sampling on Flattened Grid
-        // We step mathematically through the flattened Y-axis, eliminating diagonal slope guessing.
         int step = Math.max(1, flatHeight / 120);
-        float[] pt = new float[2];
-        int[] line = new int[flatWidth];
-
         for (int y = 2; y < flatHeight - 2; y += step) {
-            for (int x = 0; x < flatWidth; x++) {
-                pt[0] = x; pt[1] = y;
-                transform.transform(pt);
-                int srcX = (int) (pt[0] + 0.5f);
-                int srcY = (int) (pt[1] + 0.5f);
-                if (srcX >= 0 && srcX < w && srcY >= 0 && srcY < h) {
-                    line[x] = bin[srcY * w + srcX] == 1 ? 0 : 255; 
-                } else {
-                    line[x] = 255;
-                }
-            }
-            extractFlattenedRow(line, flatWidth, grid, votesCols, votesDiv3, votesMod3, votesEcc);
+            extractRowData(flatGrid[y], flatWidth, grid, votesCols, votesDiv3, votesMod3, votesEcc);
         }
 
         int bestCols = getBestVote(votesCols), bestDiv3 = getBestVote(votesDiv3);
@@ -123,133 +143,116 @@ public class PDF417Scanner {
         return null;
     }
 
-    private static byte[] binarize(byte[] yPlane, int w, int h, int stride) {
-        byte[] bin = new byte[w * h];
-        int rad = Math.max(12, Math.min(w, h) / 8);
-        long[] intImg = new long[(w + 1) * (h + 1)];
+    private static Point[] locateCorners(byte[] yPlane, int w, int h, int rowStride) {
+        List<Point> starts = new ArrayList<>();
+        List<Point> stops = new ArrayList<>();
 
-        for (int y = 0; y < h; y++) {
-            long rowSum = 0;
-            int srcRow = y * stride;
-            for (int x = 0; x < w; x++) {
-                rowSum += (yPlane[srcRow + x] & 0xFF);
-                intImg[(y + 1) * (w + 1) + (x + 1)] = intImg[y * (w + 1) + (x + 1)] + rowSum;
-            }
-        }
+        int step = Math.max(2, h / 60);
+        int[] line = new int[w];
 
-        for (int y = 0; y < h; y++) {
-            int y0 = Math.max(0, y - rad), y1 = Math.min(h - 1, y + rad);
-            int row = y * w;
-            for (int x = 0; x < w; x++) {
-                int x0 = Math.max(0, x - rad), x1 = Math.min(w - 1, x + rad);
-                long area = (long)(x1 - x0 + 1) * (y1 - y0 + 1);
-                long sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
-                         - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
-                long mean = sum / area;
-                if ((yPlane[y * stride + x] & 0xFF) < mean - (mean >> 4)) {
-                    bin[row + x] = 1; // 1 is black
+        // Sweep the image to collect all visible Start and Stop pattern outer edges
+        for (int y = step; y < h - step; y += step) {
+            for (int x = 0; x < w; x++) line[x] = yPlane[y * rowStride + x] & 0xFF;
+            
+            RunData rd = getSubpixelRuns(line, w);
+            
+            for (int i = 0; i <= rd.runs.length - 8; i++) {
+                if ((rd.firstColor + i) % 2 != 1) continue;
+                
+                if (PDF417Matcher.checkStartPattern(Arrays.copyOfRange(rd.runs, i, i + 8), null)) {
+                    float px = 0; for (int k = 0; k < i; k++) px += rd.runs[k]; // Outer Left Bound
+                    starts.add(new Point(px, y));
+                }
+                
+                if (rd.runs.length - i >= 9 && PDF417Matcher.checkStopPattern(Arrays.copyOfRange(rd.runs, i, i + 9), 9, null)) {
+                    float px = 0; for (int k = 0; k < i + 9; k++) px += rd.runs[k]; // Outer Right Bound
+                    stops.add(new Point(px, y));
                 }
             }
         }
-        return bin;
-    }
 
-    private static Point[] locateCorners(byte[] bin, int w, int h) {
-        Point tl = null, tr = null, bl = null, br = null;
-        int step = Math.max(1, h / 60);
+        if (starts.size() < 2 || stops.size() < 2) return null;
 
-        // Scan downwards for Top-Left and Top-Right
-        for (int y = 0; y < h; y += step) {
-            float[] runs = extractRuns(bin, w, y);
-            if (tl == null) tl = findPatternCenter(runs, y, true);
-            if (tr == null) tr = findPatternCenter(runs, y, false);
-            if (tl != null && tr != null) break;
+        // Filter outliers mathematically
+        starts.sort((a, b) -> Float.compare(a.x, b.x));
+        float medStartX = starts.get(starts.size() / 2).x;
+        starts.removeIf(p -> Math.abs(p.x - medStartX) > w / 4.0f);
+
+        stops.sort((a, b) -> Float.compare(a.x, b.x));
+        float medStopX = stops.get(stops.size() / 2).x;
+        stops.removeIf(p -> Math.abs(p.x - medStopX) > w / 4.0f);
+
+        if (starts.isEmpty() || stops.isEmpty()) return null;
+
+        Point tl = starts.get(0), bl = starts.get(0);
+        for (Point p : starts) {
+            if (p.y < tl.y) tl = p;
+            if (p.y > bl.y) bl = p;
         }
 
-        // Scan upwards for Bottom-Left and Bottom-Right
-        for (int y = h - 1; y >= 0; y -= step) {
-            float[] runs = extractRuns(bin, w, y);
-            if (bl == null) bl = findPatternCenter(runs, y, true);
-            if (br == null) br = findPatternCenter(runs, y, false);
-            if (bl != null && br != null) break;
+        Point tr = stops.get(0), br = stops.get(0);
+        for (Point p : stops) {
+            if (p.y < tr.y) tr = p;
+            if (p.y > br.y) br = p;
         }
 
-        if (tl == null || tr == null || bl == null || br == null) return null;
+        if (bl.y - tl.y < 10 || br.y - tr.y < 10) return null;
+
         return new Point[]{tl, bl, tr, br};
     }
 
-    private static float[] extractRuns(byte[] bin, int w, int y) {
-        float[] runs = new float[w + 2];
-        int numRuns = 0;
-        int currentVal = bin[y * w];
-        float lastCross = 0.0f;
+    private static RunData getSubpixelRuns(int[] line, int w) {
+        int[] smooth = new int[w];
+        for (int x = 0; x < w; x++) {
+            smooth[x] = (x == 0 || x == w - 1) ? line[x] : (line[x - 1] + line[x] * 2 + line[x + 1]) / 4;
+        }
         
-        for (int x = 1; x < w; x++) {
-            if (bin[y * w + x] != currentVal) {
-                runs[numRuns++] = x - lastCross;
-                lastCross = x;
-                currentVal = bin[y * w + x];
-            }
+        int window = Math.max(24, Math.min(w, w / 5));
+        int[] thresh = new int[w];
+        long sum = 0;
+        int half = window / 2;
+        
+        for (int i = -half; i <= half; i++) sum += (i >= 0 && i < w) ? smooth[i] : smooth[0];
+        for (int x = 0; x < w; x++) {
+            thresh[x] = (int)(sum / (half * 2 + 1));
+            int left = x - half;
+            int right = x + half + 1;
+            sum += (right < w ? smooth[right] : smooth[w - 1]) - (left >= 0 ? smooth[left] : smooth[0]);
         }
-        runs[numRuns++] = w - lastCross;
-        return Arrays.copyOf(runs, numRuns);
-    }
-
-    private static Point findPatternCenter(float[] runs, int y, boolean isStart) {
-        float currentX = 0;
-        for (int i = 0; i <= runs.length - (isStart ? 8 : 9); i++) {
-            if (i % 2 == 0) { // Black bar starts
-                if (isStart) {
-                    if (PDF417Matcher.checkStartPattern(Arrays.copyOfRange(runs, i, i + 8), null)) {
-                        return new Point(currentX + (sumRuns(runs, i, 8) / 2.0f), y);
-                    }
-                } else {
-                    if (PDF417Matcher.checkStopPattern(Arrays.copyOfRange(runs, i, i + 9), 9, null)) {
-                        return new Point(currentX + (sumRuns(runs, i, 9) / 2.0f), y);
-                    }
-                }
-            }
-            currentX += runs[i];
-        }
-        return null;
-    }
-
-    private static float sumRuns(float[] runs, int start, int length) {
-        float sum = 0;
-        for (int i = 0; i < length; i++) sum += runs[start + i];
-        return sum;
-    }
-
-    private static float distance(Point p1, Point p2) {
-        return (float) Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
-    }
-
-    private static int getBestVote(int[] votes) {
-        int bestIdx = -1, maxVotes = 0;
-        for (int i = 0; i < votes.length; i++) {
-            if (votes[i] > maxVotes) { maxVotes = votes[i]; bestIdx = i; }
-        }
-        return maxVotes >= 2 ? bestIdx : -1;
-    }
-
-    // Since the image is now flattened and binarized globally, 
-    // we bypass the 1D adaptive thresholding entirely and directly measure runs.
-    private static void extractFlattenedRow(int[] line, int w, CellTracker[][] grid, int[] vc, int[] vd, int[] vm, int[] ve) {
-        float[] runs = new float[w + 2];
-        int numRuns = 0;
-        int currentVal = line[0] < 128 ? 1 : 0; // Black is 1
-        int firstColor = currentVal;
+        
+        float[] tempRuns = new float[w + 2];
+        int numRuns = 0, firstColor = -1, currentVal = -1;
         float lastCrossX = 0.0f;
-
-        for (int x = 1; x < w; x++) {
-            int val = line[x] < 128 ? 1 : 0;
-            if (val != currentVal) {
-                runs[numRuns++] = x - lastCrossX;
-                lastCrossX = x;
+        
+        for (int x = 0; x < w; x++) {
+            float diffCurr = (float) smooth[x] - (float) (thresh[x] - 4);
+            int val = (diffCurr < 0.0f) ? 1 : 0;
+            if (firstColor == -1) firstColor = val;
+            if (currentVal == -1) currentVal = val;
+            
+            if (val != currentVal && x > 0) {
+                float diffPrev = (float) smooth[x - 1] - (float) (thresh[x - 1] - 4);
+                float denom = diffPrev - diffCurr;
+                float frac = (Math.abs(denom) > 0.001f) ? (diffPrev / denom) : 0.5f;
+                float crossX = (float) (x - 1) + Math.max(0.0f, Math.min(1.0f, frac));
+                tempRuns[numRuns++] = crossX - lastCrossX;
+                lastCrossX = crossX;
                 currentVal = val;
             }
         }
-        if (lastCrossX < (float) (w - 1)) runs[numRuns++] = (float) (w - 1) - lastCrossX;
+        if (lastCrossX < (float) (w - 1)) tempRuns[numRuns++] = (float) (w - 1) - lastCrossX;
+        
+        RunData rd = new RunData();
+        rd.runs = Arrays.copyOf(tempRuns, numRuns);
+        rd.firstColor = firstColor == -1 ? 0 : firstColor;
+        return rd;
+    }
+
+    private static void extractRowData(int[] line, int w, CellTracker[][] grid, int[] vc, int[] vd, int[] vm, int[] ve) {
+        RunData rd = getSubpixelRuns(line, w);
+        float[] runs = rd.runs;
+        int firstColor = rd.firstColor;
+        int numRuns = runs.length;
 
         for (int i = 0; i <= numRuns - 33; i++) {
             if ((firstColor + i) % 2 != 1) continue;
@@ -324,10 +327,22 @@ public class PDF417Scanner {
                             if (err < cell.err[slot]) cell.err[slot] = err;
                         }
                     }
-                    return;
+                    return; 
                 }
             }
         }
+    }
+
+    private static float distance(Point p1, Point p2) {
+        return (float) Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+    }
+
+    private static int getBestVote(int[] votes) {
+        int bestIdx = -1, maxVotes = 0;
+        for (int i = 0; i < votes.length; i++) {
+            if (votes[i] > maxVotes) { maxVotes = votes[i]; bestIdx = i; }
+        }
+        return maxVotes >= 2 ? bestIdx : -1;
     }
 
     // --- Perspective Mathematics Class ---
