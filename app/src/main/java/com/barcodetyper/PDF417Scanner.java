@@ -17,7 +17,9 @@ package com.barcodetyper;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class PDF417Scanner {
     
@@ -36,6 +38,14 @@ public class PDF417Scanner {
         float[] runs;
         int firstColor;
     }
+
+    static class Vote {
+        int count = 0;
+        long lastSeen = 0;
+    }
+
+    // ZXing Upgrade: Multi-Frame Consensus Cache to reject crease-induced miscorrections
+    private static final Map<String, Vote> consensusCache = new HashMap<>();
 
     public static PDF417Compaction.DecoderResult scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
         if (w < 60 || h < 15) return null;
@@ -56,75 +66,109 @@ public class PDF417Scanner {
         int[] votesCols = new int[31], votesDiv3 = new int[30];
         int[] votesMod3 = new int[3], votesEcc = new int[9];
 
+        // ---------------------------------------------------------
+        // SWEEP 1: ZXing Contour-Aligned Tracing (For Flat/Rotated)
+        // ---------------------------------------------------------
         float leftLen = distance(tl, bl);
         float rightLen = distance(tr, br);
         float maxLen = Math.max(leftLen, rightLen);
         
         int steps = (int) maxLen;
-        if (steps < 10) return null;
+        if (steps >= 10) {
+            float dxLeft = (bl.x - tl.x) / steps;
+            float dyLeft = (bl.y - tl.y) / steps;
+            float dxRight = (br.x - tr.x) / steps;
+            float dyRight = (br.y - tr.y) / steps;
 
-        float dxLeft = (bl.x - tl.x) / steps;
-        float dyLeft = (bl.y - tl.y) / steps;
-        float dxRight = (br.x - tr.x) / steps;
-        float dyRight = (br.y - tr.y) / steps;
+            int[] lineRuns = new int[w];
 
-        int[] lineRuns = new int[w];
+            for (int i = 0; i <= steps; i++) {
+                float startX = tl.x + dxLeft * i;
+                float startY = tl.y + dyLeft * i;
+                float endX = tr.x + dxRight * i;
+                float endY = tr.y + dyRight * i;
 
-        for (int i = 0; i <= steps; i++) {
-            float startX = tl.x + dxLeft * i;
-            float startY = tl.y + dyLeft * i;
-            float endX = tr.x + dxRight * i;
-            float endY = tr.y + dyRight * i;
+                float dx = endX - startX;
+                float dy = endY - startY;
+                int lineSteps = (int) Math.sqrt(dx * dx + dy * dy);
+                if (lineSteps < 20) continue;
 
-            float dx = endX - startX;
-            float dy = endY - startY;
-            float dist = (float) Math.sqrt(dx * dx + dy * dy);
-            int lineSteps = (int) dist;
-            if (lineSteps < 20) continue;
+                float stepX = dx / lineSteps;
+                float stepY = dy / lineSteps;
 
-            float stepX = dx / lineSteps;
-            float stepY = dy / lineSteps;
+                int numRuns = 0, currentVal = -1, runLen = 0, firstColor = -1;
 
-            int numRuns = 0;
-            int currentVal = -1;
-            int runLen = 0;
-            int firstColor = -1;
-
-            for (int j = 0; j <= lineSteps; j++) {
-                int cx = (int) (startX + stepX * j + 0.5f);
-                int cy = (int) (startY + stepY * j + 0.5f);
-                int val = 0;
-                
-                if (cx >= 0 && cx < w && cy >= 0 && cy < h) {
-                    val = bin[cy * w + cx];
+                for (int j = 0; j <= lineSteps; j++) {
+                    int cx = (int) (startX + stepX * j + 0.5f);
+                    int cy = (int) (startY + stepY * j + 0.5f);
+                    int val = (cx >= 0 && cx < w && cy >= 0 && cy < h) ? bin[cy * w + cx] : 0;
+                    
+                    if (currentVal == -1) {
+                        currentVal = val; firstColor = val; runLen = 1;
+                    } else if (val == currentVal) {
+                        runLen++;
+                    } else {
+                        lineRuns[numRuns++] = runLen;
+                        currentVal = val; runLen = 1;
+                    }
                 }
+                if (runLen > 0) lineRuns[numRuns++] = runLen;
+                if (numRuns < 17) continue;
 
-                if (currentVal == -1) {
-                    currentVal = val;
-                    firstColor = val;
-                    runLen = 1;
-                } else if (val == currentVal) {
-                    runLen++;
-                } else {
-                    lineRuns[numRuns++] = runLen;
-                    currentVal = val;
-                    runLen = 1;
-                }
+                float[] fRuns = new float[numRuns];
+                for (int k = 0; k < numRuns; k++) fRuns[k] = (float) lineRuns[k];
+                float[] rRuns = new float[numRuns];
+                for (int k = 0; k < numRuns; k++) rRuns[k] = fRuns[numRuns - 1 - k];
+                int rFirstColor = (firstColor + numRuns - 1) % 2;
+
+                extractLineData(fRuns, firstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, false);
+                extractLineData(rRuns, rFirstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, true);
             }
-            if (runLen > 0) lineRuns[numRuns++] = runLen;
-            if (numRuns < 17) continue;
-
-            float[] fRuns = new float[numRuns];
-            for (int k = 0; k < numRuns; k++) fRuns[k] = (float) lineRuns[k];
-
-            float[] rRuns = new float[numRuns];
-            for (int k = 0; k < numRuns; k++) rRuns[k] = fRuns[numRuns - 1 - k];
-            int rFirstColor = (firstColor + numRuns - 1) % 2;
-
-            extractLineData(fRuns, firstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, false);
-            extractLineData(rRuns, rFirstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, true);
         }
 
+        // ---------------------------------------------------------
+        // SWEEP 2: Angled Ray-Casting (The Fold & Crease Catcher)
+        // ---------------------------------------------------------
+        int minY = (int) Math.max(0, Math.min(tl.y, tr.y) - 10);
+        int maxY = (int) Math.min(h - 1, Math.max(bl.y, br.y) + 10);
+        float[] slopes = {0.0f, 0.05f, -0.05f, 0.1f, -0.1f, 0.15f, -0.15f};
+        int rayStep = Math.max(1, (maxY - minY) / 60);
+        int[] rayRuns = new int[w];
+
+        for (int y = minY; y <= maxY; y += rayStep) {
+            for (float slope : slopes) {
+                int numRuns = 0, currentVal = -1, runLen = 0, firstColor = -1;
+
+                for (int x = 0; x < w; x++) {
+                    int cy = y + (int)((x - w / 2) * slope);
+                    int val = (cy >= 0 && cy < h) ? bin[cy * w + x] : 0;
+                    
+                    if (currentVal == -1) {
+                        currentVal = val; firstColor = val; runLen = 1;
+                    } else if (val == currentVal) {
+                        runLen++;
+                    } else {
+                        rayRuns[numRuns++] = runLen;
+                        currentVal = val; runLen = 1;
+                    }
+                }
+                if (runLen > 0) rayRuns[numRuns++] = runLen;
+                if (numRuns < 17) continue;
+
+                float[] fRuns = new float[numRuns];
+                for (int k = 0; k < numRuns; k++) fRuns[k] = (float) rayRuns[k];
+                float[] rRuns = new float[numRuns];
+                for (int k = 0; k < numRuns; k++) rRuns[k] = fRuns[numRuns - 1 - k];
+                int rFirstColor = (firstColor + numRuns - 1) % 2;
+
+                extractLineData(fRuns, firstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, false);
+                extractLineData(rRuns, rFirstColor, grid, votesCols, votesDiv3, votesMod3, votesEcc, true);
+            }
+        }
+
+        // ---------------------------------------------------------
+        // GRID ASSEMBLY & REED-SOLOMON CORRECTION
+        // ---------------------------------------------------------
         int bestCols = getBestVote(votesCols), bestDiv3 = getBestVote(votesDiv3);
         int bestMod3 = getBestVote(votesMod3), bestEcc = getBestVote(votesEcc);
 
@@ -162,7 +206,24 @@ public class PDF417Scanner {
         }
 
         if (PDF417ErrorCorrection.verifyAndCorrect(workBuf, payloadLen, eccCount, erasures, numErasures)) {
-            return PDF417Compaction.decodeStream(workBuf, workBuf[0]);
+            PDF417Compaction.DecoderResult result = PDF417Compaction.decodeStream(workBuf, workBuf[0]);
+            
+            if (result != null && result.payload != null) {
+                long now = System.currentTimeMillis();
+                
+                // Prune stale votes older than 2.5 seconds
+                consensusCache.entrySet().removeIf(entry -> now - entry.getValue().lastSeen > 2500);
+                
+                Vote v = consensusCache.computeIfAbsent(result.payload, k -> new Vote());
+                v.count++;
+                v.lastSeen = now;
+                
+                // If ECC is low (ECC < 16 words), a fold can easily trick the math. Require 2 identical frames.
+                // High ECC (>= 16 words) is mathematically secure enough to return immediately.
+                if (v.count >= 2 || eccCount >= 16) {
+                    return result;
+                }
+            }
         }
         return null;
     }
@@ -185,7 +246,6 @@ public class PDF417Scanner {
                 float[] bestErrs = null;
                 int bestRowL = -1, bestRowR = -1;
 
-                // DECOUPLED LEFT/RIGHT ANCHOR SEARCH
                 for (int cL = 0; cL < 3; cL++) {
                     float[] eL = new float[1];
                     int cwL = PDF417Matcher.matchCodewordRuns(Arrays.copyOfRange(runs, i + 8, i + 16), 0, cL, eL);
@@ -208,7 +268,6 @@ public class PDF417Scanner {
 
                         int validData = 0;
                         for (int col = 0; col < numCw - 2; col++) {
-                            // ZXING UPGRADE: Strict Cluster-Drift Detection
                             int expectedRow = (int) (rowL + (rowR - rowL) * ((col + 1.0f) / (numCw - 1.0f)) + 0.5f);
                             int expectedCluster = expectedRow % 3;
                             if (expectedCluster < 0) expectedCluster += 3;
@@ -225,7 +284,7 @@ public class PDF417Scanner {
                                 validData++; 
                                 sumErr += ek[0]; 
                             } else {
-                                sumErr += 4.0f; // Penalize cluster drift
+                                sumErr += 4.0f;
                             }
                         }
 
@@ -247,7 +306,6 @@ public class PDF417Scanner {
                     int cR = bestRowR % 3;
                     int remL = bestSeq[0] % 30, remR = bestSeq[numCw - 1] % 30;
 
-                    // ZXING UPGRADE: Row Indicator Metadata Voting
                     if (cL == 0) vd[remL]++;
                     else if (cL == 1) { if (remL < 27) { ve[remL / 3]++; vm[remL % 3]++; } }
                     else if (cL == 2) vc[remL + 1]++;
