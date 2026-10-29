@@ -18,16 +18,38 @@ import java.util.List;
 
 public class QRScanner {
 
-    // Galois Field tables for Reed-Solomon (QR uses polynomial 0x11D)
+    // Galois Field tables for Reed-Solomon
     private static final int[] expTable = new int[512];
     private static final int[] logTable = new int[256];
     
-    // 32 Valid BCH(15,5) Format Information Strings (pre-XOR'd with 0x5412)
     private static final int[] FORMAT_INFO_DECODE = {
         0x5412, 0x5125, 0x5E7C, 0x5B4B, 0x45F9, 0x40CE, 0x4F97, 0x4AA0,
         0x77C4, 0x72F3, 0x7DAA, 0x789D, 0x662F, 0x6318, 0x6C41, 0x6976,
         0x1689, 0x13BE, 0x1CE7, 0x19D0, 0x0762, 0x0255, 0x0D0C, 0x083B,
         0x355F, 0x3068, 0x3F31, 0x3A06, 0x24B4, 0x2183, 0x2EDA, 0x2BED
+    };
+
+    // Expanded ECC tables to support Version 1 through Version 40
+    private static final int[][] TOT_ECC = {
+        {7,10,13,17}, {10,16,22,28}, {15,26,36,44}, {20,36,52,64}, {26,48,72,88},
+        {36,64,96,112}, {40,72,108,130}, {48,88,132,156}, {60,110,160,192}, {72,130,192,224},
+        {80,150,224,264}, {96,176,260,308}, {104,198,288,352}, {120,216,320,384}, {132,240,360,432},
+        {144,280,408,480}, {168,308,448,532}, {180,338,504,588}, {196,364,546,650}, {224,416,600,700},
+        {224,442,644,750}, {252,476,690,816}, {270,504,750,900}, {300,560,810,960}, {312,588,870,1050},
+        {336,644,952,1110}, {360,700,1020,1200}, {390,728,1050,1260}, {420,784,1140,1350}, {450,812,1200,1440},
+        {480,868,1290,1530}, {510,924,1350,1620}, {540,980,1440,1710}, {570,1036,1530,1800}, {570,1064,1590,1890},
+        {600,1120,1680,1980}, {630,1204,1770,2100}, {660,1260,1860,2220}, {720,1316,1950,2310}, {750,1372,2040,2430}
+    };
+    
+    private static final int[][] NUM_BLK = {
+        {1,1,1,1}, {1,1,1,1}, {1,1,2,2}, {1,2,2,4}, {1,2,4,4},
+        {2,4,4,4}, {2,4,6,5}, {2,4,6,6}, {2,5,8,8}, {4,5,8,8},
+        {4,5,8,11}, {4,8,10,11}, {4,9,12,16}, {4,9,16,16}, {6,10,12,18},
+        {6,10,17,16}, {6,11,16,19}, {6,13,18,21}, {7,14,21,25}, {8,16,20,25},
+        {8,17,23,25}, {9,17,23,34}, {9,18,25,30}, {10,20,27,32}, {12,21,29,35},
+        {12,23,34,37}, {12,25,34,40}, {13,26,35,42}, {14,28,38,45}, {15,29,40,48},
+        {16,31,43,51}, {17,33,45,54}, {18,35,48,57}, {19,37,51,60}, {19,38,53,63},
+        {20,40,56,66}, {21,43,59,70}, {22,45,62,74}, {24,47,65,77}, {25,49,68,81}
     };
 
     static {
@@ -76,8 +98,6 @@ public class QRScanner {
             int estimatedDim = estimateDimension(finders);
             if (estimatedDim < 21) return null;
 
-            // Fix: Multi-pass dimension verification. Stylized finders skew module sizes. 
-            // We search outward from the estimated dimension to find the mathematically valid grid.
             int[] offsets = {0, 4, -4, 8, -8, 12, -12};
             
             for (int offset : offsets) {
@@ -157,9 +177,7 @@ public class QRScanner {
                     } else {
                         if ((currentState & 1) == 0) {
                             if (currentState == 4) {
-                                if (checkRatio(state)) {
-                                    handlePossibleCenter(state, y, x, finders);
-                                }
+                                if (checkRatio(state)) handlePossibleCenter(state, y, x, finders);
                                 state[0] = state[2]; state[1] = state[3]; state[2] = state[4];
                                 state[3] = 1; state[4] = 0; currentState = 3;
                             } else {
@@ -171,9 +189,7 @@ public class QRScanner {
                     }
                 }
                 
-                if (currentState == 4 && checkRatio(state)) {
-                    handlePossibleCenter(state, y, w, finders);
-                }
+                if (currentState == 4 && checkRatio(state)) handlePossibleCenter(state, y, w, finders);
             }
 
             if (finders.size() < 3) return null;
@@ -203,15 +219,9 @@ public class QRScanner {
             }
             if (total < 7) return false;
             int mod = (total << 8) / 7;
-            
-            // Fix: Relax variance constraint to 100% to support stylized finders 
-            // with irregularly thick rounded borders or extremely thin internal white gaps.
             int maxVar = Math.max(mod, 256); 
-            
-            return Math.abs(mod - (state[0] << 8)) < maxVar && 
-                   Math.abs(mod - (state[1] << 8)) < maxVar &&
-                   Math.abs(3 * mod - (state[2] << 8)) < 3 * maxVar && 
-                   Math.abs(mod - (state[3] << 8)) < maxVar &&
+            return Math.abs(mod - (state[0] << 8)) < maxVar && Math.abs(mod - (state[1] << 8)) < maxVar &&
+                   Math.abs(3 * mod - (state[2] << 8)) < 3 * maxVar && Math.abs(mod - (state[3] << 8)) < maxVar &&
                    Math.abs(mod - (state[4] << 8)) < maxVar;
         }
 
@@ -287,21 +297,100 @@ public class QRScanner {
             return estimated;
         }
 
+        private Finder locateAlignment(Finder tl, Finder tr, Finder bl, int targetDim, float modSize) {
+            if (targetDim < 25) return null;
+            
+            float cRatio = (targetDim - 10.0f) / (targetDim - 7.0f);
+            float dx = (tr.x - tl.x) * cRatio;
+            float dy = (tr.y - tl.y) * cRatio;
+            float dx2 = (bl.x - tl.x) * cRatio;
+            float dy2 = (bl.y - tl.y) * cRatio;
+            
+            int guessX = (int) (tl.x + dx + dx2 + 0.5f);
+            int guessY = (int) (tl.y + dy + dy2 + 0.5f);
+            
+            int rad = (int) (modSize * 6);
+            if (guessX - rad < 0 || guessX + rad >= w || guessY - rad < 0 || guessY + rad >= h) return null;
+            
+            float bestX = Float.NaN, bestY = Float.NaN;
+            float minPenalty = Float.MAX_VALUE;
+
+            for (int y = guessY - rad; y <= guessY + rad; y++) {
+                for (int x = guessX - rad; x <= guessX + rad; x++) {
+                    if (bin[y * w + x] != 0) {
+                        int[] hS = new int[3];
+                        int cx = x; while (cx >= 0 && bin[y * w + cx] != 0) { hS[1]++; cx--; }
+                        float leftBlack = hS[1];
+                        while (cx >= 0 && bin[y * w + cx] == 0) { hS[0]++; cx--; }
+                        cx = x + 1; while (cx < w && bin[y * w + cx] != 0) { hS[1]++; cx++; }
+                        while (cx < w && bin[y * w + cx] == 0) { hS[2]++; cx++; }
+                        
+                        if (hS[0] == 0 || hS[1] == 0 || hS[2] == 0) continue;
+                        if (Math.abs(hS[0] - hS[1]) > hS[1] || Math.abs(hS[2] - hS[1]) > hS[1]) continue;
+
+                        int[] vS = new int[3];
+                        int cy = y; while (cy >= 0 && bin[cy * w + x] != 0) { vS[1]++; cy--; }
+                        float topBlack = vS[1];
+                        while (cy >= 0 && bin[cy * w + x] == 0) { vS[0]++; cy--; }
+                        cy = y + 1; while (cy < h && bin[cy * w + x] != 0) { vS[1]++; cy++; }
+                        while (cy < h && bin[cy * w + x] == 0) { vS[2]++; cy++; }
+
+                        if (vS[0] == 0 || vS[1] == 0 || vS[2] == 0) continue;
+                        if (Math.abs(vS[0] - vS[1]) > vS[1] || Math.abs(vS[2] - vS[1]) > vS[1]) continue;
+
+                        float penalty = Math.abs(hS[0] - hS[1]) + Math.abs(hS[2] - hS[1]) + Math.abs(vS[0] - vS[1]) + Math.abs(vS[2] - vS[1]);
+                        if (penalty < minPenalty) {
+                            minPenalty = penalty;
+                            bestX = x - leftBlack + hS[1] / 2.0f;
+                            bestY = y - topBlack + vS[1] / 2.0f;
+                        }
+                    }
+                }
+            }
+            if (!Float.isNaN(bestX)) return new Finder(bestX, bestY, modSize);
+            return null;
+        }
+
         private byte[] extractGrid(Finder[] f, int targetDim) {
             Finder tl = f[0], tr = f[1], bl = f[2];
+            float modSize = (tl.modSize + tr.modSize + bl.modSize) / 3.0f;
             
-            float pTL = 3.0f, pTR = targetDim - 4.0f;
-            float dxTR = (tr.x - tl.x) / (pTR - pTL), dyTR = (tr.y - tl.y) / (pTR - pTL);
-            float dxBL = (bl.x - tl.x) / (pTR - pTL), dyBL = (bl.y - tl.y) / (pTR - pTL);
+            Finder align = locateAlignment(tl, tr, bl, targetDim, modSize);
+            Perspective transform;
+
+            if (align != null) {
+                transform = Perspective.quadToQuad(
+                    3.0f, 3.0f, 
+                    targetDim - 4.0f, 3.0f, 
+                    targetDim - 7.0f, targetDim - 7.0f, 
+                    3.0f, targetDim - 4.0f,
+                    tl.x, tl.y, tr.x, tr.y, align.x, align.y, bl.x, bl.y
+                );
+            } else {
+                float brX = tr.x - tl.x + bl.x;
+                float brY = tr.y - tl.y + bl.y;
+                transform = Perspective.quadToQuad(
+                    3.0f, 3.0f, 
+                    targetDim - 4.0f, 3.0f, 
+                    targetDim - 4.0f, targetDim - 4.0f, 
+                    3.0f, targetDim - 4.0f,
+                    tl.x, tl.y, tr.x, tr.y, brX, brY, bl.x, bl.y
+                );
+            }
+            
+            if (transform == null) return null;
 
             byte[] grid = new byte[targetDim * targetDim];
+            float[] pt = new float[2];
             for (int y = 0; y < targetDim; y++) {
-                float rowX = tl.x + dxBL * (y - pTL);
-                float rowY = tl.y + dyBL * (y - pTL);
                 for (int x = 0; x < targetDim; x++) {
-                    int ix = (int) (rowX + dxTR * (x - pTL) + 0.5f);
-                    int iy = (int) (rowY + dyTR * (x - pTL) + 0.5f);
-                    if (ix >= 0 && ix < w && iy >= 0 && iy < h) grid[y * targetDim + x] = bin[iy * w + ix];
+                    pt[0] = x; pt[1] = y;
+                    transform.transform(pt);
+                    int ix = (int) (pt[0] + 0.5f);
+                    int iy = (int) (pt[1] + 0.5f);
+                    if (ix >= 0 && ix < w && iy >= 0 && iy < h) {
+                        grid[y * targetDim + x] = bin[iy * w + ix];
+                    }
                 }
             }
             return grid;
@@ -334,7 +423,7 @@ public class QRScanner {
             if (minDiff > 3) return null; 
             
             int mask = bestFormat & 0x07;
-            byte[] rawBytes = new byte[1024];
+            byte[] rawBytes = new byte[4096]; // High capacity allocation
             int bits = 0, current = 0, byteIdx = 0;
             boolean upward = true;
 
@@ -369,17 +458,8 @@ public class QRScanner {
             int eccLevel = (bestFormat >> 3) & 0x03;
             int eccIdx = (eccLevel == 1) ? 0 : (eccLevel == 0) ? 1 : (eccLevel == 3) ? 2 : 3;
             
-            int[][] totEcc = {
-                {7,10,13,17}, {10,16,22,28}, {15,26,36,44}, {20,36,52,64}, {26,48,72,88},
-                {36,64,96,112}, {40,72,108,130}, {48,88,132,156}, {60,110,160,192}, {72,130,192,224}
-            };
-            int[][] numBlk = {
-                {1,1,1,1}, {1,1,1,1}, {1,1,2,2}, {1,2,2,4}, {1,2,4,4},
-                {2,4,4,4}, {2,4,6,5}, {2,4,6,6}, {2,5,8,8}, {4,5,8,8}
-            };
-
-            this.eccBytes = totEcc[version - 1][eccIdx];
-            this.blocks = numBlk[version - 1][eccIdx];
+            this.eccBytes = TOT_ECC[version - 1][eccIdx];
+            this.blocks = NUM_BLK[version - 1][eccIdx];
             this.dataBytes = byteIdx - this.eccBytes;
             if (this.dataBytes <= 0) return null;
 
@@ -419,7 +499,7 @@ public class QRScanner {
 
         private boolean correctBlock(int[] cw, int dLen, int eLen) {
             int N = dLen + eLen;
-            int[] S = new int[128];
+            int[] S = new int[256];
             boolean hasErr = false;
 
             for (int j = 0; j < eLen; j++) {
@@ -430,7 +510,7 @@ public class QRScanner {
             }
             if (!hasErr) return true;
 
-            int[] C = new int[128], B = new int[128];
+            int[] C = new int[256], B = new int[256];
             C[0] = B[0] = 1;
             int L = 0, m = 1, b = 1;
 
@@ -439,31 +519,31 @@ public class QRScanner {
                 for (int i = 1; i <= L; i++) d ^= gfMul(C[i], S[n - i]);
                 if (d == 0) { m++; } 
                 else if (2 * L <= n) {
-                    int[] T = java.util.Arrays.copyOf(C, 128);
+                    int[] T = java.util.Arrays.copyOf(C, 256);
                     int coef = gfMul(d, gfInv(b));
-                    for (int i = m; i < 128; i++) C[i] ^= gfMul(coef, B[i - m]);
+                    for (int i = m; i < 256; i++) C[i] ^= gfMul(coef, B[i - m]);
                     L = n + 1 - L;
-                    System.arraycopy(T, 0, B, 0, 128);
+                    System.arraycopy(T, 0, B, 0, 256);
                     b = d; m = 1;
                 } else {
                     int coef = gfMul(d, gfInv(b));
-                    for (int i = m; i < 128; i++) C[i] ^= gfMul(coef, B[i - m]);
+                    for (int i = m; i < 256; i++) C[i] ^= gfMul(coef, B[i - m]);
                     m++;
                 }
             }
             
             if (L > eLen / 2) return false;
 
-            int[] errPos = new int[64];
+            int[] errPos = new int[128];
             int errCnt = 0;
             for (int i = 0; i < N; i++) {
                 int p = N - 1 - i, eval = 0, xPow = 1, xInv = expTable[(255 - (p % 255)) % 255];
                 for (int j = 0; j <= L; j++) { eval ^= gfMul(C[j], xPow); xPow = gfMul(xInv, xPow); }
-                if (eval == 0 && errCnt < 64) errPos[errCnt++] = i;
+                if (eval == 0 && errCnt < 128) errPos[errCnt++] = i;
             }
             if (errCnt != L) return false;
 
-            int[] omega = new int[128];
+            int[] omega = new int[256];
             for (int i = 0; i < eLen; i++) {
                 for (int j = 0; j <= L && i + j < eLen; j++) omega[i + j] ^= gfMul(S[i], C[j]);
             }
@@ -555,14 +635,19 @@ public class QRScanner {
             return false;
         }
 
+        // Dynamically compute Alignment Pattern coordinates to support any QR standard dimension.
         private boolean isAlignment(int c, int r) {
             if (version < 2) return false;
-            int[][] alignCoords = {
-                {}, {6,18}, {6,22}, {6,26}, {6,30}, {6,34}, {6,22,38}, {6,24,42}, {6,26,46}, {6,28,50}
-            };
-            if (version > alignCoords.length) return false;
-            for (int cx : alignCoords[version - 1]) {
-                for (int cy : alignCoords[version - 1]) {
+            int intervals = version / 7 + 1;
+            int step = Math.round((dim - 13.0f) / intervals);
+            if (step % 2 == 1) step++;
+            
+            int[] coords = new int[intervals + 1];
+            coords[0] = 6;
+            for (int i = 1; i <= intervals; i++) coords[i] = (dim - 7) - step * (intervals - i);
+            
+            for (int cx : coords) {
+                for (int cy : coords) {
                     if ((cx == 6 && cy == 6) || (cx == 6 && cy >= dim - 9) || (cx >= dim - 9 && cy == 6)) continue;
                     if (c >= cx - 2 && c <= cx + 2 && r >= cy - 2 && r <= cy + 2) return true;
                 }
@@ -571,7 +656,86 @@ public class QRScanner {
         }
     }
 
-    // --- Helper Classes ---
+    // --- Math & Helper Classes ---
+    
+    private static class Perspective {
+        float a11, a12, a13, a21, a22, a23, a31, a32, a33;
+        
+        static Perspective squareToQuad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3) {
+            float dx3 = x0 - x1 + x2 - x3, dy3 = y0 - y1 + y2 - y3;
+            if (Math.abs(dx3) < 1e-4f && Math.abs(dy3) < 1e-4f) {
+                Perspective p = new Perspective();
+                p.a11 = x1 - x0; p.a12 = x2 - x1; p.a13 = x0;
+                p.a21 = y1 - y0; p.a22 = y2 - y1; p.a23 = y0;
+                p.a31 = 0; p.a32 = 0; p.a33 = 1.0f;
+                return p;
+            } else {
+                float dx1 = x1 - x2, dy1 = y1 - y2;
+                float dx2 = x3 - x2, dy2 = y3 - y2;
+                float det = dx1 * dy2 - dx2 * dy1;
+                if (det == 0.0f) return null;
+                float a31 = (dx3 * dy2 - dx2 * dy3) / det;
+                float a32 = (dx1 * dy3 - dx3 * dy1) / det;
+                Perspective p = new Perspective();
+                p.a11 = x1 - x0 + a31 * x1;
+                p.a12 = x3 - x0 + a32 * x3;
+                p.a13 = x0;
+                p.a21 = y1 - y0 + a31 * y1;
+                p.a22 = y3 - y0 + a32 * y3;
+                p.a23 = y0;
+                p.a31 = a31;
+                p.a32 = a32;
+                p.a33 = 1.0f;
+                return p;
+            }
+        }
+        
+        static Perspective quadToSquare(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3) {
+            Perspective q = squareToQuad(x0, y0, x1, y1, x2, y2, x3, y3);
+            if (q == null) return null;
+            Perspective p = new Perspective();
+            p.a11 = q.a22 * q.a33 - q.a23 * q.a32;
+            p.a21 = q.a23 * q.a31 - q.a21 * q.a33;
+            p.a31 = q.a21 * q.a32 - q.a22 * q.a31;
+            p.a12 = q.a13 * q.a32 - q.a12 * q.a33;
+            p.a22 = q.a11 * q.a33 - q.a13 * q.a31;
+            p.a32 = q.a12 * q.a31 - q.a11 * q.a32;
+            p.a13 = q.a12 * q.a23 - q.a13 * q.a22;
+            p.a23 = q.a13 * q.a21 - q.a11 * q.a23;
+            p.a33 = q.a11 * q.a22 - q.a12 * q.a21;
+            return p;
+        }
+
+        Perspective times(Perspective other) {
+            Perspective p = new Perspective();
+            p.a11 = a11 * other.a11 + a12 * other.a21 + a13 * other.a31;
+            p.a12 = a11 * other.a12 + a12 * other.a22 + a13 * other.a32;
+            p.a13 = a11 * other.a13 + a12 * other.a23 + a13 * other.a33;
+            p.a21 = a21 * other.a11 + a22 * other.a21 + a23 * other.a31;
+            p.a22 = a21 * other.a12 + a22 * other.a22 + a23 * other.a32;
+            p.a23 = a21 * other.a13 + a22 * other.a23 + a23 * other.a33;
+            p.a31 = a31 * other.a11 + a32 * other.a21 + a33 * other.a31;
+            p.a32 = a31 * other.a12 + a32 * other.a22 + a33 * other.a32;
+            p.a33 = a31 * other.a13 + a32 * other.a23 + a33 * other.a33;
+            return p;
+        }
+        
+        static Perspective quadToQuad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3,
+                                      float x0p, float y0p, float x1p, float y1p, float x2p, float y2p, float x3p, float y3p) {
+            Perspective qToS = quadToSquare(x0, y0, x1, y1, x2, y2, x3, y3);
+            Perspective sToQ = squareToQuad(x0p, y0p, x1p, y1p, x2p, y2p, x3p, y3p);
+            if (qToS == null || sToQ == null) return null;
+            return sToQ.times(qToS);
+        }
+
+        void transform(float[] point) {
+            float x = point[0], y = point[1];
+            float denominator = a31 * x + a32 * y + a33;
+            point[0] = (a11 * x + a12 * y + a13) / denominator;
+            point[1] = (a21 * x + a22 * y + a23) / denominator;
+        }
+    }
+
     private static class Finder {
         float x, y, modSize; int count = 1;
         Finder(float x, float y, float m) { this.x = x; this.y = y; this.modSize = m; }
