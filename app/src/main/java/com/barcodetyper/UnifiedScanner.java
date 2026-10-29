@@ -1,11 +1,16 @@
 /* ============================================================================
  * Android Barcode Typer
+ * 2026 HUGO
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
 package com.barcodetyper;
 
 public class UnifiedScanner {
+    
+    // State manager to cache and concatenate Macro PDF417 segments across camera frames
+    private static final MacroSessionManager macroManager = new MacroSessionManager();
+
     public static String scan(byte[] yPlane, int w, int h, int rowStride) {
         
         // 1. Sweep for 1D Barcodes (Highest priority)
@@ -13,8 +18,11 @@ public class UnifiedScanner {
         if (oneD != null) return oneD;
 
         // 2. Sweep for PDF417 Codes
-        String pdf = PDF417Scanner.scanBuffer(yPlane, w, h, rowStride);
-        if (pdf != null) return pdf;
+        PDF417Compaction.DecoderResult pdfResult = PDF417Scanner.scanBuffer(yPlane, w, h, rowStride);
+        if (pdfResult != null) {
+            String finalPdf = macroManager.processResult(pdfResult);
+            if (finalPdf != null) return finalPdf;
+        }
 
         // 3. Rotate Y-Plane 90 degrees to cross-check perpendicular barcodes
         byte[] rotated = new byte[w * h];
@@ -29,8 +37,11 @@ public class UnifiedScanner {
         oneD = OneDScanner.scanBuffer(rotated, h, w, h);
         if (oneD != null) return oneD;
 
-        pdf = PDF417Scanner.scanBuffer(rotated, h, w, h);
-        if (pdf != null) return pdf;
+        PDF417Compaction.DecoderResult pdfRotatedResult = PDF417Scanner.scanBuffer(rotated, h, w, h);
+        if (pdfRotatedResult != null) {
+            String finalPdf = macroManager.processResult(pdfRotatedResult);
+            if (finalPdf != null) return finalPdf;
+        }
 
         // 5. Sweep for DataMatrix (Internally rotation invariant)
         String dm = DataMatrixScanner.scanBuffer(yPlane, w, h, rowStride);
