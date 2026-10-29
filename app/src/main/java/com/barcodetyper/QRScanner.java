@@ -87,10 +87,13 @@ public class QRScanner {
 
         private void binarize() {
             int rad = Math.max(12, Math.min(w, h) / 8);
-            int[] intImg = new int[(w + 1) * (h + 1)];
+            
+            // Fix: High resolution mobile camera frames overflow a 32-bit integer integral image
+            long[] intImg = new long[(w + 1) * (h + 1)];
 
             for (int y = 0; y < h; y++) {
-                int rowSum = 0, srcRow = y * stride;
+                long rowSum = 0;
+                int srcRow = y * stride;
                 for (int x = 0; x < w; x++) {
                     rowSum += (yPlane[srcRow + x] & 0xFF);
                     intImg[(y + 1) * (w + 1) + (x + 1)] = intImg[y * (w + 1) + (x + 1)] + rowSum;
@@ -102,10 +105,10 @@ public class QRScanner {
                 int row = y * w;
                 for (int x = 0; x < w; x++) {
                     int x0 = Math.max(0, x - rad), x1 = Math.min(w - 1, x + rad);
-                    int area = (x1 - x0 + 1) * (y1 - y0 + 1);
-                    int sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
-                            - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
-                    int mean = sum / area;
+                    long area = (long)(x1 - x0 + 1) * (y1 - y0 + 1);
+                    long sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
+                             - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
+                    long mean = sum / area;
                     if ((yPlane[y * stride + x] & 0xFF) < mean - (mean >> 4)) {
                         bin[row + x] = 1;
                     }
@@ -261,7 +264,6 @@ public class QRScanner {
             if (dim < 21 || dim > 57) return null;
             version = (dim - 17) / 4;
 
-            // Correct mathematical finder offset mapping logic
             float pTL = 3.0f, pTR = dim - 4.0f;
             float dxTR = (tr.x - tl.x) / (pTR - pTL), dyTR = (tr.y - tl.y) / (pTR - pTL);
             float dxBL = (bl.x - tl.x) / (pTR - pTL), dyBL = (bl.y - tl.y) / (pTR - pTL);
@@ -280,18 +282,23 @@ public class QRScanner {
         }
 
         private byte[] unmaskAndRead(byte[] grid) {
-            int fmt = 0;
-            for (int i = 0; i < 6; i++) fmt = (fmt << 1) | grid[8 * dim + i];
-            fmt = (fmt << 1) | grid[8 * dim + 7];
-            fmt = (fmt << 1) | grid[8 * dim + 8];
-            fmt = (fmt << 1) | grid[7 * dim + 8];
-            for (int i = 5; i >= 0; i--) fmt = (fmt << 1) | grid[i * dim + 8];
+            // Fix: Add parsing fallback using redundant Format Information location.
+            int fmt1 = 0, fmt2 = 0;
+            for (int i = 0; i < 6; i++) fmt1 = (fmt1 << 1) | grid[8 * dim + i];
+            fmt1 = (fmt1 << 1) | grid[8 * dim + 7];
+            fmt1 = (fmt1 << 1) | grid[8 * dim + 8];
+            fmt1 = (fmt1 << 1) | grid[7 * dim + 8];
+            for (int i = 5; i >= 0; i--) fmt1 = (fmt1 << 1) | grid[i * dim + 8];
+
+            for (int i = 0; i < 7; i++) fmt2 = (fmt2 << 1) | grid[(dim - 1 - i) * dim + 8];
+            for (int i = 0; i < 8; i++) fmt2 = (fmt2 << 1) | grid[8 * dim + (dim - 8 + i)];
             
-            // BCH(15,5) Decode for Format String
             int bestFormat = -1;
             int minDiff = 15;
             for (int i = 0; i < 32; i++) {
-                int diff = Integer.bitCount(fmt ^ FORMAT_INFO_DECODE[i]);
+                int diff1 = Integer.bitCount(fmt1 ^ FORMAT_INFO_DECODE[i]);
+                int diff2 = Integer.bitCount(fmt2 ^ FORMAT_INFO_DECODE[i]);
+                int diff = Math.min(diff1, diff2);
                 if (diff < minDiff) {
                     minDiff = diff;
                     bestFormat = i;
@@ -300,7 +307,7 @@ public class QRScanner {
             if (minDiff > 3) return null; 
             
             int mask = bestFormat & 0x07;
-            byte[] rawBytes = new byte[512];
+            byte[] rawBytes = new byte[1024]; // Safety net bump
             int bits = 0, current = 0, byteIdx = 0;
             boolean upward = true;
 
@@ -310,7 +317,16 @@ public class QRScanner {
                     int r = upward ? dim - 1 - y : y;
                     for (int cOffset = 0; cOffset < 2; cOffset++) {
                         int c = x - cOffset;
+                        // Skip Finder, Format Info, and Timing Patterns
                         if ((r < 9 && c < 9) || (r < 9 && c >= dim - 8) || (r >= dim - 8 && c < 9) || r == 6 || c == 6) continue;
+                        
+                        // Fix: Version Information Block overlapping must be explicitly skipped for version >= 7
+                        if (version >= 7) {
+                            if (r < 6 && c >= dim - 11 && c <= dim - 9) continue;
+                            if (c < 6 && r >= dim - 11 && r <= dim - 9) continue;
+                        }
+                        
+                        // Skip Alignment Patterns
                         if (isAlignment(c, r)) continue;
 
                         int bit = grid[r * dim + c];
@@ -362,7 +378,6 @@ public class QRScanner {
                 int dLen = shortBlock + (b >= numShort ? 1 : 0);
                 int[] rsBlock = new int[dLen + eccPerBlock];
 
-                // Corrected offset extraction indexing for long interleaved blocks
                 for (int i = 0; i < dLen; i++) {
                     int idx = (i < shortBlock) ? (i * blocks + b) : 
                               (shortBlock * blocks + (i - shortBlock) * numLong + (b - numShort));
@@ -413,14 +428,16 @@ public class QRScanner {
                     m++;
                 }
             }
-            if (L > eLen / 2 || L > 16) return false;
+            
+            // Fix: Hardcapped RS bounds (`L > 16`) improperly rejected viable recovery blocks
+            if (L > eLen / 2) return false;
 
-            int[] errPos = new int[32];
+            int[] errPos = new int[64]; // Fix: Increased maximum position pool
             int errCnt = 0;
             for (int i = 0; i < N; i++) {
                 int p = N - 1 - i, eval = 0, xPow = 1, xInv = expTable[(255 - (p % 255)) % 255];
                 for (int j = 0; j <= L; j++) { eval ^= gfMul(C[j], xPow); xPow = gfMul(xInv, xPow); }
-                if (eval == 0 && errCnt < 32) errPos[errCnt++] = i;
+                if (eval == 0 && errCnt < 64) errPos[errCnt++] = i;
             }
             if (errCnt != L) return false;
 
@@ -435,7 +452,7 @@ public class QRScanner {
                 xPow = 1;
                 for (int j = 1; j <= L; j += 2) { den ^= gfMul(C[j], xPow); xPow = gfMul(xPow, gfMul(xInv, xInv)); }
                 if (den == 0) return false;
-                cw[idx] ^= gfMul(gfMul(num, gfInv(den)), expTable[p % 255]); // Correct QR X_k multiplier
+                cw[idx] ^= gfMul(gfMul(num, gfInv(den)), expTable[p % 255]); 
             }
             return true;
         }
@@ -448,7 +465,7 @@ public class QRScanner {
                 int mode = stream.read(4);
                 if (mode == 0) break;
                 
-                if (mode == 1) { // Numeric
+                if (mode == 1) { 
                     int lenBits = version < 10 ? 10 : 12;
                     if (stream.available() < lenBits) break;
                     int len = stream.read(lenBits);
@@ -465,7 +482,7 @@ public class QRScanner {
                             sb.append((char)('0' + val));
                         }
                     }
-                } else if (mode == 2) { // Alphanumeric
+                } else if (mode == 2) { 
                     int lenBits = version < 10 ? 9 : 11;
                     if (stream.available() < lenBits) break;
                     int len = stream.read(lenBits);
@@ -483,13 +500,13 @@ public class QRScanner {
                             sb.append(val < alpha.length() ? alpha.charAt(val) : '?');
                         }
                     }
-                } else if (mode == 4) { // Byte
+                } else if (mode == 4) { 
                     int lenBits = version < 10 ? 8 : 16;
                     if (stream.available() < lenBits) break;
                     int len = stream.read(lenBits);
                     if (stream.available() < len * 8) break;
                     for (int i = 0; i < len; i++) sb.append((char) stream.read(8));
-                } else if (mode == 7) { // ECI
+                } else if (mode == 7) { 
                     if (stream.available() < 8) break;
                     int val = stream.read(8);
                     if ((val & 0x80) != 0) {
