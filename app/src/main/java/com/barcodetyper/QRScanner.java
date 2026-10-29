@@ -1,3 +1,4 @@
+// QRScanner.java
 /* ============================================================================
  * Android Barcode Typer
  *
@@ -103,8 +104,6 @@ public class QRScanner {
             int estimatedDim = estimateDimension(finders);
             if (estimatedDim < 21) return null;
 
-            // Phase 1: Robust BCH Version Extraction 
-            // Rather than guessing the dimension from the physical size, we force the mathematical version if found
             int verifiedVersion = readBCHVersion(finders[0], finders[1], finders[2], estimatedDim);
             if (verifiedVersion != -1) {
                 estimatedDim = verifiedVersion * 4 + 17;
@@ -133,29 +132,54 @@ public class QRScanner {
         }
 
         private void binarize() {
-            int rad = Math.max(12, Math.min(w, h) / 8);
-            long[] intImg = new long[(w + 1) * (h + 1)];
+            int subWidth = w >> 3;
+            int subHeight = h >> 3;
+            int[][] blackPoints = new int[subHeight][subWidth];
 
-            for (int y = 0; y < h; y++) {
-                long rowSum = 0;
-                int srcRow = y * stride;
-                for (int x = 0; x < w; x++) {
-                    rowSum += (yPlane[srcRow + x] & 0xFF);
-                    intImg[(y + 1) * (w + 1) + (x + 1)] = intImg[y * (w + 1) + (x + 1)] + rowSum;
+            for (int y = 0; y < subHeight; y++) {
+                for (int x = 0; x < subWidth; x++) {
+                    int sum = 0, min = 255, max = 0;
+                    for (int yy = 0; yy < 8; yy++) {
+                        int offset = (y * 8 + yy) * stride + (x * 8);
+                        for (int xx = 0; xx < 8; xx++) {
+                            int pixel = yPlane[offset + xx] & 0xFF;
+                            sum += pixel;
+                            if (pixel < min) min = pixel;
+                            if (pixel > max) max = pixel;
+                        }
+                    }
+                    int average = sum >> 6;
+                    if (max - min <= 24) {
+                        average = min >> 1;
+                        if (y > 0 && x > 0) {
+                            average = blackPoints[y - 1][x]; 
+                        }
+                    }
+                    blackPoints[y][x] = average;
                 }
             }
 
-            for (int y = 0; y < h; y++) {
-                int y0 = Math.max(0, y - rad), y1 = Math.min(h - 1, y + rad);
-                int row = y * w;
-                for (int x = 0; x < w; x++) {
-                    int x0 = Math.max(0, x - rad), x1 = Math.min(w - 1, x + rad);
-                    long area = (long)(x1 - x0 + 1) * (y1 - y0 + 1);
-                    long sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
-                             - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
-                    long mean = sum / area;
-                    if ((yPlane[y * stride + x] & 0xFF) < mean - (mean >> 4)) {
-                        bin[row + x] = 1;
+            for (int y = 0; y < subHeight; y++) {
+                for (int x = 0; x < subWidth; x++) {
+                    int left = Math.max(0, x - 2);
+                    left = Math.min(left, subWidth - 5);
+                    int top = Math.max(0, y - 2);
+                    top = Math.min(top, subHeight - 5);
+                    int sum = 0;
+                    for (int yy = 0; yy < 5; yy++) {
+                        for (int xx = 0; xx < 5; xx++) {
+                            sum += blackPoints[top + yy][left + xx];
+                        }
+                    }
+                    int threshold = sum / 25;
+
+                    for (int yy = 0; yy < 8; yy++) {
+                        int offset = (y * 8 + yy) * stride + (x * 8);
+                        int binOffset = (y * 8 + yy) * w + (x * 8);
+                        for (int xx = 0; xx < 8; xx++) {
+                            int pixel = yPlane[offset + xx] & 0xFF;
+                            bin[binOffset + xx] = (byte) (pixel <= threshold ? 1 : 0);
+                        }
                     }
                 }
             }
@@ -167,7 +191,6 @@ public class QRScanner {
             if (!Float.isNaN(cy)) {
                 float finalX = crossCheckHorizontal((int) (cx + 0.5f), (int) (cy + 0.5f), state[2] * 2);
                 if (!Float.isNaN(finalX)) {
-                    // ZXing Upgrade: Diagonal Cross-Check prevents false positives on text/linear barcodes
                     if (crossCheckDiagonal((int) finalX, (int) cy, state[2] * 2)) {
                         float modSize = (state[0] + state[1] + state[2] + state[3] + state[4]) / 7.0f;
                         mergeFinder(finders, finalX, cy, modSize);
@@ -179,7 +202,6 @@ public class QRScanner {
         private boolean crossCheckDiagonal(int startX, int startY, int maxCount) {
             int[] state = new int[5];
             int i = 0;
-            // Up-Left
             while (startX - i >= 0 && startY - i >= 0 && bin[(startY - i) * w + startX - i] != 0) { state[2]++; i++; }
             if (startX - i < 0 || startY - i < 0) return false;
             while (startX - i >= 0 && startY - i >= 0 && bin[(startY - i) * w + startX - i] == 0 && state[1] <= maxCount) { state[1]++; i++; }
@@ -188,7 +210,6 @@ public class QRScanner {
             if (state[0] > maxCount) return false;
 
             i = 1;
-            // Down-Right
             while (startX + i < w && startY + i < h && bin[(startY + i) * w + startX + i] != 0) { state[2]++; i++; }
             if (startX + i >= w || startY + i >= h) return false;
             while (startX + i < w && startY + i < h && bin[(startY + i) * w + startX + i] == 0 && state[3] <= maxCount) { state[3]++; i++; }
@@ -196,7 +217,14 @@ public class QRScanner {
             while (startX + i < w && startY + i < h && bin[(startY + i) * w + startX + i] != 0 && state[4] <= maxCount) { state[4]++; i++; }
             if (state[4] > maxCount) return false;
 
-            return checkRatio(state);
+            int total = 0;
+            for (int s : state) total += s;
+            if (total < 7) return false;
+            int mod = (total << 8) / 7;
+            int maxVar = Math.max(mod * 2, 384); 
+            return Math.abs(mod - (state[0] << 8)) < maxVar && Math.abs(mod - (state[1] << 8)) < maxVar &&
+                   Math.abs(3 * mod - (state[2] << 8)) < 3 * maxVar && Math.abs(mod - (state[3] << 8)) < maxVar &&
+                   Math.abs(mod - (state[4] << 8)) < maxVar;
         }
 
         private Finder[] locateFinders() {
@@ -334,9 +362,8 @@ public class QRScanner {
             return estimated;
         }
         
-        // ZXing Upgrade: BCH(18,6) Version Recovery for warped grids
         private int readBCHVersion(Finder tl, Finder tr, Finder bl, int estimatedDim) {
-            if (estimatedDim < 45) return -1; // Version 7+ only
+            if (estimatedDim < 45) return -1;
             
             float pTL = 3.0f, pTR = estimatedDim - 4.0f;
             float dxTR = (tr.x - tl.x) / (pTR - pTL), dyTR = (tr.y - tl.y) / (pTR - pTL);
@@ -344,7 +371,6 @@ public class QRScanner {
 
             int version1 = 0, version2 = 0;
             
-            // Read Top-Right block
             for (int i = 0; i < 6; i++) {
                 for (int j = 0; j < 3; j++) {
                     int ix = (int) (tl.x + dxTR * (estimatedDim - 11 + j - pTL) + dxBL * (i - pTL) + 0.5f);
@@ -355,7 +381,6 @@ public class QRScanner {
                 }
             }
             
-            // Read Bottom-Left block
             for (int i = 0; i < 6; i++) {
                 for (int j = 0; j < 3; j++) {
                     int ix = (int) (tl.x + dxTR * (i - pTL) + dxBL * (estimatedDim - 11 + j - pTL) + 0.5f);
@@ -442,7 +467,6 @@ public class QRScanner {
             Perspective transform;
 
             if (align != null) {
-                // Primary 4-point Homography (Quad-to-Quad)
                 transform = Perspective.quadToQuad(
                     3.0f, 3.0f, 
                     targetDim - 4.0f, 3.0f, 
@@ -451,7 +475,6 @@ public class QRScanner {
                     tl.x, tl.y, tr.x, tr.y, align.x, align.y, bl.x, bl.y
                 );
             } else {
-                // ZXing Upgrade: Affine Fallback using 3 points if Alignment is obscured
                 float brX = tr.x - tl.x + bl.x;
                 float brY = tr.y - tl.y + bl.y;
                 transform = Perspective.quadToQuad(
@@ -467,15 +490,29 @@ public class QRScanner {
 
             byte[] grid = new byte[targetDim * targetDim];
             float[] pt = new float[2];
+            
             for (int y = 0; y < targetDim; y++) {
                 for (int x = 0; x < targetDim; x++) {
                     pt[0] = x; pt[1] = y;
                     transform.transform(pt);
-                    // Sample EXACTLY at sub-pixel center to prevent grid drift
-                    int ix = (int) (pt[0] + 0.5f);
-                    int iy = (int) (pt[1] + 0.5f);
-                    if (ix >= 0 && ix < w && iy >= 0 && iy < h) {
-                        grid[y * targetDim + x] = bin[iy * w + ix];
+                    
+                    float px = pt[0], py = pt[1];
+                    int ix = (int) px, iy = (int) py;
+                    
+                    if (ix >= 0 && ix < w - 1 && iy >= 0 && iy < h - 1) {
+                        float dx = px - ix;
+                        float dy = py - iy;
+                        float p00 = bin[iy * w + ix];
+                        float p10 = bin[iy * w + ix + 1];
+                        float p01 = bin[(iy + 1) * w + ix];
+                        float p11 = bin[(iy + 1) * w + ix + 1];
+                        
+                        float val = p00 * (1.0f - dx) * (1.0f - dy) +
+                                    p10 * dx * (1.0f - dy) +
+                                    p01 * (1.0f - dx) * dy +
+                                    p11 * dx * dy;
+                                    
+                        grid[y * targetDim + x] = (byte) (val > 0.5f ? 1 : 0);
                     }
                 }
             }

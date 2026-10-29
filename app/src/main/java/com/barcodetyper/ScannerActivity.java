@@ -1,3 +1,4 @@
+// ScannerActivity.java
 /* ============================================================================
  * Clipboard Barcode Scanner 
  *
@@ -55,6 +56,7 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.util.Size;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
@@ -114,6 +116,7 @@ public class ScannerActivity extends AppCompatActivity {
         preview.setSurfaceProvider(viewFinder.getSurfaceProvider());
 
         ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
+                .setTargetResolution(new Size(1280, 720))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build();
 

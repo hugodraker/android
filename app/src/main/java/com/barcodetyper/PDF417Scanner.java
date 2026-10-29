@@ -1,3 +1,4 @@
+// PDF417Scanner.java
 /* ============================================================================
  * Android Barcode Typer
  *
@@ -44,7 +45,6 @@ public class PDF417Scanner {
         long lastSeen = 0;
     }
 
-    // ZXing Upgrade: Multi-Frame Consensus Cache to reject crease-induced miscorrections
     private static final Map<String, Vote> consensusCache = new HashMap<>();
 
     public static PDF417Compaction.DecoderResult scanBuffer(byte[] yPlane, int w, int h, int rowStride) {
@@ -66,9 +66,6 @@ public class PDF417Scanner {
         int[] votesCols = new int[31], votesDiv3 = new int[30];
         int[] votesMod3 = new int[3], votesEcc = new int[9];
 
-        // ---------------------------------------------------------
-        // SWEEP 1: ZXing Contour-Aligned Tracing (For Flat/Rotated)
-        // ---------------------------------------------------------
         float leftLen = distance(tl, bl);
         float rightLen = distance(tr, br);
         float maxLen = Math.max(leftLen, rightLen);
@@ -126,9 +123,6 @@ public class PDF417Scanner {
             }
         }
 
-        // ---------------------------------------------------------
-        // SWEEP 2: Angled Ray-Casting (The Fold & Crease Catcher)
-        // ---------------------------------------------------------
         int minY = (int) Math.max(0, Math.min(tl.y, tr.y) - 10);
         int maxY = (int) Math.min(h - 1, Math.max(bl.y, br.y) + 10);
         float[] slopes = {0.0f, 0.05f, -0.05f, 0.1f, -0.1f, 0.15f, -0.15f};
@@ -166,9 +160,6 @@ public class PDF417Scanner {
             }
         }
 
-        // ---------------------------------------------------------
-        // GRID ASSEMBLY & REED-SOLOMON CORRECTION
-        // ---------------------------------------------------------
         int bestCols = getBestVote(votesCols), bestDiv3 = getBestVote(votesDiv3);
         int bestMod3 = getBestVote(votesMod3), bestEcc = getBestVote(votesEcc);
 
@@ -211,15 +202,12 @@ public class PDF417Scanner {
             if (result != null && result.payload != null) {
                 long now = System.currentTimeMillis();
                 
-                // Prune stale votes older than 2.5 seconds
                 consensusCache.entrySet().removeIf(entry -> now - entry.getValue().lastSeen > 2500);
                 
                 Vote v = consensusCache.computeIfAbsent(result.payload, k -> new Vote());
                 v.count++;
                 v.lastSeen = now;
                 
-                // If ECC is low (ECC < 16 words), a fold can easily trick the math. Require 2 identical frames.
-                // High ECC (>= 16 words) is mathematically secure enough to return immediately.
                 if (v.count >= 2 || eccCount >= 16) {
                     return result;
                 }
@@ -342,32 +330,54 @@ public class PDF417Scanner {
 
     private static byte[] binarize(byte[] yPlane, int w, int h, int stride) {
         byte[] bin = new byte[w * h];
-        int rad = Math.max(12, Math.min(w, h) / 10);
-        long[] intImg = new long[(w + 1) * (h + 1)];
+        int subWidth = w >> 3;
+        int subHeight = h >> 3;
+        int[][] blackPoints = new int[subHeight][subWidth];
 
-        for (int y = 0; y < h; y++) {
-            long rowSum = 0;
-            int srcRow = y * stride;
-            for (int x = 0; x < w; x++) {
-                rowSum += (yPlane[srcRow + x] & 0xFF);
-                intImg[(y + 1) * (w + 1) + (x + 1)] = intImg[y * (w + 1) + (x + 1)] + rowSum;
+        for (int y = 0; y < subHeight; y++) {
+            for (int x = 0; x < subWidth; x++) {
+                int sum = 0, min = 255, max = 0;
+                for (int yy = 0; yy < 8; yy++) {
+                    int offset = (y * 8 + yy) * stride + (x * 8);
+                    for (int xx = 0; xx < 8; xx++) {
+                        int pixel = yPlane[offset + xx] & 0xFF;
+                        sum += pixel;
+                        if (pixel < min) min = pixel;
+                        if (pixel > max) max = pixel;
+                    }
+                }
+                int average = sum >> 6;
+                if (max - min <= 24) {
+                    average = min >> 1;
+                    if (y > 0 && x > 0) {
+                        average = blackPoints[y - 1][x]; 
+                    }
+                }
+                blackPoints[y][x] = average;
             }
         }
 
-        for (int y = 0; y < h; y++) {
-            int y0 = Math.max(0, y - rad), y1 = Math.min(h - 1, y + rad);
-            int row = y * w;
-            for (int x = 0; x < w; x++) {
-                int x0 = Math.max(0, x - rad), x1 = Math.min(w - 1, x + rad);
-                long area = (long)(x1 - x0 + 1) * (y1 - y0 + 1);
-                long sum = intImg[(y1 + 1) * (w + 1) + (x1 + 1)] - intImg[y0 * (w + 1) + (x1 + 1)]
-                         - intImg[(y1 + 1) * (w + 1) + x0] + intImg[y0 * (w + 1) + x0];
-                long mean = sum / area;
-                
-                if ((yPlane[y * stride + x] & 0xFF) < mean - (mean >> 4)) {
-                    bin[row + x] = 1; 
-                } else {
-                    bin[row + x] = 0; 
+        for (int y = 0; y < subHeight; y++) {
+            for (int x = 0; x < subWidth; x++) {
+                int left = Math.max(0, x - 2);
+                left = Math.min(left, subWidth - 5);
+                int top = Math.max(0, y - 2);
+                top = Math.min(top, subHeight - 5);
+                int sum = 0;
+                for (int yy = 0; yy < 5; yy++) {
+                    for (int xx = 0; xx < 5; xx++) {
+                        sum += blackPoints[top + yy][left + xx];
+                    }
+                }
+                int threshold = sum / 25;
+
+                for (int yy = 0; yy < 8; yy++) {
+                    int offset = (y * 8 + yy) * stride + (x * 8);
+                    int binOffset = (y * 8 + yy) * w + (x * 8);
+                    for (int xx = 0; xx < 8; xx++) {
+                        int pixel = yPlane[offset + xx] & 0xFF;
+                        bin[binOffset + xx] = (byte) (pixel <= threshold ? 1 : 0);
+                    }
                 }
             }
         }
@@ -378,25 +388,33 @@ public class PDF417Scanner {
         List<Point> starts = new ArrayList<>();
         List<Point> stops = new ArrayList<>();
 
+        float[] slopes = {0.0f, 0.05f, -0.05f, 0.1f, -0.1f, 0.15f, -0.15f, 0.2f, -0.2f};
         int step = Math.max(2, h / 60);
-        int[] line = new int[w];
 
-        for (int y = step; y < h - step; y += step) {
-            for (int x = 0; x < w; x++) line[x] = yPlane[y * rowStride + x] & 0xFF;
-            
-            RunData rd = getSubpixelRuns(line, w);
-            
-            for (int i = 0; i <= rd.runs.length - 8; i++) {
-                if ((rd.firstColor + i) % 2 != 1) continue;
-                
-                if (PDF417Matcher.checkStartPattern(Arrays.copyOfRange(rd.runs, i, i + 8), null)) {
-                    float px = 0; for (int k = 0; k < i; k++) px += rd.runs[k]; 
-                    starts.add(new Point(px, y));
+        for (float slope : slopes) {
+            int[] line = new int[w];
+            for (int y = step; y < h - step; y += step) {
+                for (int x = 0; x < w; x++) {
+                    int cy = y + (int) ((x - w / 2) * slope);
+                    line[x] = (cy >= 0 && cy < h) ? (yPlane[cy * rowStride + x] & 0xFF) : 255;
                 }
                 
-                if (rd.runs.length - i >= 9 && PDF417Matcher.checkStopPattern(Arrays.copyOfRange(rd.runs, i, i + 9), 9, null)) {
-                    float px = 0; for (int k = 0; k < i + 9; k++) px += rd.runs[k]; 
-                    stops.add(new Point(px, y));
+                RunData rd = getSubpixelRuns(line, w);
+                
+                for (int i = 0; i <= rd.runs.length - 8; i++) {
+                    if ((rd.firstColor + i) % 2 != 1) continue;
+                    
+                    if (PDF417Matcher.checkStartPattern(Arrays.copyOfRange(rd.runs, i, i + 8), null)) {
+                        float px = 0; for (int k = 0; k < i; k++) px += rd.runs[k]; 
+                        float realY = y + (px - w / 2.0f) * slope;
+                        starts.add(new Point(px, realY));
+                    }
+                    
+                    if (rd.runs.length - i >= 9 && PDF417Matcher.checkStopPattern(Arrays.copyOfRange(rd.runs, i, i + 9), 9, null)) {
+                        float px = 0; for (int k = 0; k < i + 9; k++) px += rd.runs[k]; 
+                        float realY = y + (px - w / 2.0f) * slope;
+                        stops.add(new Point(px, realY));
+                    }
                 }
             }
         }
