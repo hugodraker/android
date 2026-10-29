@@ -1,3 +1,11 @@
+/* ============================================================================
+ * Android Barcode Scanner
+ *
+ *  2026 HUGO
+ *
+ * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+ * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
+ * ============================================================================ */
 package com.barcodetyper;
 
 import java.util.Arrays;
@@ -19,8 +27,8 @@ public class PDF417ErrorCorrection {
     }
 
     private static boolean solveKnownLocations(int[] cw, int N, int K, int[] S, int[] errIdx, int E) {
-        if (E <= 0 || E > K - 2 || E > 32) return false;
-        int[] X = new int[32];
+        if (E <= 0 || E > K - 2 || E > 256) return false;
+        int[] X = new int[256];
         for (int m = 0; m < E; m++) {
             if (errIdx[m] < 0 || errIdx[m] >= N) return false;
             X[m] = gf929_pow(3, N - 1 - errIdx[m]);
@@ -28,7 +36,7 @@ public class PDF417ErrorCorrection {
 
         int[] trial = Arrays.copyOf(cw, N);
         for (int m = 0; m < E; m++) {
-            int[] c = new int[33];
+            int[] c = new int[257];
             c[0] = 1;
             int deg = 0;
             int denom = X[m];
@@ -84,8 +92,8 @@ public class PDF417ErrorCorrection {
             return false;
         }
 
-        int K = Math.min(eccCount, 128);
-        int[] C = new int[130], B = new int[130];
+        int K = eccCount; 
+        int[] C = new int[514], B = new int[514];
         C[0] = 1; B[0] = 1;
         int L = 0, m = 1, b = 1;
 
@@ -97,7 +105,7 @@ public class PDF417ErrorCorrection {
             } else {
                 int[] T = Arrays.copyOf(C, C.length);
                 int coef = gf929_mul(d, PDF417Data.pdfInv929[b]);
-                for (int i = m; i < 130; i++) C[i] = (C[i] + 929 - gf929_mul(coef, B[i - m])) % 929;
+                for (int i = m; i < 514; i++) C[i] = (C[i] + 929 - gf929_mul(coef, B[i - m])) % 929;
                 if (2 * L <= n) {
                     L = n + 1 - L; B = T; b = d; m = 1;
                 } else {
@@ -106,9 +114,9 @@ public class PDF417ErrorCorrection {
             }
         }
 
-        if (L <= 0 || 2 * L > K - 4 || L > 32) return false;
+        if (L <= 0 || 2 * L > K - 4) return false;
 
-        int[] errIdx = new int[32];
+        int[] errIdx = new int[256];
         int errCnt = 0;
         for (int i = 0; i < N; i++) {
             int p = N - 1 - i;
@@ -118,7 +126,7 @@ public class PDF417ErrorCorrection {
                 eval = (eval + gf929_mul(C[j], xPow)) % 929;
                 xPow = gf929_mul(xPow, xInv);
             }
-            if (eval == 0 && errCnt < 32) errIdx[errCnt++] = i;
+            if (eval == 0 && errCnt < 256) errIdx[errCnt++] = i;
         }
 
         if (errCnt != L) return false;
