@@ -1,5 +1,5 @@
 plugins {
-    id 'com.android.application'
+    id 'com.android.application' version '8.0.2'
 }
 
 android {
@@ -8,7 +8,7 @@ android {
 
     defaultConfig {
         applicationId "com.example.dlnaserver"
-        minSdk 9  // Android 2.3 Gingerbread
+        minSdk 9
         targetSdk 33
         versionCode 1
         versionName "1.0"
@@ -24,13 +24,9 @@ android {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
-        debug {
-            applicationIdSuffix ".debug"
-            debuggable true
-        }
     }
 }
 
 dependencies {
-    // Pure standard Java networking APIs are used; no external library dependencies required.
+    // Pure standard Java networking APIs; no external libraries required
 }
