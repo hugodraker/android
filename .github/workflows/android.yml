@@ -26,7 +26,7 @@ jobs:
         gradle-version: '8.0.2'
 
     - name: Build Debug APK
-      run: gradle assembleDebug
+      run: gradle :app:assembleDebug
 
     - name: Rename APK to dlnad.apk
       run: mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/dlnad.apk
