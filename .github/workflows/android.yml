@@ -2,9 +2,9 @@ name: Build CalDAV-D Android APK
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "caldavd" ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "caldavd" ]
   workflow_dispatch:
 
 jobs:
@@ -27,10 +27,8 @@ jobs:
 
       - name: Setup Android SDK & NDK
         uses: android-actions/setup-android@v3
-
-      - name: Install NDK and CMake
-        run: |
-          sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+        with:
+          packages: 'ndk;26.1.10909125 cmake;3.22.1 platforms;android-34 build-tools;34.0.0'
 
       - name: Build Debug APK
         run: gradle assembleDebug --stacktrace
