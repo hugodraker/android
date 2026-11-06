@@ -10,6 +10,8 @@ import android.util.Log;
 
 import java.io.*;
 import java.net.*;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -24,52 +26,69 @@ public class DlnaService extends Service {
     private MulticastSocket ssdpSocket;
     private Thread httpThread;
     private Thread ssdpThread;
-    private boolean isRunning = false;
+    private volatile boolean isRunning = false;
     private int currentPort = DEFAULT_DLNA_PORT;
     private int systemUpdateId = 1;
     
     private WifiManager.MulticastLock multicastLock;
-    private String baseSharePath;
+    private List<String> sharePaths = new ArrayList<String>();
 
     @Override
     public void onCreate() {
         super.onCreate();
         File extDir = Environment.getExternalStorageDirectory();
-        baseSharePath = extDir != null ? extDir.getAbsolutePath() : "/sdcard";
+        sharePaths.add(extDir != null ? extDir.getAbsolutePath() : "/sdcard");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        stopServers();
+
         if (intent != null) {
             currentPort = intent.getIntExtra("PORT", DEFAULT_DLNA_PORT);
-            
-            String folder = intent.getStringExtra("FOLDER");
-            if (folder != null) baseSharePath = folder;
+            ArrayList<String> folders = intent.getStringArrayListExtra("FOLDERS");
+            if (folders != null && !folders.isEmpty()) {
+                sharePaths = new ArrayList<String>(folders);
+            }
         }
         
-        WifiManager wifi = (WifiManager) getSystemService(Context.WIFI_SERVICE);
-        multicastLock = wifi.createMulticastLock("DlnaSsdpLock");
-        multicastLock.acquire();
+        try {
+            WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wifi != null) {
+                multicastLock = wifi.createMulticastLock("DlnaSsdpLock");
+                multicastLock.setReferenceCounted(false);
+                multicastLock.acquire();
+            }
+        } catch (Exception e) {
+            Log.e("DLNA", "MulticastLock Error", e);
+        }
 
         isRunning = true;
+        systemUpdateId++;
         startSsdpServer();
         startHttpServer();
         
         return START_STICKY;
     }
 
-    @Override
-    public void onDestroy() {
+    private void stopServers() {
         isRunning = false;
         try {
-            if (httpSocket != null) httpSocket.close();
-            if (ssdpSocket != null) ssdpSocket.close();
+            if (httpSocket != null) { httpSocket.close(); httpSocket = null; }
+        } catch (IOException ignored) { }
+        try {
+            if (ssdpSocket != null) { ssdpSocket.close(); ssdpSocket = null; }
+        } catch (Exception ignored) { }
+        try {
             if (multicastLock != null && multicastLock.isHeld()) {
                 multicastLock.release();
             }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+        } catch (Exception ignored) { }
+    }
+
+    @Override
+    public void onDestroy() {
+        stopServers();
         super.onDestroy();
     }
 
@@ -90,7 +109,11 @@ public class DlnaService extends Service {
                         
                         if (request.startsWith("M-SEARCH")) {
                             String st = "upnp:rootdevice";
-                            if (request.contains("urn:schemas-upnp-org:device:MediaServer:1")) st = "urn:schemas-upnp-org:device:MediaServer:1";
+                            if (request.contains("urn:schemas-upnp-org:device:MediaServer:1")) {
+                                st = "urn:schemas-upnp-org:device:MediaServer:1";
+                            } else if (request.contains("urn:schemas-upnp-org:service:ContentDirectory:1")) {
+                                st = "urn:schemas-upnp-org:service:ContentDirectory:1";
+                            }
                             
                             String reply = "HTTP/1.1 200 OK\r\n" +
                                     "CACHE-CONTROL: max-age=1800\r\n" +
@@ -107,7 +130,7 @@ public class DlnaService extends Service {
                         }
                     }
                 } catch (Exception e) {
-                    Log.e("DLNA", "SSDP Error", e);
+                    if (isRunning) Log.e("DLNA", "SSDP Error", e);
                 }
             }
         });
@@ -125,7 +148,7 @@ public class DlnaService extends Service {
                         new Thread(new HttpClientHandler(client)).start();
                     }
                 } catch (IOException e) {
-                    Log.e("DLNA", "HTTP Server Error", e);
+                    if (isRunning) Log.e("DLNA", "HTTP Server Error", e);
                 }
             }
         });
@@ -134,7 +157,7 @@ public class DlnaService extends Service {
 
     private String getLocalIpAddress() {
         try {
-            WifiManager wifiManager = (WifiManager) getSystemService(WIFI_SERVICE);
+            WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
             int ipAddress = wifiManager.getConnectionInfo().getIpAddress();
             return String.format("%d.%d.%d.%d",
                     (ipAddress & 0xff), (ipAddress >> 8 & 0xff),
@@ -149,9 +172,11 @@ public class DlnaService extends Service {
 
     private String bytesToHex(String in) {
         StringBuilder out = new StringBuilder();
-        for (byte b : in.getBytes()) {
-            out.append(String.format("%02X", b));
-        }
+        try {
+            for (byte b : in.getBytes("UTF-8")) {
+                out.append(String.format("%02X", b));
+            }
+        } catch (UnsupportedEncodingException ignored) { }
         return out.toString();
     }
 
@@ -161,7 +186,7 @@ public class DlnaService extends Service {
             for (int i = 0; i < bytes.length; i++) {
                 bytes[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
             }
-            return new String(bytes);
+            return new String(bytes, "UTF-8");
         } catch (Exception e) {
             return "";
         }
@@ -191,6 +216,26 @@ public class DlnaService extends Service {
         if (ext.equals("mp3")) return new MediaProfile("audio/mpeg", "object.item.audioItem.musicTrack", "DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000");
         if (ext.equals("jpg") || ext.equals("jpeg")) return new MediaProfile("image/jpeg", "object.item.imageItem.photo", "DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000");
         if (ext.equals("png")) return new MediaProfile("image/png", "object.item.imageItem.photo", "DLNA.ORG_PN=PNG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000");
+        return null;
+    }
+
+    private File resolveObjectIdToFile(String objId) {
+        if (!objId.startsWith("S")) return null;
+        int underscore = objId.indexOf('_');
+        try {
+            if (underscore == -1) {
+                int idx = Integer.parseInt(objId.substring(1));
+                if (idx >= 0 && idx < sharePaths.size()) {
+                    return new File(sharePaths.get(idx));
+                }
+            } else {
+                int idx = Integer.parseInt(objId.substring(1, underscore));
+                if (idx >= 0 && idx < sharePaths.size()) {
+                    String relPath = hexToBytes(objId.substring(underscore + 1));
+                    return new File(sharePaths.get(idx), relPath);
+                }
+            }
+        } catch (Exception ignored) { }
         return null;
     }
 
@@ -272,64 +317,75 @@ public class DlnaService extends Service {
         }
 
         private void sendHttpXml(OutputStream out, String xml) throws IOException {
+            byte[] data = xml.getBytes("UTF-8");
             String hdr = "HTTP/1.1 200 OK\r\n" +
                          "Content-Type: text/xml; charset=\"utf-8\"\r\n" +
-                         "Content-Length: " + xml.getBytes("UTF-8").length + "\r\n" +
+                         "Content-Length: " + data.length + "\r\n" +
                          "Server: Android/2.3 UPnP/1.0 DalvikDLNA/1.0\r\n" +
                          "EXT:\r\n" +
                          "Connection: close\r\n\r\n";
             out.write(hdr.getBytes());
-            out.write(xml.getBytes("UTF-8"));
+            out.write(data);
         }
 
         private String extractXmlTag(String xml, String tag) {
-            Matcher m = Pattern.compile("<" + tag + "[^>]*>(.*?)</" + tag + ">").matcher(xml);
-            return m.find() ? m.group(1) : "0";
+            Matcher m = Pattern.compile("<(?:\\w+:)?(" + tag + ")[^>]*>(.*?)</(?:\\w+:)?\\1>").matcher(xml);
+            return m.find() ? m.group(2) : "0";
         }
 
         private String buildSoapBrowseResponse(String reqXml) {
             String objId = extractXmlTag(reqXml, "ObjectID");
             String browseFlag = extractXmlTag(reqXml, "BrowseFlag");
-            int startIdx = Integer.parseInt(extractXmlTag(reqXml, "StartingIndex"));
-            int reqCount = Integer.parseInt(extractXmlTag(reqXml, "RequestedCount"));
+            int startIdx = 0, reqCount = 0;
+            try { startIdx = Integer.parseInt(extractXmlTag(reqXml, "StartingIndex")); } catch (Exception ignored) {}
+            try { reqCount = Integer.parseInt(extractXmlTag(reqXml, "RequestedCount")); } catch (Exception ignored) {}
             boolean isMetadata = browseFlag.contains("BrowseMetadata");
 
             StringBuilder didl = new StringBuilder();
             int totalMatches = 0, numReturned = 0;
 
-            File targetDir = null;
-            String parentId = "0";
-
             if (objId.equals("0")) {
-                targetDir = new File(baseSharePath);
-                parentId = "-1";
-            } else if (objId.startsWith("S0")) {
-                if (objId.equals("S0")) {
-                    targetDir = new File(baseSharePath);
-                    parentId = "0";
-                } else {
-                    String hexRel = objId.substring(3);
-                    String relPath = hexToBytes(hexRel);
-                    targetDir = new File(baseSharePath, relPath);
-                    int lastSep = relPath.lastIndexOf('/');
-                    parentId = (lastSep > 0) ? "S0_" + bytesToHex(relPath.substring(0, lastSep)) : "S0";
-                }
-            }
-
-            if (targetDir != null && targetDir.exists()) {
                 if (isMetadata) {
-                    if (targetDir.isDirectory()) {
-                        didl.append("&lt;container id=\"").append(objId).append("\" parentID=\"").append(parentId).append("\" restricted=\"1\" searchable=\"0\"&gt;")
-                            .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(targetDir.getName().isEmpty() ? "SD Card" : targetDir.getName()))).append("&lt;/dc:title&gt;")
-                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
-                        totalMatches = numReturned = 1;
-                    }
+                    didl.append("&lt;container id=\"0\" parentID=\"-1\" restricted=\"1\" searchable=\"0\"&gt;")
+                        .append("&lt;dc:title&gt;Root&lt;/dc:title&gt;")
+                        .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
+                    totalMatches = numReturned = 1;
                 } else {
-                    if (objId.equals("0")) {
-                        didl.append("&lt;container id=\"S0\" parentID=\"0\" restricted=\"1\" searchable=\"0\"&gt;")
-                            .append("&lt;dc:title&gt;SD Card&lt;/dc:title&gt;")
-                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
-                        totalMatches = numReturned = 1;
+                    for (int i = 0; i < sharePaths.size(); i++) {
+                        if (totalMatches >= startIdx && (reqCount == 0 || numReturned < reqCount)) {
+                            File f = new File(sharePaths.get(i));
+                            String name = f.getName().isEmpty() ? f.getAbsolutePath() : f.getName();
+                            didl.append("&lt;container id=\"S").append(i).append("\" parentID=\"0\" restricted=\"1\" searchable=\"0\"&gt;")
+                                .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(name))).append("&lt;/dc:title&gt;")
+                                .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
+                            numReturned++;
+                        }
+                        totalMatches++;
+                    }
+                }
+            } else if (objId.startsWith("S")) {
+                File targetDir = resolveObjectIdToFile(objId);
+                int underscore = objId.indexOf('_');
+                String sharePrefix = (underscore == -1) ? objId : objId.substring(0, underscore);
+                int shareIdx = Integer.parseInt(sharePrefix.substring(1));
+                String baseSharePath = sharePaths.get(shareIdx);
+
+                String parentId = "0";
+                if (underscore != -1) {
+                    String relPath = hexToBytes(objId.substring(underscore + 1));
+                    int lastSep = relPath.lastIndexOf('/');
+                    parentId = (lastSep > 0) ? sharePrefix + "_" + bytesToHex(relPath.substring(0, lastSep)) : sharePrefix;
+                }
+
+                if (targetDir != null && targetDir.exists()) {
+                    if (isMetadata) {
+                        if (targetDir.isDirectory()) {
+                            String name = targetDir.getName().isEmpty() ? "Share " + shareIdx : targetDir.getName();
+                            didl.append("&lt;container id=\"").append(objId).append("\" parentID=\"").append(parentId).append("\" restricted=\"1\" searchable=\"0\"&gt;")
+                                .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(name))).append("&lt;/dc:title&gt;")
+                                .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
+                            totalMatches = numReturned = 1;
+                        }
                     } else if (targetDir.isDirectory()) {
                         File[] files = targetDir.listFiles();
                         if (files != null) {
@@ -339,9 +395,9 @@ public class DlnaService extends Service {
                                 if (!f.isDirectory() && profile == null) continue;
 
                                 if (totalMatches >= startIdx && (reqCount == 0 || numReturned < reqCount)) {
-                                    String childRel = f.getAbsolutePath().substring(baseSharePath.length());
+                                    String childRel = f.getAbsolutePath().substring(baseSharePath.length()).replace('\\', '/');
                                     if (childRel.startsWith("/")) childRel = childRel.substring(1);
-                                    String childId = "S0_" + bytesToHex(childRel);
+                                    String childId = sharePrefix + "_" + bytesToHex(childRel);
 
                                     if (f.isDirectory()) {
                                         didl.append("&lt;container id=\"").append(childId).append("\" parentID=\"").append(objId).append("\" restricted=\"1\" searchable=\"0\"&gt;")
@@ -386,11 +442,7 @@ public class DlnaService extends Service {
             if (segments.length < 3) return;
             String objId = segments[2];
 
-            File targetFile = null;
-            if (objId.startsWith("S0_")) {
-                String relPath = hexToBytes(objId.substring(3));
-                targetFile = new File(baseSharePath, relPath);
-            }
+            File targetFile = resolveObjectIdToFile(objId);
 
             if (targetFile == null || !targetFile.exists() || targetFile.isDirectory()) {
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes());
@@ -412,7 +464,7 @@ public class DlnaService extends Service {
                 try {
                     if (range.length > 0 && !range[0].isEmpty()) startByte = Long.parseLong(range[0]);
                     if (range.length > 1 && !range[1].isEmpty()) endByte = Long.parseLong(range[1]);
-                } catch (NumberFormatException e) { }
+                } catch (NumberFormatException ignored) { }
             }
             if (startByte >= totalSize) startByte = 0;
             if (endByte >= totalSize) endByte = totalSize - 1;
@@ -462,7 +514,7 @@ public class DlnaService extends Service {
                    "  <specVersion><major>1</major><minor>0</minor></specVersion>\r\n" +
                    "  <device>\r\n" +
                    "    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>\r\n" +
-                   "    <friendlyName>Android 2.3 DLNA Server</friendlyName>\r\n" +
+                   "    <friendlyName>Android DLNA Server</friendlyName>\r\n" +
                    "    <manufacturer>Custom Android Systems</manufacturer>\r\n" +
                    "    <modelName>Android-DLNA-Server</modelName>\r\n" +
                    "    <modelNumber>1.0</modelNumber>\r\n" +
