@@ -8,18 +8,35 @@
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="Port:" />
-
+        android:text="DLNA Server Port:" />
     <EditText
         android:id="@+id/editPort"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:inputType="number" />
 
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Shared Folder:" />
+    <TextView
+        android:id="@+id/textFolder"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="/sdcard"
+        android:textStyle="bold" />
+    <Button
+        android:id="@+id/btnPickFolder"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Choose Folder" />
+
     <Button
         android:id="@+id/btnToggle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
         android:text="Start Server" />
 
     <TextView
@@ -27,5 +44,4 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp" />
-
 </LinearLayout>
