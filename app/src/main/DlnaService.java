@@ -15,10 +15,10 @@ import java.util.regex.Pattern;
 
 public class DlnaService extends Service {
 
-    public static final String SSDP_ADDR = "239.255.255.250"; //[cite: 1]
-    public static final int SSDP_PORT = 1900; //[cite: 1]
-    public static final int DEFAULT_DLNA_PORT = 8200; //[cite: 1]
-    public static final String SERVER_UUID = "uuid:4d696e69-444c-164e-9d41-57696e333200"; //[cite: 1]
+    public static final String SSDP_ADDR = "239.255.255.250";
+    public static final int SSDP_PORT = 1900;
+    public static final int DEFAULT_DLNA_PORT = 8200;
+    public static final String SERVER_UUID = "uuid:4d696e69-444c-164e-9d41-57696e333200";
 
     private ServerSocket httpSocket;
     private MulticastSocket ssdpSocket;
@@ -26,7 +26,7 @@ public class DlnaService extends Service {
     private Thread ssdpThread;
     private boolean isRunning = false;
     private int currentPort = DEFAULT_DLNA_PORT;
-    private int systemUpdateId = 1; //[cite: 1]
+    private int systemUpdateId = 1;
     
     private WifiManager.MulticastLock multicastLock;
     private String baseSharePath;
@@ -34,7 +34,6 @@ public class DlnaService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        // Default share mapped to Android's external storage (SD card)
         File extDir = Environment.getExternalStorageDirectory();
         baseSharePath = extDir != null ? extDir.getAbsolutePath() : "/sdcard";
     }
@@ -43,6 +42,9 @@ public class DlnaService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null) {
             currentPort = intent.getIntExtra("PORT", DEFAULT_DLNA_PORT);
+            
+            String folder = intent.getStringExtra("FOLDER");
+            if (folder != null) baseSharePath = folder;
         }
         
         WifiManager wifi = (WifiManager) getSystemService(Context.WIFI_SERVICE);
@@ -86,9 +88,9 @@ public class DlnaService extends Service {
                         ssdpSocket.receive(packet);
                         String request = new String(packet.getData(), 0, packet.getLength());
                         
-                        if (request.startsWith("M-SEARCH")) { //[cite: 1]
+                        if (request.startsWith("M-SEARCH")) {
                             String st = "upnp:rootdevice";
-                            if (request.contains("urn:schemas-upnp-org:device:MediaServer:1")) st = "urn:schemas-upnp-org:device:MediaServer:1"; //[cite: 1]
+                            if (request.contains("urn:schemas-upnp-org:device:MediaServer:1")) st = "urn:schemas-upnp-org:device:MediaServer:1";
                             
                             String reply = "HTTP/1.1 200 OK\r\n" +
                                     "CACHE-CONTROL: max-age=1800\r\n" +
@@ -96,7 +98,7 @@ public class DlnaService extends Service {
                                     "LOCATION: http://" + getLocalIpAddress() + ":" + currentPort + "/rootDesc.xml\r\n" +
                                     "SERVER: Android/2.3 UPnP/1.0 DalvikDLNA/1.0\r\n" +
                                     "ST: " + st + "\r\n" +
-                                    "USN: " + SERVER_UUID + "::" + st + "\r\n\r\n"; //[cite: 1]
+                                    "USN: " + SERVER_UUID + "::" + st + "\r\n\r\n";
                             
                             byte[] replyBytes = reply.getBytes();
                             DatagramPacket replyPacket = new DatagramPacket(
@@ -145,10 +147,7 @@ public class DlnaService extends Service {
     @Override
     public IBinder onBind(Intent intent) { return null; }
 
-    // -------------------------------------------------------------------------
-    // Object ID Hex Encoding/Decoding (Mirrors C implementation)
-    // -------------------------------------------------------------------------
-    private String bytesToHex(String in) { //[cite: 1]
+    private String bytesToHex(String in) {
         StringBuilder out = new StringBuilder();
         for (byte b : in.getBytes()) {
             out.append(String.format("%02X", b));
@@ -156,7 +155,7 @@ public class DlnaService extends Service {
         return out.toString();
     }
 
-    private String hexToBytes(String hex) { //[cite: 1]
+    private String hexToBytes(String hex) {
         try {
             byte[] bytes = new byte[hex.length() / 2];
             for (int i = 0; i < bytes.length; i++) {
@@ -168,7 +167,7 @@ public class DlnaService extends Service {
         }
     }
 
-    private String escapeXml(String raw) { //[cite: 1]
+    private String escapeXml(String raw) {
         return raw.replace("&", "&amp;")
                   .replace("<", "&lt;")
                   .replace(">", "&gt;")
@@ -176,31 +175,25 @@ public class DlnaService extends Service {
                   .replace("'", "&apos;");
     }
 
-    // -------------------------------------------------------------------------
-    // Media Profiles Mapping (Mirrors get_media_profile)
-    // -------------------------------------------------------------------------
     private static class MediaProfile {
         String mime, upnpClass, dlnaPn;
         MediaProfile(String m, String c, String p) { mime = m; upnpClass = c; dlnaPn = p; }
     }
 
-    private MediaProfile getMediaProfile(String filename) { //[cite: 1]
+    private MediaProfile getMediaProfile(String filename) {
         String ext = "";
         int dot = filename.lastIndexOf('.');
         if (dot > 0) ext = filename.substring(dot + 1).toLowerCase();
 
-        if (ext.equals("mp4") || ext.equals("m4v") || ext.equals("mov")) return new MediaProfile("video/mp4", "object.item.videoItem", "DLNA.ORG_PN=AVC_MP4_MP_SD_AAC_MULT5;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"); //[cite: 1]
-        if (ext.equals("mkv") || ext.equals("webm")) return new MediaProfile("video/x-matroska", "object.item.videoItem", "DLNA.ORG_PN=MATROSKA;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"); //[cite: 1]
-        if (ext.equals("avi")) return new MediaProfile("video/x-msvideo", "object.item.videoItem", "DLNA.ORG_PN=AVI;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"); //[cite: 1]
-        if (ext.equals("mp3")) return new MediaProfile("audio/mpeg", "object.item.audioItem.musicTrack", "DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"); //[cite: 1]
-        if (ext.equals("jpg") || ext.equals("jpeg")) return new MediaProfile("image/jpeg", "object.item.imageItem.photo", "DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000"); //[cite: 1]
-        if (ext.equals("png")) return new MediaProfile("image/png", "object.item.imageItem.photo", "DLNA.ORG_PN=PNG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000"); //[cite: 1]
+        if (ext.equals("mp4") || ext.equals("m4v") || ext.equals("mov")) return new MediaProfile("video/mp4", "object.item.videoItem", "DLNA.ORG_PN=AVC_MP4_MP_SD_AAC_MULT5;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000");
+        if (ext.equals("mkv") || ext.equals("webm")) return new MediaProfile("video/x-matroska", "object.item.videoItem", "DLNA.ORG_PN=MATROSKA;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000");
+        if (ext.equals("avi")) return new MediaProfile("video/x-msvideo", "object.item.videoItem", "DLNA.ORG_PN=AVI;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000");
+        if (ext.equals("mp3")) return new MediaProfile("audio/mpeg", "object.item.audioItem.musicTrack", "DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000");
+        if (ext.equals("jpg") || ext.equals("jpeg")) return new MediaProfile("image/jpeg", "object.item.imageItem.photo", "DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000");
+        if (ext.equals("png")) return new MediaProfile("image/png", "object.item.imageItem.photo", "DLNA.ORG_PN=PNG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000");
         return null;
     }
 
-    // -------------------------------------------------------------------------
-    // HTTP Client Handler
-    // -------------------------------------------------------------------------
     private class HttpClientHandler implements Runnable {
         private Socket client;
 
@@ -223,7 +216,6 @@ public class DlnaService extends Service {
                 String method = parts[0];
                 String path = parts[1];
 
-                // Parse Headers
                 int contentLength = 0;
                 String rangeHeader = null;
                 String line;
@@ -232,11 +224,10 @@ public class DlnaService extends Service {
                     if (lower.startsWith("content-length:")) {
                         contentLength = Integer.parseInt(lower.substring(15).trim());
                     } else if (lower.startsWith("range:")) {
-                        rangeHeader = line.substring(6).trim(); //[cite: 1]
+                        rangeHeader = line.substring(6).trim();
                     }
                 }
 
-                // Parse Body for POST
                 String reqBody = "";
                 if (contentLength > 0) {
                     char[] bodyChars = new char[contentLength];
@@ -249,28 +240,28 @@ public class DlnaService extends Service {
                     reqBody = new String(bodyChars);
                 }
 
-                if (method.equals("GET") && path.equals("/rootDesc.xml")) { //[cite: 1]
+                if (method.equals("GET") && path.equals("/rootDesc.xml")) {
                     sendHttpXml(out, getRootDescXml());
-                } else if (method.equals("GET") && path.equals("/cds_scpd.xml")) { //[cite: 1]
+                } else if (method.equals("GET") && path.equals("/cds_scpd.xml")) {
                     sendHttpXml(out, getCdsScpdXml());
-                } else if (method.equals("GET") && path.equals("/cms_scpd.xml")) { //[cite: 1]
+                } else if (method.equals("GET") && path.equals("/cms_scpd.xml")) {
                     sendHttpXml(out, getCmsScpdXml());
-                } else if (method.equals("POST") && path.equals("/ctl/ContentDir")) { //[cite: 1]
-                    if (reqBody.contains("GetSystemUpdateID")) { //[cite: 1]
-                        sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetSystemUpdateIDResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"><Id>" + systemUpdateId + "</Id></u:GetSystemUpdateIDResponse></s:Body>\r\n</s:Envelope>\r\n"); //[cite: 1]
-                    } else if (reqBody.contains("GetSearchCapabilities")) { //[cite: 1]
-                        sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetSearchCapabilitiesResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"><SearchCaps></SearchCaps></u:GetSearchCapabilitiesResponse></s:Body>\r\n</s:Envelope>\r\n"); //[cite: 1]
-                    } else if (reqBody.contains("GetSortCapabilities")) { //[cite: 1]
-                        sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetSortCapabilitiesResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"><SortCaps>dc:title</SortCaps></u:GetSortCapabilitiesResponse></s:Body>\r\n</s:Envelope>\r\n"); //[cite: 1]
+                } else if (method.equals("POST") && path.equals("/ctl/ContentDir")) {
+                    if (reqBody.contains("GetSystemUpdateID")) {
+                        sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetSystemUpdateIDResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"><Id>" + systemUpdateId + "</Id></u:GetSystemUpdateIDResponse></s:Body>\r\n</s:Envelope>\r\n");
+                    } else if (reqBody.contains("GetSearchCapabilities")) {
+                        sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetSearchCapabilitiesResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"><SearchCaps></SearchCaps></u:GetSearchCapabilitiesResponse></s:Body>\r\n</s:Envelope>\r\n");
+                    } else if (reqBody.contains("GetSortCapabilities")) {
+                        sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetSortCapabilitiesResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"><SortCaps>dc:title</SortCaps></u:GetSortCapabilitiesResponse></s:Body>\r\n</s:Envelope>\r\n");
                     } else {
                         sendHttpXml(out, buildSoapBrowseResponse(reqBody));
                     }
-                } else if (method.equals("POST") && path.equals("/ctl/ConnMgr")) { //[cite: 1]
-                    sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetProtocolInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\"><Source>http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,http-get:*:video/x-msvideo:*,http-get:*:audio/mpeg:*,http-get:*:image/jpeg:*,http-get:*:image/png:*</Source><Sink></Sink></u:GetProtocolInfoResponse></s:Body>\r\n</s:Envelope>\r\n"); //[cite: 1]
-                } else if (path.startsWith("/media/")) { //[cite: 1]
+                } else if (method.equals("POST") && path.equals("/ctl/ConnMgr")) {
+                    sendHttpXml(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n  <s:Body><u:GetProtocolInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\"><Source>http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,http-get:*:video/x-msvideo:*,http-get:*:audio/mpeg:*,http-get:*:image/jpeg:*,http-get:*:image/png:*</Source><Sink></Sink></u:GetProtocolInfoResponse></s:Body>\r\n</s:Envelope>\r\n");
+                } else if (path.startsWith("/media/")) {
                     streamMediaFile(out, path, rangeHeader, method.equals("HEAD"));
                 } else {
-                    String r404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; //[cite: 1]
+                    String r404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     out.write(r404.getBytes());
                 }
                 out.flush();
@@ -286,25 +277,22 @@ public class DlnaService extends Service {
                          "Content-Length: " + xml.getBytes("UTF-8").length + "\r\n" +
                          "Server: Android/2.3 UPnP/1.0 DalvikDLNA/1.0\r\n" +
                          "EXT:\r\n" +
-                         "Connection: close\r\n\r\n"; //[cite: 1]
+                         "Connection: close\r\n\r\n";
             out.write(hdr.getBytes());
             out.write(xml.getBytes("UTF-8"));
         }
 
-        private String extractXmlTag(String xml, String tag) { //[cite: 1]
+        private String extractXmlTag(String xml, String tag) {
             Matcher m = Pattern.compile("<" + tag + "[^>]*>(.*?)</" + tag + ">").matcher(xml);
             return m.find() ? m.group(1) : "0";
         }
 
-        // ---------------------------------------------------------------------
-        // Browse Engine
-        // ---------------------------------------------------------------------
         private String buildSoapBrowseResponse(String reqXml) {
-            String objId = extractXmlTag(reqXml, "ObjectID"); //[cite: 1]
-            String browseFlag = extractXmlTag(reqXml, "BrowseFlag"); //[cite: 1]
-            int startIdx = Integer.parseInt(extractXmlTag(reqXml, "StartingIndex")); //[cite: 1]
-            int reqCount = Integer.parseInt(extractXmlTag(reqXml, "RequestedCount")); //[cite: 1]
-            boolean isMetadata = browseFlag.contains("BrowseMetadata"); //[cite: 1]
+            String objId = extractXmlTag(reqXml, "ObjectID");
+            String browseFlag = extractXmlTag(reqXml, "BrowseFlag");
+            int startIdx = Integer.parseInt(extractXmlTag(reqXml, "StartingIndex"));
+            int reqCount = Integer.parseInt(extractXmlTag(reqXml, "RequestedCount"));
+            boolean isMetadata = browseFlag.contains("BrowseMetadata");
 
             StringBuilder didl = new StringBuilder();
             int totalMatches = 0, numReturned = 0;
@@ -312,63 +300,62 @@ public class DlnaService extends Service {
             File targetDir = null;
             String parentId = "0";
 
-            if (objId.equals("0")) { //[cite: 1]
+            if (objId.equals("0")) {
                 targetDir = new File(baseSharePath);
                 parentId = "-1";
-            } else if (objId.startsWith("S0")) { //[cite: 1]
-                if (objId.equals("S0")) { //[cite: 1]
+            } else if (objId.startsWith("S0")) {
+                if (objId.equals("S0")) {
                     targetDir = new File(baseSharePath);
                     parentId = "0";
                 } else {
-                    String hexRel = objId.substring(3); // skip "S0_"
+                    String hexRel = objId.substring(3);
                     String relPath = hexToBytes(hexRel);
                     targetDir = new File(baseSharePath, relPath);
                     int lastSep = relPath.lastIndexOf('/');
-                    parentId = (lastSep > 0) ? "S0_" + bytesToHex(relPath.substring(0, lastSep)) : "S0"; //[cite: 1]
+                    parentId = (lastSep > 0) ? "S0_" + bytesToHex(relPath.substring(0, lastSep)) : "S0";
                 }
             }
 
             if (targetDir != null && targetDir.exists()) {
-                if (isMetadata) { //[cite: 1]
+                if (isMetadata) {
                     if (targetDir.isDirectory()) {
                         didl.append("&lt;container id=\"").append(objId).append("\" parentID=\"").append(parentId).append("\" restricted=\"1\" searchable=\"0\"&gt;")
-                            .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(targetDir.getName().isEmpty() ? "SD Card" : targetDir.getName()))).append("&lt;/dc:title&gt;") //[cite: 1]
-                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;"); //[cite: 1]
+                            .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(targetDir.getName().isEmpty() ? "SD Card" : targetDir.getName()))).append("&lt;/dc:title&gt;")
+                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
                         totalMatches = numReturned = 1;
                     }
                 } else {
-                    if (objId.equals("0")) { //[cite: 1]
-                        // Expose S0 as the root share container
-                        didl.append("&lt;container id=\"S0\" parentID=\"0\" restricted=\"1\" searchable=\"0\"&gt;") //[cite: 1]
+                    if (objId.equals("0")) {
+                        didl.append("&lt;container id=\"S0\" parentID=\"0\" restricted=\"1\" searchable=\"0\"&gt;")
                             .append("&lt;dc:title&gt;SD Card&lt;/dc:title&gt;")
-                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;"); //[cite: 1]
+                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
                         totalMatches = numReturned = 1;
                     } else if (targetDir.isDirectory()) {
                         File[] files = targetDir.listFiles();
                         if (files != null) {
                             for (File f : files) {
-                                if (f.isHidden()) continue; //[cite: 1]
-                                MediaProfile profile = f.isDirectory() ? null : getMediaProfile(f.getName()); //[cite: 1]
-                                if (!f.isDirectory() && profile == null) continue; //[cite: 1]
+                                if (f.isHidden()) continue;
+                                MediaProfile profile = f.isDirectory() ? null : getMediaProfile(f.getName());
+                                if (!f.isDirectory() && profile == null) continue;
 
-                                if (totalMatches >= startIdx && (reqCount == 0 || numReturned < reqCount)) { //[cite: 1]
+                                if (totalMatches >= startIdx && (reqCount == 0 || numReturned < reqCount)) {
                                     String childRel = f.getAbsolutePath().substring(baseSharePath.length());
                                     if (childRel.startsWith("/")) childRel = childRel.substring(1);
-                                    String childId = "S0_" + bytesToHex(childRel); //[cite: 1]
+                                    String childId = "S0_" + bytesToHex(childRel);
 
                                     if (f.isDirectory()) {
-                                        didl.append("&lt;container id=\"").append(childId).append("\" parentID=\"").append(objId).append("\" restricted=\"1\" searchable=\"0\"&gt;") //[cite: 1]
-                                            .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(f.getName()))).append("&lt;/dc:title&gt;") //[cite: 1]
-                                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;"); //[cite: 1]
+                                        didl.append("&lt;container id=\"").append(childId).append("\" parentID=\"").append(objId).append("\" restricted=\"1\" searchable=\"0\"&gt;")
+                                            .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(f.getName()))).append("&lt;/dc:title&gt;")
+                                            .append("&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;");
                                     } else {
                                         String ext = f.getName().substring(f.getName().lastIndexOf('.'));
-                                        didl.append("&lt;item id=\"").append(childId).append("\" parentID=\"").append(objId).append("\" restricted=\"1\"&gt;") //[cite: 1]
-                                            .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(f.getName()))).append("&lt;/dc:title&gt;") //[cite: 1]
-                                            .append("&lt;upnp:class&gt;").append(profile.upnpClass).append("&lt;/upnp:class&gt;") //[cite: 1]
-                                            .append("&lt;res size=\"").append(f.length()).append("\" protocolInfo=\"http-get:*:") //[cite: 1]
-                                            .append(profile.mime).append(":").append(profile.dlnaPn).append("\"&gt;") //[cite: 1]
-                                            .append("http://").append(getLocalIpAddress()).append(":").append(currentPort).append("/media/").append(childId).append("/stream").append(ext) //[cite: 1]
-                                            .append("&lt;/res&gt;&lt;/item&gt;"); //[cite: 1]
+                                        didl.append("&lt;item id=\"").append(childId).append("\" parentID=\"").append(objId).append("\" restricted=\"1\"&gt;")
+                                            .append("&lt;dc:title&gt;").append(escapeXml(escapeXml(f.getName()))).append("&lt;/dc:title&gt;")
+                                            .append("&lt;upnp:class&gt;").append(profile.upnpClass).append("&lt;/upnp:class&gt;")
+                                            .append("&lt;res size=\"").append(f.length()).append("\" protocolInfo=\"http-get:*:")
+                                            .append(profile.mime).append(":").append(profile.dlnaPn).append("\"&gt;")
+                                            .append("http://").append(getLocalIpAddress()).append(":").append(currentPort).append("/media/").append(childId).append("/stream").append(ext)
+                                            .append("&lt;/res&gt;&lt;/item&gt;");
                                     }
                                     numReturned++;
                                 }
@@ -383,7 +370,7 @@ public class DlnaService extends Service {
                    "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n" +
                    "  <s:Body>\r\n" +
                    "    <u:BrowseResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\r\n" +
-                   "      <Result>&lt;DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"&gt;" + //[cite: 1]
+                   "      <Result>&lt;DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"&gt;" +
                    didl.toString() +
                    "&lt;/DIDL-Lite&gt;</Result>\r\n" +
                    "      <NumberReturned>" + numReturned + "</NumberReturned>\r\n" +
@@ -391,91 +378,84 @@ public class DlnaService extends Service {
                    "      <UpdateID>" + systemUpdateId + "</UpdateID>\r\n" +
                    "    </u:BrowseResponse>\r\n" +
                    "  </s:Body>\r\n" +
-                   "</s:Envelope>\r\n"; //[cite: 1]
+                   "</s:Envelope>\r\n";
         }
 
-        // ---------------------------------------------------------------------
-        // Byte-Range Media Streaming
-        // ---------------------------------------------------------------------
         private void streamMediaFile(OutputStream out, String path, String rangeHeader, boolean isHead) throws IOException {
-            // URI format: /media/<ObjectID>/stream.ext[cite: 1]
             String[] segments = path.split("/");
             if (segments.length < 3) return;
             String objId = segments[2];
 
             File targetFile = null;
-            if (objId.startsWith("S0_")) { //[cite: 1]
+            if (objId.startsWith("S0_")) {
                 String relPath = hexToBytes(objId.substring(3));
                 targetFile = new File(baseSharePath, relPath);
             }
 
             if (targetFile == null || !targetFile.exists() || targetFile.isDirectory()) {
-                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes()); //[cite: 1]
+                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes());
                 return;
             }
 
             MediaProfile profile = getMediaProfile(targetFile.getName());
-            String mime = (profile != null) ? profile.mime : "application/octet-stream"; //[cite: 1]
+            String mime = (profile != null) ? profile.mime : "application/octet-stream";
             String dlnaPn = (profile != null) ? profile.dlnaPn : "";
 
-            long totalSize = targetFile.length(); //[cite: 1]
+            long totalSize = targetFile.length();
             long startByte = 0;
-            long endByte = totalSize - 1; //[cite: 1]
+            long endByte = totalSize - 1;
             boolean isPartial = false;
 
-            if (rangeHeader != null && rangeHeader.startsWith("bytes=")) { //[cite: 1]
+            if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
                 isPartial = true;
-                String[] range = rangeHeader.substring(6).split("-"); //[cite: 1]
+                String[] range = rangeHeader.substring(6).split("-");
                 try {
-                    if (range.length > 0 && !range[0].isEmpty()) startByte = Long.parseLong(range[0]); //[cite: 1]
-                    if (range.length > 1 && !range[1].isEmpty()) endByte = Long.parseLong(range[1]); //[cite: 1]
-                } catch (NumberFormatException e) { /* Ignore and use defaults */ }
+                    if (range.length > 0 && !range[0].isEmpty()) startByte = Long.parseLong(range[0]);
+                    if (range.length > 1 && !range[1].isEmpty()) endByte = Long.parseLong(range[1]);
+                } catch (NumberFormatException e) { }
             }
-            if (startByte >= totalSize) startByte = 0; //[cite: 1]
-            if (endByte >= totalSize) endByte = totalSize - 1; //[cite: 1]
-            long contentLength = endByte - startByte + 1; //[cite: 1]
+            if (startByte >= totalSize) startByte = 0;
+            if (endByte >= totalSize) endByte = totalSize - 1;
+            long contentLength = endByte - startByte + 1;
 
             StringBuilder hdr = new StringBuilder();
             if (isPartial) {
-                hdr.append("HTTP/1.1 206 Partial Content\r\n") //[cite: 1]
-                   .append("Content-Range: bytes ").append(startByte).append("-").append(endByte).append("/").append(totalSize).append("\r\n"); //[cite: 1]
+                hdr.append("HTTP/1.1 206 Partial Content\r\n")
+                   .append("Content-Range: bytes ").append(startByte).append("-").append(endByte).append("/").append(totalSize).append("\r\n");
             } else {
-                hdr.append("HTTP/1.1 200 OK\r\n"); //[cite: 1]
+                hdr.append("HTTP/1.1 200 OK\r\n");
             }
 
-            hdr.append("Content-Type: ").append(mime).append("\r\n") //[cite: 1]
-               .append("Content-Length: ").append(contentLength).append("\r\n") //[cite: 1]
-               .append("Accept-Ranges: bytes\r\n") //[cite: 1]
-               .append("transferMode.dlna.org: Streaming\r\n") //[cite: 1]
-               .append("contentFeatures.dlna.org: ").append(dlnaPn).append("\r\n") //[cite: 1]
+            hdr.append("Content-Type: ").append(mime).append("\r\n")
+               .append("Content-Length: ").append(contentLength).append("\r\n")
+               .append("Accept-Ranges: bytes\r\n")
+               .append("transferMode.dlna.org: Streaming\r\n")
+               .append("contentFeatures.dlna.org: ").append(dlnaPn).append("\r\n")
                .append("Server: Android/2.3 UPnP/1.0 DalvikDLNA/1.0\r\n")
-               .append("Connection: close\r\n\r\n"); //[cite: 1]
+               .append("Connection: close\r\n\r\n");
 
             out.write(hdr.toString().getBytes());
 
-            if (!isHead && contentLength > 0) { //[cite: 1]
+            if (!isHead && contentLength > 0) {
                 RandomAccessFile raf = null;
                 try {
                     raf = new RandomAccessFile(targetFile, "r");
-                    raf.seek(startByte); //[cite: 1]
-                    byte[] chunk = new byte[65536]; //[cite: 1]
+                    raf.seek(startByte);
+                    byte[] chunk = new byte[65536];
                     long rem = contentLength;
-                    while (rem > 0 && isRunning) { //[cite: 1]
-                        int toRead = (int) Math.min(rem, chunk.length); //[cite: 1]
+                    while (rem > 0 && isRunning) {
+                        int toRead = (int) Math.min(rem, chunk.length);
                         int n = raf.read(chunk, 0, toRead);
-                        if (n == -1) break; //[cite: 1]
+                        if (n == -1) break;
                         out.write(chunk, 0, n);
-                        rem -= n; //[cite: 1]
+                        rem -= n;
                     }
                 } finally {
-                    if (raf != null) raf.close(); //[cite: 1]
+                    if (raf != null) raf.close();
                 }
             }
         }
 
-        // ---------------------------------------------------------------------
-        // Static XML Descriptors
-        // ---------------------------------------------------------------------
         private String getRootDescXml() {
             return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n" +
                    "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">\r\n" +
@@ -505,7 +485,7 @@ public class DlnaService extends Service {
                    "      </service>\r\n" +
                    "    </serviceList>\r\n" +
                    "  </device>\r\n" +
-                   "</root>\r\n"; //[cite: 1]
+                   "</root>\r\n";
         }
 
         private String getCdsScpdXml() {
@@ -542,7 +522,7 @@ public class DlnaService extends Service {
                    "    <stateVariable sendEvents=\"no\"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>\r\n" +
                    "    <stateVariable sendEvents=\"no\"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>\r\n" +
                    "  </serviceStateTable>\r\n" +
-                   "</scpd>\r\n"; //[cite: 1]
+                   "</scpd>\r\n";
         }
 
         private String getCmsScpdXml() {
@@ -563,7 +543,7 @@ public class DlnaService extends Service {
                    "    <stateVariable sendEvents=\"yes\"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable>\r\n" +
                    "    <stateVariable sendEvents=\"yes\"><name>CurrentConnectionIDs</name><dataType>string</dataType></stateVariable>\r\n" +
                    "  </serviceStateTable>\r\n" +
-                   "</scpd>\r\n"; //[cite: 1]
+                   "</scpd>\r\n";
         }
     }
 }
