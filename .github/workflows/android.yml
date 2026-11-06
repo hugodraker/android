@@ -2,9 +2,9 @@ name: Android Build
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "dlna-2.3" ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "dlna-2.3" ]
 
 jobs:
   build:
