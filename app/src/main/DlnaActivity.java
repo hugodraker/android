@@ -2,14 +2,13 @@ package com.example.dlnaserver;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
-import android.net.wifi.WifiManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
@@ -28,8 +27,12 @@ import android.widget.Toast;
 
 import java.io.File;
 import java.lang.reflect.Method;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.List;
 
 public class DlnaActivity extends Activity {
@@ -50,28 +53,25 @@ public class DlnaActivity extends Activity {
         prefs = getSharedPreferences("DlnaPrefs", MODE_PRIVATE);
         loadSettings();
 
-        // Build the entire UI programmatically (Zero XML dependency)
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(24, 24, 24, 24);
+        root.setPadding(20, 20, 20, 20);
         root.setBackgroundColor(Color.WHITE);
 
-        // Title
         TextView title = new TextView(this);
         title.setText("DLNA Media Server");
         title.setTextSize(20);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.BLACK);
-        title.setPadding(0, 0, 0, 16);
+        title.setPadding(0, 0, 0, 12);
         root.addView(title);
 
-        // Port Row
         LinearLayout portRow = new LinearLayout(this);
         portRow.setOrientation(LinearLayout.HORIZONTAL);
         portRow.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView lblPort = new TextView(this);
-        lblPort.setText("Server Port: ");
+        lblPort.setText("Port: ");
         lblPort.setTextColor(Color.BLACK);
         lblPort.setTextSize(16);
         portRow.addView(lblPort);
@@ -85,21 +85,21 @@ public class DlnaActivity extends Activity {
         portRow.addView(editPort, portParams);
         root.addView(portRow);
 
-        // Shared Folders Header
         TextView lblFolders = new TextView(this);
-        lblFolders.setText("Shared Folders (Tap folder to remove):");
+        lblFolders.setText("Shared Folders (Tap to remove):");
         lblFolders.setTextColor(Color.DKGRAY);
-        lblFolders.setPadding(0, 20, 0, 8);
+        lblFolders.setPadding(0, 16, 0, 6);
         root.addView(lblFolders);
 
-        // Folder ListView
         listFolders = new ListView(this);
-        folderAdapter = new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, sharedFolders);
+        listFolders.setBackgroundColor(Color.rgb(240, 240, 240));
+        listFolders.setCacheColorHint(Color.TRANSPARENT); // Fixes Android 2.3 black scroll flicker
+        folderAdapter = createBlackTextAdapter(sharedFolders);
         listFolders.setAdapter(folderAdapter);
-        listFolders.setBackgroundColor(Color.rgb(245, 245, 245));
+
         LinearLayout.LayoutParams listParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
-        listParams.setMargins(0, 0, 0, 12);
+        listParams.setMargins(0, 0, 0, 10);
         root.addView(listFolders, listParams);
 
         listFolders.setOnItemClickListener(new AdapterView.OnItemClickListener() {
@@ -126,20 +126,17 @@ public class DlnaActivity extends Activity {
             }
         });
 
-        // Add Folder Button
         btnAddFolder = new Button(this);
         btnAddFolder.setText("+ Add Shared Folder");
         root.addView(btnAddFolder);
 
-        // Start / Stop Button
         btnToggle = new Button(this);
         btnToggle.setText("Start Server");
         LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        toggleParams.setMargins(0, 12, 0, 12);
+        toggleParams.setMargins(0, 8, 0, 8);
         root.addView(btnToggle, toggleParams);
 
-        // Status Log TextView
         textStatus = new TextView(this);
         textStatus.setText("Status: Stopped\nIP: " + getLocalIpAddress());
         textStatus.setTextColor(Color.DKGRAY);
@@ -148,7 +145,6 @@ public class DlnaActivity extends Activity {
 
         setContentView(root);
 
-        // Request Storage Permission safely via Reflection (compatible with API 9 through 33+)
         requestStoragePermissions();
 
         btnAddFolder.setOnClickListener(new View.OnClickListener() {
@@ -158,9 +154,7 @@ public class DlnaActivity extends Activity {
                     Toast.makeText(DlnaActivity.this, "Stop server before adding folders", Toast.LENGTH_SHORT).show();
                     return;
                 }
-                File startDir = Environment.getExternalStorageDirectory();
-                if (startDir == null || !startDir.exists()) startDir = new File("/sdcard");
-                if (!startDir.exists()) startDir = new File("/");
+                File startDir = getDefaultStorageDir();
                 showFolderPicker(startDir);
             }
         });
@@ -168,73 +162,113 @@ public class DlnaActivity extends Activity {
         btnToggle.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                Intent serviceIntent = new Intent(DlnaActivity.this, DlnaService.class);
-                if (!isServerRunning) {
-                    if (sharedFolders.isEmpty()) {
-                        Toast.makeText(DlnaActivity.this, "Please add at least one folder", Toast.LENGTH_SHORT).show();
-                        return;
-                    }
-                    int port = DlnaService.DEFAULT_DLNA_PORT;
-                    try {
-                        port = Integer.parseInt(editPort.getText().toString().trim());
-                    } catch (NumberFormatException e) {
-                        editPort.setText(String.valueOf(port));
-                    }
-                    saveSettings();
+                try {
+                    Intent serviceIntent = new Intent(DlnaActivity.this, DlnaService.class);
+                    if (!isServerRunning) {
+                        if (sharedFolders.isEmpty()) {
+                            Toast.makeText(DlnaActivity.this, "Add at least one folder", Toast.LENGTH_SHORT).show();
+                            return;
+                        }
+                        int port = DlnaService.DEFAULT_DLNA_PORT;
+                        try {
+                            port = Integer.parseInt(editPort.getText().toString().trim());
+                        } catch (NumberFormatException e) {
+                            editPort.setText(String.valueOf(port));
+                        }
+                        saveSettings();
 
-                    serviceIntent.putExtra("PORT", port);
-                    serviceIntent.putStringArrayListExtra("FOLDERS", sharedFolders);
-                    startService(serviceIntent);
+                        serviceIntent.putExtra("PORT", port);
+                        serviceIntent.putStringArrayListExtra("FOLDERS", sharedFolders);
+                        startService(serviceIntent);
 
-                    btnToggle.setText("Stop Server");
-                    editPort.setEnabled(false);
-                    btnAddFolder.setEnabled(false);
-                    isServerRunning = true;
-                    textStatus.setText("Status: RUNNING on http://" + getLocalIpAddress() + ":" + port + "\nSharing " + sharedFolders.size() + " folder(s)");
-                    textStatus.setTextColor(Color.rgb(0, 128, 0));
-                } else {
-                    stopService(serviceIntent);
-                    btnToggle.setText("Start Server");
-                    editPort.setEnabled(true);
-                    btnAddFolder.setEnabled(true);
-                    isServerRunning = false;
-                    textStatus.setText("Status: Stopped\nIP: " + getLocalIpAddress());
-                    textStatus.setTextColor(Color.DKGRAY);
+                        btnToggle.setText("Stop Server");
+                        editPort.setEnabled(false);
+                        btnAddFolder.setEnabled(false);
+                        isServerRunning = true;
+                        textStatus.setText("Status: RUNNING on http://" + getLocalIpAddress() + ":" + port + "\nSharing " + sharedFolders.size() + " folder(s)");
+                        textStatus.setTextColor(Color.rgb(0, 128, 0));
+                    } else {
+                        stopService(serviceIntent);
+                        btnToggle.setText("Start Server");
+                        editPort.setEnabled(true);
+                        btnAddFolder.setEnabled(true);
+                        isServerRunning = false;
+                        textStatus.setText("Status: Stopped\nIP: " + getLocalIpAddress());
+                        textStatus.setTextColor(Color.DKGRAY);
+                    }
+                } catch (Throwable t) {
+                    Toast.makeText(DlnaActivity.this, "Error: " + t.getMessage(), Toast.LENGTH_LONG).show();
                 }
             }
         });
     }
 
+    private ArrayAdapter<String> createBlackTextAdapter(List<String> items) {
+        return new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, items) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                View view = super.getView(position, convertView, parent);
+                TextView text = (TextView) view.findViewById(android.R.id.text1);
+                if (text != null) {
+                    text.setTextColor(Color.BLACK);
+                }
+                return view;
+            }
+        };
+    }
+
+    private File getDefaultStorageDir() {
+        try {
+            File ext = Environment.getExternalStorageDirectory();
+            if (ext != null && ext.exists()) return ext;
+        } catch (Throwable ignored) { }
+        File sd = new File("/sdcard");
+        if (sd.exists()) return sd;
+        return new File("/");
+    }
+
     private void requestStoragePermissions() {
+        // Android 11+ (API 30+) All Files Access check via reflection
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                Method isExternalStorageManager = Environment.class.getMethod("isExternalStorageManager");
+                Boolean isManager = (Boolean) isExternalStorageManager.invoke(null);
+                if (isManager != null && !isManager.booleanValue()) {
+                    Intent intent = new Intent("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION");
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                    return;
+                }
+            } catch (Throwable ignored) { }
+        }
+        // Android 6.0 - 10 (API 23 - 29) runtime permission check via reflection
         if (Build.VERSION.SDK_INT >= 23) {
             try {
-                Method checkPerm = getClass().getMethod("checkSelfPermission", String.class);
-                int res = (Integer) checkPerm.invoke(this, "android.permission.READ_EXTERNAL_STORAGE");
+                Method checkPerm = Activity.class.getMethod("checkSelfPermission", String.class);
+                int res = ((Integer) checkPerm.invoke(this, "android.permission.READ_EXTERNAL_STORAGE")).intValue();
                 if (res != PackageManager.PERMISSION_GRANTED) {
-                    Method reqPerm = getClass().getMethod("requestPermissions", String[].class, int.class);
+                    Method reqPerm = Activity.class.getMethod("requestPermissions", String[].class, int.class);
                     reqPerm.invoke(this, new String[]{
                         "android.permission.READ_EXTERNAL_STORAGE",
-                        "android.permission.READ_MEDIA_VIDEO",
-                        "android.permission.READ_MEDIA_AUDIO",
-                        "android.permission.READ_MEDIA_IMAGES"
+                        "android.permission.WRITE_EXTERNAL_STORAGE"
                     }, 1);
                 }
-            } catch (Exception ignored) { }
+            } catch (Throwable ignored) { }
         }
     }
 
     private void loadSettings() {
         sharedFolders.clear();
         String saved = prefs.getString("FOLDERS", "");
-        if (saved.length() > 0) {
+        if (saved != null && saved.length() > 0) {
             String[] parts = saved.split("\n");
-            for (String p : parts) {
-                if (p.trim().length() > 0) sharedFolders.add(p.trim());
+            for (int i = 0; i < parts.length; i++) {
+                String p = parts[i].trim();
+                if (p.length() > 0) sharedFolders.add(p);
             }
         }
         if (sharedFolders.isEmpty()) {
-            File ext = Environment.getExternalStorageDirectory();
-            sharedFolders.add(ext != null ? ext.getAbsolutePath() : "/sdcard");
+            sharedFolders.add(getDefaultStorageDir().getAbsolutePath());
         }
     }
 
@@ -247,7 +281,7 @@ public class DlnaActivity extends Activity {
         int port = DlnaService.DEFAULT_DLNA_PORT;
         try {
             port = Integer.parseInt(editPort.getText().toString().trim());
-        } catch (Exception ignored) { }
+        } catch (Throwable ignored) { }
 
         prefs.edit()
              .putString("FOLDERS", sb.toString())
@@ -261,14 +295,19 @@ public class DlnaActivity extends Activity {
             return;
         }
 
-        File[] files = dir.listFiles();
+        File[] files = null;
+        try {
+            files = dir.listFiles();
+        } catch (Throwable ignored) { }
+
         final List<String> dirs = new ArrayList<String>();
         if (dir.getParentFile() != null) {
             dirs.add(".. (Parent Directory)");
         }
         if (files != null) {
             List<String> subDirs = new ArrayList<String>();
-            for (File f : files) {
+            for (int i = 0; i < files.length; i++) {
+                File f = files[i];
                 if (f.isDirectory() && !f.isHidden()) {
                     subDirs.add(f.getName());
                 }
@@ -276,10 +315,11 @@ public class DlnaActivity extends Activity {
             Collections.sort(subDirs, String.CASE_INSENSITIVE_ORDER);
             dirs.addAll(subDirs);
         } else {
-            Toast.makeText(this, "Permission denied reading subfolders", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Storage permission needed to list subfolders", Toast.LENGTH_SHORT).show();
+            requestStoragePermissions();
         }
 
-        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, dirs);
+        ArrayAdapter<String> adapter = createBlackTextAdapter(dirs);
         new AlertDialog.Builder(this)
             .setTitle(dir.getAbsolutePath())
             .setAdapter(adapter, new DialogInterface.OnClickListener() {
@@ -308,14 +348,20 @@ public class DlnaActivity extends Activity {
             .show();
     }
 
-    private String getLocalIpAddress() {
+    public static String getLocalIpAddress() {
         try {
-            WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-            int ip = wifiManager.getConnectionInfo().getIpAddress();
-            if (ip == 0) return "127.0.0.1 (Check Wi-Fi)";
-            return String.format("%d.%d.%d.%d", (ip & 0xff), (ip >> 8 & 0xff), (ip >> 16 & 0xff), (ip >> 24 & 0xff));
-        } catch (Exception ex) {
-            return "127.0.0.1";
-        }
+            Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces();
+            while (en != null && en.hasMoreElements()) {
+                NetworkInterface intf = en.nextElement();
+                Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses();
+                while (enumIpAddr.hasMoreElements()) {
+                    InetAddress inetAddress = enumIpAddr.nextElement();
+                    if (!inetAddress.isLoopbackAddress() && (inetAddress instanceof Inet4Address)) {
+                        return inetAddress.getHostAddress();
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+        return "127.0.0.1";
     }
 }
