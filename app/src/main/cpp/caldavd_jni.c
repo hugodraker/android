@@ -27,6 +27,7 @@
 #include <openssl/pkcs12.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
+#include <openssl/bn.h>
 
 #define SERVER_NAME "CaldAV-D"
 #define SERVER_VERSION "2.0-TLS"
@@ -265,7 +266,10 @@ static BOOL GenerateCertificates(void) {
     }
 
     EVP_PKEY *caPkey = EVP_PKEY_new();
-    RSA *caRsa = RSA_generate_key(2048, RSA_F4, NULL, NULL);
+    RSA *caRsa = RSA_new();
+    BIGNUM *bne = BN_new();
+    BN_set_word(bne, RSA_F4);
+    RSA_generate_key_ex(caRsa, 2048, bne, NULL);
     EVP_PKEY_assign_RSA(caPkey, caRsa);
 
     X509 *caCert = X509_new();
@@ -287,7 +291,9 @@ static BOOL GenerateCertificates(void) {
     if (fp) { PEM_write_PrivateKey(fp, caPkey, NULL, NULL, 0, NULL, NULL); fclose(fp); }
 
     EVP_PKEY *leafPkey = EVP_PKEY_new();
-    RSA *leafRsa = RSA_generate_key(2048, RSA_F4, NULL, NULL);
+    RSA *leafRsa = RSA_new();
+    RSA_generate_key_ex(leafRsa, 2048, bne, NULL);
+    BN_free(bne);
     EVP_PKEY_assign_RSA(leafPkey, leafRsa);
 
     X509 *leafCert = X509_new();
@@ -1431,7 +1437,6 @@ JNIEXPORT void JNICALL Java_com_hugo_caldavd_CaldavService_nativeSaveConfig(JNIE
     g_bUseTls = tls ? TRUE : FALSE;
     SaveConfig();
 }
-
 JNIEXPORT jobjectArray JNICALL Java_com_hugo_caldavd_CaldavService_nativeGetUsers(JNIEnv* env, jclass clazz) {
     char keys[4096] = {0};
     GetPrivateProfileString("users", NULL, "", keys, sizeof(keys), CONFIG_FILE);
@@ -1439,10 +1444,10 @@ JNIEXPORT jobjectArray JNICALL Java_com_hugo_caldavd_CaldavService_nativeGetUser
     char* p = keys;
     while (*p) { count++; p += strlen(p) + 1; }
 
-    jobjectArray ret = (*env)->NewObjectArray(env, count, (*env)->FindClass("java/lang/String"), NULL);
+    jobjectArray ret = (*env)->NewObjectArray(env, count, (*env)->FindClass(env, "java/lang/String"), NULL);
     p = keys;
     for (int i = 0; i < count; i++) {
-        (*env)->SetObjectArrayElement(env, ret, i, (*env)->NewStringUTF(p));
+        (*env)->SetObjectArrayElement(env, ret, i, (*env)->NewStringUTF(env, p));
         p += strlen(p) + 1;
     }
     return ret;
@@ -1487,12 +1492,12 @@ JNIEXPORT jstring JNICALL Java_com_hugo_caldavd_CaldavService_nativeResetPasswor
     snprintf(entry, sizeof(entry), "salt2026,%s", hash);
     WritePrivateProfileString("users", user, entry, CONFIG_FILE);
     (*env)->ReleaseStringUTFChars(env, userStr, user);
-    return (*env)->NewStringUTF(newPass);
+    return (*env)->NewStringUTF(env, newPass);
 }
 
 JNIEXPORT jstring JNICALL Java_com_hugo_caldavd_CaldavService_nativeGenerateAndGetRootCaPath(JNIEnv* env, jclass clazz) {
     if (GenerateCertificates()) {
-        return (*env)->NewStringUTF(CA_CERT_FILE);
+        return (*env)->NewStringUTF(env, CA_CERT_FILE);
     }
     return NULL;
 }
@@ -1586,7 +1591,7 @@ JNIEXPORT jint JNICALL Java_com_hugo_caldavd_CaldavService_nativeImportIcs(JNIEn
 
 JNIEXPORT jstring JNICALL Java_com_hugo_caldavd_CaldavService_nativeExportIcs(JNIEnv* env, jclass clazz) {
     char* outIcs = calloc(1, 1024 * 1024);
-    if (!outIcs) return (*env)->NewStringUTF("");
+    if (!outIcs) return (*env)->NewStringUTF(env, "");
     strcpy(outIcs, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDAV-D//EN\r\n");
 
     DIR* dir = opendir(DATA_DIR);
@@ -1640,7 +1645,7 @@ JNIEXPORT jstring JNICALL Java_com_hugo_caldavd_CaldavService_nativeExportIcs(JN
         closedir(dir);
     }
     strcat(outIcs, "END:VCALENDAR\r\n");
-    jstring res = (*env)->NewStringUTF(outIcs);
+    jstring res = (*env)->NewStringUTF(env, outIcs);
     free(outIcs);
     return res;
 }
