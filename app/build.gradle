@@ -1,5 +1,5 @@
 plugins {
-    id 'com.android.application' version '8.0.2'
+    id 'com.android.application'
 }
 
 android {
@@ -9,7 +9,7 @@ android {
     defaultConfig {
         applicationId "com.example.dlnaserver"
         minSdk 9
-        targetSdk 33
+        targetSdk 29
         versionCode 1
         versionName "1.0"
     }
@@ -23,6 +23,10 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            applicationIdSuffix ".debug"
+            debuggable true
         }
     }
 }
