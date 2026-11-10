@@ -90,7 +90,35 @@ public class TrackerService extends Service {
                .setContentIntent(pi)
                .setOngoing(true);
 
-        startForeground(1, Build.VERSION.SDK_INT >= 16 ? builder.build() : builder.getNotification());
+        Notification notification = Build.VERSION.SDK_INT >= 16 ? builder.build() : builder.getNotification();
+
+        // STRICT FIX FOR ANDROID 12/14 FOREGROUND LOCATION CRASH
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+        } else {
+            startForeground(1, notification);
+        }
+    }
+
+    private void startLocationTracking() {
+        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        pollHandler = new Handler(Looper.getMainLooper());
+        
+        pollRunnable = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, oneShotListener);
+                    locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, oneShotListener);
+                } catch (SecurityException e) {}
+                
+                // Safety fix: prevent freezing if user accidentally inputs interval as 0
+                long interval = prefs.getLong("interval", 30000);
+                if (interval < 5000) interval = 5000; 
+                pollHandler.postDelayed(this, interval);
+            }
+        };
+        pollHandler.post(pollRunnable);
     }
 
     private void startLocationTracking() {
