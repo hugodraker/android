@@ -5,13 +5,12 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationManager;
-import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
-import android.text.format.Formatter;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
@@ -23,8 +22,12 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.Enumeration;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
@@ -39,26 +42,15 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("TrackerPrefs", MODE_PRIVATE);
 
-        if (Build.VERSION.SDK_INT >= 23) {
-            requestPermissions(new String[]{
-                "android.permission.ACCESS_FINE_LOCATION",
-                "android.permission.WRITE_EXTERNAL_STORAGE",
-                "android.permission.READ_EXTERNAL_STORAGE"
-            }, 1);
-        }
-
         ScrollView scroll = new ScrollView(this);
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(20, 20, 20, 20);
         scroll.addView(layout);
 
-        // Auto-start tracker on open
-        toggleTracker(true);
-
         // Toggle Button
         btnToggle = new Button(this);
-        btnToggle.setText("STOP TRACKER");
+        btnToggle.setText("START TRACKER");
         btnToggle.setOnClickListener(v -> toggleTracker(!isTracking));
         layout.addView(btnToggle);
 
@@ -76,7 +68,6 @@ public class MainActivity extends Activity {
         editLink = new EditText(this);
         editLink.setTextIsSelectable(true);
         layout.addView(editLink);
-        updateLinkText();
 
         // Settings Forms
         EditText editUser = createInput(layout, "HTTP Username (Admin)", prefs.getString("http_user", "admin"));
@@ -114,8 +105,10 @@ public class MainActivity extends Activity {
             saveLocationsToPrefs();
             updateLinkText();
             Toast.makeText(this, "Settings Saved. Restarting Tracker...", Toast.LENGTH_SHORT).show();
-            toggleTracker(false);
-            toggleTracker(true);
+            if (isTracking) {
+                toggleTracker(false);
+                toggleTracker(true);
+            }
         });
         layout.addView(btnSave);
 
@@ -136,6 +129,30 @@ public class MainActivity extends Activity {
         layout.addView(ioLayout);
 
         setContentView(scroll);
+
+        // SAFE PERMISSION CHECK - Only start tracker if permissions already granted
+        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{
+                "android.permission.ACCESS_FINE_LOCATION",
+                "android.permission.ACCESS_COARSE_LOCATION",
+                "android.permission.WRITE_EXTERNAL_STORAGE",
+                "android.permission.READ_EXTERNAL_STORAGE"
+            }, 1);
+        } else {
+            toggleTracker(true);
+        }
+        
+        updateLinkText();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        // Automatically start the tracker the exact moment the user clicks "Allow"
+        if (requestCode == 1 && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            toggleTracker(true);
+        } else {
+            Toast.makeText(this, "Location permission is required to track.", Toast.LENGTH_LONG).show();
+        }
     }
 
     private void toggleTracker(boolean start) {
@@ -155,8 +172,11 @@ public class MainActivity extends Activity {
     private void addCurrentLocationToOmitted() {
         try {
             LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-            Location loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            if (loc == null) loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            Location loc = null;
+            if (checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") == PackageManager.PERMISSION_GRANTED) {
+                loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                if (loc == null) loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            }
             
             if (loc != null) {
                 addLocationRow("HOME", loc.getLatitude() + "," + loc.getLongitude(), true);
@@ -164,23 +184,36 @@ public class MainActivity extends Activity {
             } else {
                 Toast.makeText(this, "No GPS fix available", Toast.LENGTH_SHORT).show();
             }
-        } catch (SecurityException e) {
-            Toast.makeText(this, "Permission denied", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Failed to get location", Toast.LENGTH_SHORT).show();
         }
     }
 
-    private void updateLinkText() {
-        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
-        String ip = Formatter.formatIpAddress(wm.getConnectionInfo().getIpAddress());
-        if (ip.equals("0.0.0.0")) ip = "127.0.0.1";
+    // Safely get IP without requiring WiFi permissions
+    private String getLocalIpAddress() {
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
+                NetworkInterface intf = en.nextElement();
+                for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
+                    InetAddress inetAddress = enumIpAddr.nextElement();
+                    if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
+                        return inetAddress.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ex) {}
+        return "127.0.0.1";
+    }
 
+    private void updateLinkText() {
+        String ip = getLocalIpAddress();
         SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd", Locale.US);
         String today = sdf.format(new Date());
         
         String url = "http://" + ip + ":" + prefs.getInt("http_port", 8080) + 
                      "/download?" + prefs.getString("http_user", "admin") + "=" + prefs.getString("http_pass", "password") +
                      "&" + today + "0000&" + today + "1700";
-        editLink.setText(url);
+        if (editLink != null) editLink.setText(url);
     }
 
     private EditText createInput(LinearLayout parent, String hint, String defVal) {
@@ -269,9 +302,11 @@ public class MainActivity extends Activity {
             File backupFile = new File(sd, "TrackerBackup/" + filename);
             File currentDB = new File(Environment.getDataDirectory(), "/data/" + getPackageName() + "/databases/travel_events.db");
             copyFile(backupFile, currentDB);
-            Toast.makeText(this, "Imported from SD Card. Restarting Tracker...", Toast.LENGTH_LONG).show();
-            toggleTracker(false);
-            toggleTracker(true);
+            Toast.makeText(this, "Imported. Restarting Tracker...", Toast.LENGTH_LONG).show();
+            if (isTracking) {
+                toggleTracker(false);
+                toggleTracker(true);
+            }
         } catch (Exception e) { Toast.makeText(this, "Import failed", Toast.LENGTH_SHORT).show(); }
     }
 
