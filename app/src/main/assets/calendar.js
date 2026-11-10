@@ -11,6 +11,15 @@
 const hostname = window.location.hostname || "127.0.0.1";
 const CALDAV_URL = window.location.origin + '/calendar/';
 const CONFIG_URL = window.location.origin + '/config/';
+
+// Fix for: favicon.ico 401 (Unauthorized) 
+if (!document.querySelector("link[rel~='icon']")) {
+    let blankFavicon = document.createElement('link');
+    blankFavicon.rel = 'icon';
+    blankFavicon.href = 'data:,'; 
+    document.head.appendChild(blankFavicon);
+}
+
 let zoom = 1.0;
 let viewMode = 3; 
 let currentDate = new Date();
@@ -53,22 +62,39 @@ function validateSchedInput(type, val) {
     return true;
 }
 
+function getEffectiveVisiblePeople() {
+    let sel = document.getElementById('comboTempPersonFilter');
+    if (sel && sel.value !== "") {
+        return [parseInt(sel.value)];
+    }
+    return visiblePeopleIndices;
+}
+
 function populateTempFilter() {
     let sel = document.getElementById('comboTempPersonFilter');
     if (!sel) return;
     let currentVal = sel.value;
     sel.innerHTML = '<option value="">None</option>';
+    
+    let safeContacts = Array.isArray(contacts) ? contacts : [];
+    let validIndices = visiblePeopleIndices.filter(n => typeof n === 'number' && !isNaN(n));
+
     people.forEach((p, idx) => {
         if (!p) return;
-        if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(idx)) return;
         
-        let contactMatch = contacts.find(c => c.username === p);
+        if (hasLoadedSchedUsers && unselectedSchedUsers.has(idx)) return;
+        if (validIndices.length > 0 && !validIndices.includes(idx)) return;
+        if (validIndices.length === 0 && (!hasLoadedSchedUsers || unselectedSchedUsers.size === 0) && p.startsWith("Person ") && idx >= 7) return; 
+        
+        let contactMatch = safeContacts.find(c => c.username === p);
         let pDisp = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : p;
+        
         let opt = document.createElement('option');
         opt.value = idx;
         opt.innerText = pDisp;
         sel.appendChild(opt);
     });
+    
     if (currentVal && sel.querySelector(`option[value="${currentVal}"]`)) {
         sel.value = currentVal;
     } else {
@@ -79,14 +105,6 @@ function populateTempFilter() {
 document.getElementById('comboTempPersonFilter')?.addEventListener('change', () => {
     render();
 });
-
-function getEffectiveVisiblePeople() {
-    let sel = document.getElementById('comboTempPersonFilter');
-    if (sel && sel.value !== "") {
-        return [parseInt(sel.value)];
-    }
-    return visiblePeopleIndices;
-}
 
 let activeCard = null, activeEv = null;
 let startMouseY = 0, startMouseX = 0, originalDateStr = "", originalStartMin = 0, originalDuration = 0;
@@ -158,8 +176,70 @@ function updateDateTitle(text) {
     if (mobileLbl) mobileLbl.innerText = text;
 }
 
-function getClientY(e) { return e.touches && e.touches.length > 0 ? e.touches[0].clientY : e.clientY; }
-function getClientX(e) { return e.touches && e.touches.length > 0 ? e.touches[0].clientX : e.clientX; }
+function getClientY(e) { 
+    if (e.touches && e.touches.length > 0) return e.touches[0].clientY;
+    if (e.changedTouches && e.changedTouches.length > 0) return e.changedTouches[0].clientY;
+    return e.clientY; 
+}
+function getClientX(e) { 
+    if (e.touches && e.touches.length > 0) return e.touches[0].clientX;
+    if (e.changedTouches && e.changedTouches.length > 0) return e.changedTouches[0].clientX;
+    return e.clientX; 
+}
+
+let lastTouchDblTapTime = 0;
+
+function bindDoubleTap(el, handler) {
+    let lastTapTime = 0;
+    let lastTapX = 0;
+    let lastTapY = 0;
+    let startX = 0;
+    let startY = 0;
+    let moved = false;
+
+    el.addEventListener('touchstart', (e) => {
+        if (e.touches && e.touches.length > 1) { moved = true; return; }
+        startX = getClientX(e);
+        startY = getClientY(e);
+        moved = false;
+    }, { passive: true });
+
+    el.addEventListener('touchmove', (e) => {
+        if (Math.abs(getClientX(e) - startX) > 10 || Math.abs(getClientY(e) - startY) > 10) {
+            moved = true;
+        }
+    }, { passive: true });
+
+    el.addEventListener('touchend', (e) => {
+        if (moved) return;
+        let now = Date.now();
+        let x = getClientX(e);
+        let y = getClientY(e);
+        if (now - lastTapTime < 350 && Math.abs(x - lastTapX) < 30 && Math.abs(y - lastTapY) < 30) {
+            if (e.cancelable) e.preventDefault();
+            e.stopPropagation();
+            lastTapTime = 0;
+            lastTouchDblTapTime = now;
+            isDragging = false;
+            isResizing = false;
+            isMonthDragging = false;
+            activeCard = null;
+            activeEv = null;
+            monthDragEv = null;
+            handler(e);
+        } else {
+            lastTapTime = now;
+            lastTapX = x;
+            lastTapY = y;
+        }
+    }, { passive: false });
+
+    el.addEventListener('dblclick', (e) => {
+        if (Date.now() - lastTouchDblTapTime < 500) return;
+        handler(e);
+    });
+}
+
 function formatDate(d) { return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`; }
 function minToTimeStr(min) {
     let h = Math.floor(min / 60), m = min % 60;
@@ -278,8 +358,12 @@ async function downloadUpdates() {
             let meData = await meRes.json();
             currentUser = meData.user;
             canEditAll = meData.edit_all;
-            if (meData.visible_people && meData.visible_people !== "") {
-                visiblePeopleIndices = meData.visible_people.split(',').filter(x => x !== "").map(Number);
+            if (meData.visible_people && meData.visible_people !== "" && meData.visible_people !== "NaN") {
+                visiblePeopleIndices = meData.visible_people.split(',')
+                    .map(Number)
+                    .filter(n => !isNaN(n));
+            } else {
+                visiblePeopleIndices = [];
             }
         }
 
@@ -582,6 +666,7 @@ function renderTimeline() {
     for(let i=0; i<activeCols; i++) {
         let div = document.createElement('div');
         div.className = 'col-header';
+        div.style.touchAction = 'manipulation';
         
         if (isPeopleView()) {
             let pIdx = activeVisiblePeople[i];
@@ -589,7 +674,7 @@ function renderTimeline() {
             let contactMatch = contacts.find(c => c.username === shortName);
             div.innerText = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
             
-            div.ondblclick = () => {
+            bindDoubleTap(div, () => {
                 let input = document.createElement('input');
                 input.className = 'edit-person-input';
                 input.value = people[pIdx] || "";
@@ -610,7 +695,7 @@ function renderTimeline() {
                     }
                     render();
                 };
-            };
+            });
         } else {
             let d = new Date(viewStart);
             d.setDate(d.getDate() + i);
@@ -622,6 +707,7 @@ function renderTimeline() {
     const totalHeight = 1440 * zoom;
     timelineLabels.style.height = `${totalHeight}px`;
     gridBg.style.height = `${totalHeight}px`;
+    gridBg.style.touchAction = 'manipulation';
 
     timelineLabels.innerHTML = '';
     for(let i=0; i<=24; i++) {
@@ -637,7 +723,10 @@ function renderTimeline() {
     gridBg.style.backgroundImage = 'linear-gradient(#e0e0e0 1px, transparent 1px), linear-gradient(90deg, #dadce0 1px, transparent 1px)';
     gridBg.style.backgroundSize = `calc(100% / ${activeCols}) ${60 * zoom}px`;
     
-    if (eventsLayer) eventsLayer.innerHTML = '';
+    if (eventsLayer) {
+        eventsLayer.innerHTML = '';
+        eventsLayer.style.pointerEvents = 'none';
+    }
 
     let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
 
@@ -669,15 +758,20 @@ function renderTimeline() {
             card.style.width = `calc(${100 / activeCols}% - 6px)`;
             card.style.marginLeft = '3px';
             card.style.backgroundColor = ev.color;
+            card.style.pointerEvents = 'auto';
+            card.style.touchAction = 'none';
+            card.style.webkitUserSelect = 'none';
+            card.style.userSelect = 'none';
+            card.style.webkitTouchCallout = 'none';
             card.dataset.id = ev.id;
             
             card.innerHTML = `
                 <div class="event-title">${ev.title}</div>
                 <div class="event-time">${minToTimeStr(ev.startMin)} - ${minToTimeStr(ev.startMin + ev.duration)}</div>
-                <div class="resize-handle"></div>
+                <div class="resize-handle" style="touch-action:none;"></div>
             `;
             
-            card.ondblclick = (e) => {
+            bindDoubleTap(card, (e) => {
                 e.stopPropagation(); 
                 if (!isEditMode()) return;
                 if (!canEdit(ev)) { alert("You do not have permission to edit this event."); return; }
@@ -690,7 +784,7 @@ function renderTimeline() {
                 input.type = 'text';
                 input.value = ev.title;
                 input.style.width = '100%'; input.style.color = '#000'; input.style.pointerEvents = 'auto'; 
-                input.onmousedown = (e) => e.stopPropagation(); input.ontouchstart = (e) => e.stopPropagation();
+                input.onmousedown = (ev) => ev.stopPropagation(); input.ontouchstart = (ev) => ev.stopPropagation();
                 
                 titleDiv.innerHTML = '';
                 titleDiv.appendChild(input);
@@ -708,7 +802,7 @@ function renderTimeline() {
                     window.isEditing = false;
                     render();
                 };
-            };
+            });
 
             card.addEventListener('mousedown', handleDrag);
             card.addEventListener('touchstart', handleDrag, {passive: false});
@@ -750,6 +844,7 @@ function renderMonth() {
     for (let row = 0; row < 6; row++) {
         for (let col = 0; col < 7; col++) {
             let cell = document.createElement('div'); cell.className = 'month-cell';
+            cell.style.touchAction = 'manipulation';
             let dayNum = cellCount - firstDay + 1;
             let cellDateStr, displayNum, isOtherMonth = false;
 
@@ -783,7 +878,14 @@ function renderMonth() {
                 let pDisp = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
                 
                 let evDiv = document.createElement('div');
-                evDiv.className = 'month-event'; evDiv.style.backgroundColor = ev.color; evDiv.innerText = ev.title + (pDisp ? " - " + pDisp : ""); evDiv.dataset.id = ev.id;
+                evDiv.className = 'month-event';
+                evDiv.style.backgroundColor = ev.color;
+                evDiv.style.touchAction = 'none';
+                evDiv.style.webkitUserSelect = 'none';
+                evDiv.style.userSelect = 'none';
+                evDiv.style.webkitTouchCallout = 'none';
+                evDiv.innerText = ev.title + (pDisp ? " - " + pDisp : "");
+                evDiv.dataset.id = ev.id;
                 if(selectedEventId === ev.id) evDiv.style.outline = "2px solid #000";
                 
                 evDiv.onclick = (e) => { 
@@ -792,8 +894,9 @@ function renderMonth() {
                     evDiv.style.outline = "2px solid #000"; 
                 };
                 
-                evDiv.addEventListener('mousedown', startMonthDrag); evDiv.addEventListener('touchstart', startMonthDrag, {passive: false});
-                evDiv.ondblclick = (e) => {
+                evDiv.addEventListener('mousedown', startMonthDrag);
+                evDiv.addEventListener('touchstart', startMonthDrag, {passive: false});
+                bindDoubleTap(evDiv, (e) => {
                     e.stopPropagation();
                     if (!isEditMode()) return;
                     if (!canEdit(ev)) { alert("You do not have permission to edit this event."); return; }
@@ -801,7 +904,7 @@ function renderMonth() {
                     
                     let input = document.createElement('input'); input.type = 'text'; input.value = ev.title;
                     input.style.width = '100%'; input.style.color = '#000'; input.style.pointerEvents = 'auto'; 
-                    input.onmousedown = (e) => e.stopPropagation(); input.ontouchstart = (e) => e.stopPropagation();
+                    input.onmousedown = (ev) => ev.stopPropagation(); input.ontouchstart = (ev) => ev.stopPropagation();
                     
                     evDiv.innerHTML = ''; evDiv.appendChild(input); input.focus();
                     
@@ -818,11 +921,11 @@ function renderMonth() {
                         window.isEditing = false;
                         render();
                     };
-                };
+                });
                 cell.appendChild(evDiv);
             });
             
-            cell.ondblclick = () => {
+            bindDoubleTap(cell, () => {
                 if (!isEditMode()) return;
                 let targetIdx = people.indexOf(currentUser);
                 if (targetIdx === -1 && currentUser) {
@@ -834,7 +937,7 @@ function renderMonth() {
                     startMin: 540, duration: 60, color: colors[targetIdx % colors.length], date: cellDateStr, personIdx: targetIdx 
                 };
                 events.push(newEv); putEventToCalDAV(newEv); render();
-            };
+            });
             
             if (isOtherMonth) cell.style.backgroundColor = '#f1f3f4';
             grid.appendChild(cell);
@@ -853,6 +956,7 @@ function startMonthDrag(e) {
     monthDragEv = events.find(x => x.id === realId);
     
     if (!monthDragEv || !canEdit(monthDragEv)) { monthDragEv = null; return; }
+    if (e.type === 'touchstart' && e.cancelable) e.preventDefault();
     isMonthDragging = true; hasMoved = false;
     document.querySelectorAll('.month-event').forEach(el => el.style.outline = 'none');
     this.style.outline = "2px solid #000";
@@ -898,7 +1002,6 @@ function renderScheduleTable() {
     if (!gridBg || !headerRow || !timelineLabels) return;
     
     let viewStart = new Date(currentDate);
-    // Fixed: Now starts on Sunday by removing the extra + 1
     viewStart.setDate(viewStart.getDate() - viewStart.getDay()); 
 
     updateDateTitle("Schedule");
@@ -1062,16 +1165,17 @@ function handleDrag(e) {
     if (!isEditMode()) return;
     if (e.target.classList.contains('resize-handle') || e.target.tagName === 'INPUT') return;
     if (window.isEditing) return;
+    e.stopPropagation();
     
     selectedEventId = e.currentTarget.dataset.id;
     let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
     activeEv = events.find(ev => ev.id === realId);
     if (!activeEv || !canEdit(activeEv)) { activeEv = null; return; }
+    if (e.type === 'touchstart' && e.cancelable) e.preventDefault();
     
     originalDateStr = activeEv.date;
     
-    if (e.ctrlKey) {
-        // Clone on Ctrl+Drag and save to CalDAV immediately
+    if (e.ctrlKey || e.metaKey) {
         let clonedEv = { ...activeEv, id: Date.now().toString() };
         events.push(clonedEv);
         putEventToCalDAV(clonedEv);
@@ -1090,6 +1194,7 @@ function handleDrag(e) {
     hasMoved = false;
     activeCard = document.querySelector(`.event-card[data-id='${selectedEventId}']`);
 }
+
 function handleResize(e) {
     if (!isEditMode()) return;
     e.stopPropagation();
@@ -1100,6 +1205,7 @@ function handleResize(e) {
     activeEv = events.find(ev => ev.id === realId);
     
     if (!activeEv || !canEdit(activeEv)) { activeEv = null; return; }
+    if (e.type === 'touchstart' && e.cancelable) e.preventDefault();
     isResizing = true; hasMoved = true;
     startMouseY = getClientY(e); originalDuration = activeEv.duration;
 }
@@ -1169,7 +1275,7 @@ function handleMove(e) {
 function handleUp(e) {
     if (isMonthDragging && monthDragEv) {
         if (hasMoved) {
-            let target = document.elementFromPoint(e.changedTouches ? e.changedTouches[0].clientX : e.clientX, e.changedTouches ? e.changedTouches[0].clientY : e.clientY);
+            let target = document.elementFromPoint(getClientX(e), getClientY(e));
             let cell = target ? target.closest('.month-cell') : null;
             if (cell && cell.dataset.date && monthDragEv.date !== cell.dataset.date) {
                 let oldDateStr = monthDragEv.date;
@@ -1208,7 +1314,7 @@ window.addEventListener('mouseup', handleUp);
 window.addEventListener('touchend', handleUp);
 
 if (gridBg) {
-    gridBg.addEventListener('dblclick', e => {
+    bindDoubleTap(gridBg, e => {
         if (viewMode >= 6) return; 
         if (!isEditMode()) return;
         
@@ -1280,7 +1386,6 @@ document.getElementById('btnCopy')?.addEventListener('click', () => {
         let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
         let ev = events.find(e => e.id === realId);
         if (ev && canEdit(ev)) {
-            // Clone in the exact same spot (no +30 offset)
             let newEv = { ...ev, id: Date.now().toString(), startMin: ev.startMin };
             events.push(newEv); 
             putEventToCalDAV(newEv); 
@@ -1651,6 +1756,19 @@ async function saveSetting(key, val) {
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
+    let savedChecked = await loadSetting('sched_checked', 'NONE');
+    unselectedSchedUsers.clear();
+    if (savedChecked === 'NONE') {
+        people.forEach((_, idx) => unselectedSchedUsers.add(idx));
+    } else {
+        let checkedArr = savedChecked.split(',').map(Number).filter(n => !isNaN(n));
+        people.forEach((_, idx) => {
+            if (!checkedArr.includes(idx)) unselectedSchedUsers.add(idx);
+        });
+    }
+    hasLoadedSchedUsers = true;
+    populateTempFilter();
+
     let schedHeader = document.getElementById('schedHeaderRow');
     if (schedHeader) {
         schedHeader.innerHTML = `
@@ -1749,8 +1867,6 @@ window.addEventListener('DOMContentLoaded', async () => {
 
 document.getElementById('comboDefaultEvent')?.addEventListener('change', (e) => { saveSetting('default_event', e.target.value); });
 
-
-// --- AUTOMATED SCHEDULING SYSTEM ---
 let currentSchedYear = new Date().getFullYear();
 let unselectedSchedUsers = new Set();
 let schedUserData = {}; 
@@ -1766,20 +1882,6 @@ document.getElementById('btnScheduling')?.addEventListener('click', async () => 
         schedUserData = JSON.parse(savedUserData);
     } catch(e) {
         schedUserData = {};
-    }
-
-    if (!hasLoadedSchedUsers) {
-        let savedChecked = await loadSetting('sched_checked', 'NONE');
-        unselectedSchedUsers.clear();
-        if (savedChecked === 'NONE') {
-            people.forEach((_, idx) => unselectedSchedUsers.add(idx));
-        } else {
-            let checkedArr = savedChecked.split(',').map(Number).filter(n => !isNaN(n));
-            people.forEach((_, idx) => {
-                if (!checkedArr.includes(idx)) unselectedSchedUsers.add(idx);
-            });
-        }
-        hasLoadedSchedUsers = true;
     }
 
     renderSchedUsers();
@@ -1945,21 +2047,6 @@ function parseTimeStr(t) {
     return h * 60 + m;
 }
 
-function parseShiftList(str) {
-    if (!str || str.toLowerCase() === 'default' || str.toLowerCase() === 'clear') return [];
-    let shifts = [];
-    str.split(',').forEach(p => {
-        let pTrim = p.trim(); if (!pTrim) return;
-        let bounds = pTrim.split('-');
-        if (bounds.length === 2) {
-            let s = parseTimeStr(bounds[0]); let e = parseTimeStr(bounds[1]);
-            if (e < s) e += 24*60; 
-            shifts.push({ start: s, span: e - s });
-        }
-    });
-    return shifts;
-}
-
 document.getElementById('btnMakeSchedule')?.addEventListener('click', async () => {
     let activeMode = document.getElementById('comboDefaultEvent')?.value || "WORKING";
     if (!confirm(`Are you sure you want to Create a Schedule using ${activeMode}?`)) return;
@@ -2011,7 +2098,7 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
                     if (eqParts.length !== 2) continue;
                     let dNum = parseInt(eqParts[0].trim(), 10);
                     if (isNaN(dNum) || dNum < 1 || dNum > 7) continue;
-                    dayIdx = dNum - 1; // 1 = Sunday (0), 2 = Monday (1), ..., 7 = Saturday (6)
+                    dayIdx = dNum - 1; 
                     rangeStr = eqParts[1].trim();
                 }
 
@@ -2031,7 +2118,6 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
                 if (eToken.mer === 'am' && eH === 12) eH = 0;
                 else if (eToken.mer === 'pm' && eH < 12) eH += 12;
 
-                // Treat 1-5 without AM/PM or leading zero as PM (e.g. 1:15-3:15 -> 13:15-15:15)
                 if (!sToken.mer && !sToken.hasLeadingZero && sH >= 1 && sH <= 5) {
                     let tentativeStartMin = (sH + 12) * 60 + sToken.mins;
                     let rawEndMin = eH * 60 + eToken.mins;
@@ -2043,7 +2129,6 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
                 let startMin = sH * 60 + sToken.mins;
                 let endMin = eH * 60 + eToken.mins;
 
-                // If end <= start in 12h format (e.g. 8-7 or 1:15-3:15), roll end into PM (+12h)
                 if (!eToken.mer && !eToken.hasLeadingZero && eH <= 12 && endMin <= startMin) {
                     eH += 12;
                     endMin = eH * 60 + eToken.mins;
@@ -2097,7 +2182,6 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
             return availableChunks;
         };
 
-        // Build the set of 7 date strings for the selected week
         let weekDates = [];
         for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
             let curDate = new Date(startDate);
@@ -2107,8 +2191,6 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
 
         let qToUpdate = new Set();
 
-        // If an unscheduled manager (e.g. admin) created OFF events while filtering a specific person in Week View,
-        // reassign those OFF events to the filtered person so they properly trim that person's shifts.
         let myIdx = people.indexOf(currentUser);
         let tempFilterVal = document.getElementById('comboTempPersonFilter')?.value;
         if (myIdx !== -1 && unselectedSchedUsers.has(myIdx) && tempFilterVal !== "" && tempFilterVal !== undefined) {
@@ -2124,7 +2206,6 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
             }
         }
 
-        // Pre-pass: Trim any ALREADY EXISTING working events in this week that overlap with OFF events
         let allEvsInitial = typeof unrollEvents === 'function' ? unrollEvents() : events;
         let preTrimmedEvents = [];
         for (let ev of events) {
@@ -2356,7 +2437,6 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
             } 
         } 
 
-        // Final Trimming Pass: Cut and trim all newly generated working events around any OFF variations
         let latestAllEvs = typeof unrollEvents === 'function' ? unrollEvents() : events;
         let finalEventsList = [];
 
