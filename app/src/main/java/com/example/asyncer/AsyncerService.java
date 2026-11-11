@@ -388,7 +388,7 @@ public class AsyncerService extends Service {
         }
     }
 
-    // --- Core File & Directory Sync (Local, FTP, SMB1, SMB2) ---
+// --- Core File & Directory Sync (Local, FTP, SMB1, SMB2) ---
     private void syncSingleFile(
             String srcFull, String dstFull,
             boolean isSrcSmb, UncPath srcUnc, SmbClient.DirectoryItem srcSmbMeta,
@@ -399,7 +399,8 @@ public class AsyncerService extends Service {
         FtpClient ftpSrc = FtpClient.parseUrl(srcFull);
         FtpClient ftpDst = FtpClient.parseUrl(dstFull);
         if (ftpSrc != null || ftpDst != null) {
-            String shortName = new File(ftpSrc != null ? ftpSrc.path : ftpDst.path).getName();
+            String targetPath = (ftpSrc != null ? ftpSrc.path : ftpDst.path);
+            String shortName = new File(targetPath != null ? targetPath : "").getName();
             showSyncTextNonBlocking(shortName);
             boolean ok = false;
             if (ftpSrc != null && ftpDst == null && !isDstSmb) {
