@@ -129,7 +129,6 @@ public class MainActivity extends Activity {
         final EditText editStartHr = createLabeledInput(layout, "Work Start Hour (0-23):", String.valueOf(prefs.getInt("start_hour", 0)));
         final EditText editEndHr = createLabeledInput(layout, "Work End Hour (1-24):", String.valueOf(prefs.getInt("end_hour", 24)));
 
-        // Live-update link whenever password, username, or port changes
         TextWatcher linkWatcher = new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
@@ -184,10 +183,9 @@ public class MainActivity extends Activity {
 
                 saveLocationsToPrefs();
                 updateLinkText(true);
-                Toast.makeText(MainActivity.this, "Settings Saved. Restarting Tracker...", Toast.LENGTH_SHORT).show();
+                Toast.makeText(MainActivity.this, "Settings Saved.", Toast.LENGTH_SHORT).show();
                 if (isTracking) {
-                    toggleTracker(false);
-                    toggleTracker(true);
+                    reloadServiceSettings();
                 }
             }
         });
@@ -277,7 +275,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        // Refresh local IP and select the link text every time the app is opened/resumed
         updateLinkText(true);
     }
 
@@ -314,6 +311,13 @@ public class MainActivity extends Activity {
         } else {
             Toast.makeText(this, "Location permission is required to track.", Toast.LENGTH_LONG).show();
         }
+    }
+
+    private void reloadServiceSettings() {
+        Intent serviceIntent = new Intent(this, TrackerService.class);
+        serviceIntent.setAction(TrackerService.ACTION_RELOAD_SETTINGS);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent);
+        else startService(serviceIntent);
     }
 
     private void toggleTracker(boolean start) {
@@ -366,6 +370,7 @@ public class MainActivity extends Activity {
                 if (name.length() == 0) name = "HOME";
                 addLocationRow(name.toUpperCase(Locale.US), coordStr, true);
                 saveLocationsToPrefs();
+                if (isTracking) reloadServiceSettings();
                 Toast.makeText(MainActivity.this, "Added " + name + " (" + coordStr + ")", Toast.LENGTH_SHORT).show();
             }
         });
@@ -457,6 +462,7 @@ public class MainActivity extends Activity {
             public void onClick(View v) {
                 btnType.setText(btnType.getText().toString().equals("OMIT") ? "TRACK" : "OMIT");
                 saveLocationsToPrefs();
+                if (isTracking) reloadServiceSettings();
             }
         });
 
@@ -472,6 +478,7 @@ public class MainActivity extends Activity {
                             public void onClick(DialogInterface dialog, int which) {
                                 locationsLayout.removeView(row);
                                 saveLocationsToPrefs();
+                                if (isTracking) reloadServiceSettings();
                                 Toast.makeText(MainActivity.this, "Entry deleted", Toast.LENGTH_SHORT).show();
                             }
                         })
@@ -607,4 +614,4 @@ public class MainActivity extends Activity {
     private float parseFloatSafe(String s, float def) {
         try { return Float.parseFloat(s.trim()); } catch (Exception e) { return def; }
     }
-            }
+    }
