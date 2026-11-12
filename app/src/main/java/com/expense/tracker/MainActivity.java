@@ -17,9 +17,12 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.PowerManager;
 import android.provider.Settings;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -43,7 +46,11 @@ public class MainActivity extends Activity {
     private Button btnToggle;
     private LinearLayout locationsLayout;
     private EditText editLink;
+    private EditText editUser;
+    private EditText editPass;
+    private EditText editPort;
     private CheckBox chkBoot;
+    private CheckBox chkOutputLocations;
 
     private interface FileAction {
         void execute(String filename);
@@ -85,6 +92,19 @@ public class MainActivity extends Activity {
         chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
         layout.addView(chkBoot);
 
+        chkOutputLocations = new CheckBox(this);
+        chkOutputLocations.setText("Output locations");
+        chkOutputLocations.setChecked(prefs.getBoolean("output_locations", false));
+        chkOutputLocations.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                SharedPreferences.Editor ed = prefs.edit();
+                ed.putBoolean("output_locations", isChecked);
+                ed.commit();
+            }
+        });
+        layout.addView(chkOutputLocations);
+
         Button btnAddKnown = new Button(this);
         btnAddKnown.setText("Add to Known Named Locations (Current GPS)");
         btnAddKnown.setOnClickListener(new View.OnClickListener() {
@@ -95,18 +115,37 @@ public class MainActivity extends Activity {
         });
         layout.addView(btnAddKnown);
 
-        addLabel(layout, "Copy/Paste Server Download Link:");
+        addLabel(layout, "Copy/Paste Server Link (includes &view=1):");
         editLink = new EditText(this);
+        editLink.setSelectAllOnFocus(true);
         layout.addView(editLink);
 
-        final EditText editUser = createLabeledInput(layout, "HTTP Username:", prefs.getString("http_user", "admin"));
-        final EditText editPass = createLabeledInput(layout, "HTTP Password:", prefs.getString("http_pass", "password"));
-        final EditText editPort = createLabeledInput(layout, "HTTP Port:", String.valueOf(prefs.getInt("http_port", 8080)));
+        editUser = createLabeledInput(layout, "HTTP Username:", prefs.getString("http_user", "admin"));
+        editPass = createLabeledInput(layout, "HTTP Password:", prefs.getString("http_pass", "password"));
+        editPort = createLabeledInput(layout, "HTTP Port:", String.valueOf(prefs.getInt("http_port", 8080)));
         final EditText editInterval = createLabeledInput(layout, "GPS Check Interval (ms) [60000 = 1 min]:", String.valueOf(prefs.getLong("interval", 60000L)));
         final EditText editStayMins = createLabeledInput(layout, "Min Stay Time to Confirm Site (minutes):", String.valueOf(prefs.getInt("stay_mins", 5)));
         final EditText editDist = createLabeledInput(layout, "Site Radius Tolerance (meters):", String.valueOf(prefs.getFloat("distance", 75.0f)));
         final EditText editStartHr = createLabeledInput(layout, "Work Start Hour (0-23):", String.valueOf(prefs.getInt("start_hour", 0)));
         final EditText editEndHr = createLabeledInput(layout, "Work End Hour (1-24):", String.valueOf(prefs.getInt("end_hour", 24)));
+
+        // Live-update link whenever password, username, or port changes
+        TextWatcher linkWatcher = new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override
+            public void afterTextChanged(Editable s) {
+                SharedPreferences.Editor ed = prefs.edit();
+                ed.putString("http_user", editUser.getText().toString().trim());
+                ed.putString("http_pass", editPass.getText().toString().trim());
+                ed.putInt("http_port", parseIntSafe(editPort.getText().toString(), 8080));
+                ed.commit();
+                updateLinkText(false);
+            }
+        };
+        editUser.addTextChangedListener(linkWatcher);
+        editPass.addTextChangedListener(linkWatcher);
+        editPort.addTextChangedListener(linkWatcher);
 
         addLabel(layout, "\nSpecial Locations (Tap OMIT/TRACK to toggle, Long-Press OMIT/TRACK to Delete):");
         locationsLayout = new LinearLayout(this);
@@ -132,6 +171,7 @@ public class MainActivity extends Activity {
             public void onClick(View v) {
                 SharedPreferences.Editor ed = prefs.edit();
                 ed.putBoolean("start_on_boot", chkBoot.isChecked());
+                ed.putBoolean("output_locations", chkOutputLocations.isChecked());
                 ed.putString("http_user", editUser.getText().toString().trim());
                 ed.putString("http_pass", editPass.getText().toString().trim());
                 ed.putInt("http_port", parseIntSafe(editPort.getText().toString(), 8080));
@@ -143,7 +183,7 @@ public class MainActivity extends Activity {
                 ed.commit();
 
                 saveLocationsToPrefs();
-                updateLinkText();
+                updateLinkText(true);
                 Toast.makeText(MainActivity.this, "Settings Saved. Restarting Tracker...", Toast.LENGTH_SHORT).show();
                 if (isTracking) {
                     toggleTracker(false);
@@ -231,7 +271,14 @@ public class MainActivity extends Activity {
             toggleTracker(true);
         }
 
-        updateLinkText();
+        updateLinkText(true);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Refresh local IP and select the link text every time the app is opened/resumed
+        updateLinkText(true);
     }
 
     private void enableAdminAndBatteryExemption() {
@@ -328,12 +375,19 @@ public class MainActivity extends Activity {
 
     private String getLocalIpAddress() {
         try {
-            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
-                NetworkInterface intf = en.nextElement();
-                for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
-                    InetAddress inetAddress = enumIpAddr.nextElement();
-                    if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
-                        return inetAddress.getHostAddress();
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            if (interfaces != null) {
+                while (interfaces.hasMoreElements()) {
+                    NetworkInterface intf = interfaces.nextElement();
+                    Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses();
+                    while (enumIpAddr.hasMoreElements()) {
+                        InetAddress inetAddress = enumIpAddr.nextElement();
+                        if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
+                            String ip = inetAddress.getHostAddress();
+                            if (ip != null && ip.length() > 0 && !ip.equals("0.0.0.0")) {
+                                return ip;
+                            }
+                        }
                     }
                 }
             }
@@ -341,15 +395,30 @@ public class MainActivity extends Activity {
         return "127.0.0.1";
     }
 
-    private void updateLinkText() {
+    private void updateLinkText(boolean selectText) {
+        if (editLink == null) return;
         String ip = getLocalIpAddress();
         SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd", Locale.US);
         String today = sdf.format(new Date());
 
-        String url = "http://" + ip + ":" + prefs.getInt("http_port", 8080) +
-                     "/download?" + prefs.getString("http_user", "admin") + "=" + prefs.getString("http_pass", "password") +
-                     "&" + today + "0000&" + today + "1700";
-        if (editLink != null) editLink.setText(url);
+        String user = (editUser != null) ? editUser.getText().toString().trim() : prefs.getString("http_user", "admin");
+        String pass = (editPass != null) ? editPass.getText().toString().trim() : prefs.getString("http_pass", "password");
+        int port = (editPort != null) ? parseIntSafe(editPort.getText().toString(), 8080) : prefs.getInt("http_port", 8080);
+
+        String url = "http://" + ip + ":" + port +
+                     "/download?" + user + "=" + pass +
+                     "&" + today + "0000&" + today + "1700&view=1";
+        editLink.setText(url);
+
+        if (selectText) {
+            editLink.post(new Runnable() {
+                @Override
+                public void run() {
+                    editLink.requestFocus();
+                    editLink.selectAll();
+                }
+            });
+        }
     }
 
     private void addLabel(LinearLayout parent, String text) {
@@ -391,7 +460,6 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Long-press on the OMIT/TRACK button to delete this location entry
         btnType.setOnLongClickListener(new View.OnLongClickListener() {
             @Override
             public boolean onLongClick(View v) {
@@ -539,4 +607,4 @@ public class MainActivity extends Activity {
     private float parseFloatSafe(String s, float def) {
         try { return Float.parseFloat(s.trim()); } catch (Exception e) { return def; }
     }
-                    }
+            }
