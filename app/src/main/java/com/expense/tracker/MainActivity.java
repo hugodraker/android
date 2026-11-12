@@ -2,6 +2,8 @@ package com.expense.tracker;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
@@ -9,9 +11,12 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -65,20 +70,30 @@ public class MainActivity extends Activity {
         });
         layout.addView(btnToggle);
 
+        Button btnAdmin = new Button(this);
+        btnAdmin.setText("Enable System Admin & Never-Sleep Mode");
+        btnAdmin.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                enableAdminAndBatteryExemption();
+            }
+        });
+        layout.addView(btnAdmin);
+
         chkBoot = new CheckBox(this);
         chkBoot.setText("Start Tracker When Phone Starts");
         chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
         layout.addView(chkBoot);
 
-        Button btnOmit = new Button(this);
-        btnOmit.setText("Don't Track Here (Add Current GPS to Omitted)");
-        btnOmit.setOnClickListener(new View.OnClickListener() {
+        Button btnAddKnown = new Button(this);
+        btnAddKnown.setText("Add to Known Named Locations (Current GPS)");
+        btnAddKnown.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                addCurrentLocationToOmitted();
+                promptAddCurrentLocationToNamed();
             }
         });
-        layout.addView(btnOmit);
+        layout.addView(btnAddKnown);
 
         addLabel(layout, "Copy/Paste Server Download Link:");
         editLink = new EditText(this);
@@ -88,18 +103,18 @@ public class MainActivity extends Activity {
         final EditText editPass = createLabeledInput(layout, "HTTP Password:", prefs.getString("http_pass", "password"));
         final EditText editPort = createLabeledInput(layout, "HTTP Port:", String.valueOf(prefs.getInt("http_port", 8080)));
         final EditText editInterval = createLabeledInput(layout, "GPS Check Interval (ms) [60000 = 1 min]:", String.valueOf(prefs.getLong("interval", 60000L)));
-        final EditText editStayMins = createLabeledInput(layout, "Min Stay Time to Record Trip (minutes):", String.valueOf(prefs.getInt("stay_mins", 5)));
-        final EditText editDist = createLabeledInput(layout, "Site Radius Tolerance (meters):", String.valueOf(prefs.getFloat("distance", 50.0f)));
+        final EditText editStayMins = createLabeledInput(layout, "Min Stay Time to Confirm Site (minutes):", String.valueOf(prefs.getInt("stay_mins", 5)));
+        final EditText editDist = createLabeledInput(layout, "Site Radius Tolerance (meters):", String.valueOf(prefs.getFloat("distance", 75.0f)));
         final EditText editStartHr = createLabeledInput(layout, "Work Start Hour (0-23):", String.valueOf(prefs.getInt("start_hour", 0)));
         final EditText editEndHr = createLabeledInput(layout, "Work End Hour (1-24):", String.valueOf(prefs.getInt("end_hour", 24)));
 
-        addLabel(layout, "\nSpecial Locations (Name | Lat,Lon | Track/Omit):");
+        addLabel(layout, "\nSpecial Locations (Tap OMIT/TRACK to toggle, Long-Press OMIT/TRACK to Delete):");
         locationsLayout = new LinearLayout(this);
         locationsLayout.setOrientation(LinearLayout.VERTICAL);
         layout.addView(locationsLayout);
 
         Button btnAddLoc = new Button(this);
-        btnAddLoc.setText("+ Add Special Location");
+        btnAddLoc.setText("+ Add Blank Special Location Row");
         btnAddLoc.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -122,10 +137,10 @@ public class MainActivity extends Activity {
                 ed.putInt("http_port", parseIntSafe(editPort.getText().toString(), 8080));
                 ed.putLong("interval", parseLongSafe(editInterval.getText().toString(), 60000L));
                 ed.putInt("stay_mins", parseIntSafe(editStayMins.getText().toString(), 5));
-                ed.putFloat("distance", parseFloatSafe(editDist.getText().toString(), 50.0f));
+                ed.putFloat("distance", parseFloatSafe(editDist.getText().toString(), 75.0f));
                 ed.putInt("start_hour", parseIntSafe(editStartHr.getText().toString(), 0));
                 ed.putInt("end_hour", parseIntSafe(editEndHr.getText().toString(), 24));
-                ed.commit(); // API 4 compatible
+                ed.commit();
 
                 saveLocationsToPrefs();
                 updateLinkText();
@@ -219,6 +234,32 @@ public class MainActivity extends Activity {
         updateLinkText();
     }
 
+    private void enableAdminAndBatteryExemption() {
+        try {
+            ComponentName adminComponent = new ComponentName(this, TrackerDeviceAdminReceiver.class);
+            DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+            if (dpm != null && !dpm.isAdminActive(adminComponent)) {
+                Intent intent = new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
+                intent.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent);
+                intent.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Keeps Travel Expense Tracker active in the background without sleeping.");
+                startActivity(intent);
+            } else {
+                Toast.makeText(this, "Device Admin is already active.", Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception ignored) {}
+
+        if (Build.VERSION.SDK_INT >= 23) {
+            try {
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                    Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         if (requestCode == 1 && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
@@ -242,30 +283,47 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void addCurrentLocationToOmitted() {
+    private void promptAddCurrentLocationToNamed() {
+        double lat = 0.0;
+        double lon = 0.0;
         try {
             LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
             Location loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
             if (loc == null) loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-
-            if (loc != null && (loc.getLatitude() != 0.0 || loc.getLongitude() != 0.0)) {
-                addLocationRow("HOME", loc.getLatitude() + "," + loc.getLongitude(), true);
-                saveLocationsToPrefs();
-                Toast.makeText(this, "Added Current Location as HOME (Omitted)", Toast.LENGTH_SHORT).show();
-            } else {
-                double lat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
-                double lon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
-                if (lat != 0.0 || lon != 0.0) {
-                    addLocationRow("HOME", lat + "," + lon, true);
-                    saveLocationsToPrefs();
-                    Toast.makeText(this, "Added Last Known Fix as HOME (Omitted)", Toast.LENGTH_SHORT).show();
-                } else {
-                    Toast.makeText(this, "No GPS fix available yet", Toast.LENGTH_SHORT).show();
-                }
+            if (loc != null && (Math.abs(loc.getLatitude()) > 0.0001 || Math.abs(loc.getLongitude()) > 0.0001)) {
+                lat = loc.getLatitude();
+                lon = loc.getLongitude();
             }
-        } catch (Exception e) {
-            Toast.makeText(this, "Failed to get location", Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {}
+
+        if (Math.abs(lat) <= 0.0001 && Math.abs(lon) <= 0.0001) {
+            lat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
+            lon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
         }
+
+        if (Math.abs(lat) <= 0.0001 && Math.abs(lon) <= 0.0001) {
+            Toast.makeText(this, "No valid GPS fix available yet.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        final String coordStr = String.format(Locale.US, "%.6f,%.6f", lat, lon);
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Add Known Named Location (" + coordStr + ")");
+        final EditText input = new EditText(this);
+        input.setText("HOME");
+        builder.setView(input);
+        builder.setPositiveButton("Add", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                String name = input.getText().toString().trim();
+                if (name.length() == 0) name = "HOME";
+                addLocationRow(name.toUpperCase(Locale.US), coordStr, true);
+                saveLocationsToPrefs();
+                Toast.makeText(MainActivity.this, "Added " + name + " (" + coordStr + ")", Toast.LENGTH_SHORT).show();
+            }
+        });
+        builder.setNegativeButton("Cancel", null);
+        builder.show();
     }
 
     private String getLocalIpAddress() {
@@ -310,10 +368,10 @@ public class MainActivity extends Activity {
     }
 
     private void addLocationRow(String name, String coords, boolean omitted) {
-        LinearLayout row = new LinearLayout(this);
+        final LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
 
-        EditText eName = new EditText(this);
+        final EditText eName = new EditText(this);
         eName.setText(name);
         eName.setHint("Name");
         eName.setWidth(180);
@@ -329,6 +387,29 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 btnType.setText(btnType.getText().toString().equals("OMIT") ? "TRACK" : "OMIT");
+                saveLocationsToPrefs();
+            }
+        });
+
+        // Long-press on the OMIT/TRACK button to delete this location entry
+        btnType.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                String locTitle = eName.getText().toString().trim();
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Delete Location")
+                        .setMessage("Delete '" + (locTitle.length() > 0 ? locTitle : "this entry") + "'?")
+                        .setPositiveButton("Delete", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                                locationsLayout.removeView(row);
+                                saveLocationsToPrefs();
+                                Toast.makeText(MainActivity.this, "Entry deleted", Toast.LENGTH_SHORT).show();
+                            }
+                        })
+                        .setNegativeButton("Cancel", null)
+                        .show();
+                return true;
             }
         });
 
@@ -383,12 +464,7 @@ public class MainActivity extends Activity {
                 action.execute(input.getText().toString().trim());
             }
         });
-        builder.setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
-            @Override
-            public void onClick(DialogInterface dialog, int which) {
-                dialog.cancel();
-            }
-        });
+        builder.setNegativeButton("Cancel", null);
         builder.show();
     }
 
@@ -463,4 +539,4 @@ public class MainActivity extends Activity {
     private float parseFloatSafe(String s, float def) {
         try { return Float.parseFloat(s.trim()); } catch (Exception e) { return def; }
     }
-}
+                    }
