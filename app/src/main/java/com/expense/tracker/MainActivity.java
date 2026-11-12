@@ -3,6 +3,7 @@ package com.expense.tracker;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -13,6 +14,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -36,6 +38,11 @@ public class MainActivity extends Activity {
     private Button btnToggle;
     private LinearLayout locationsLayout;
     private EditText editLink;
+    private CheckBox chkBoot;
+
+    private interface FileAction {
+        void execute(String filename);
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -48,89 +55,156 @@ public class MainActivity extends Activity {
         layout.setPadding(20, 20, 20, 20);
         scroll.addView(layout);
 
-        // Toggle Button
         btnToggle = new Button(this);
         btnToggle.setText("START TRACKER");
-        btnToggle.setOnClickListener(v -> toggleTracker(!isTracking));
+        btnToggle.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleTracker(!isTracking);
+            }
+        });
         layout.addView(btnToggle);
 
-        // Don't Track (Omit Current Location)
+        chkBoot = new CheckBox(this);
+        chkBoot.setText("Start Tracker When Phone Starts");
+        chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
+        layout.addView(chkBoot);
+
         Button btnOmit = new Button(this);
-        btnOmit.setText("Don't Track Here (Add to Omitted)");
-        btnOmit.setOnClickListener(v -> addCurrentLocationToOmitted());
+        btnOmit.setText("Don't Track Here (Add Current GPS to Omitted)");
+        btnOmit.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                addCurrentLocationToOmitted();
+            }
+        });
         layout.addView(btnOmit);
 
-        // HTTP Link
-        TextView lblLink = new TextView(this);
-        lblLink.setText("Copy/Paste Server Download Link:");
-        layout.addView(lblLink);
-        
+        addLabel(layout, "Copy/Paste Server Download Link:");
         editLink = new EditText(this);
-        editLink.setTextIsSelectable(true);
         layout.addView(editLink);
 
-        // Settings Forms
-        EditText editUser = createInput(layout, "HTTP Username (Admin)", prefs.getString("http_user", "admin"));
-        EditText editPass = createInput(layout, "HTTP Password", prefs.getString("http_pass", "password"));
-        EditText editPort = createInput(layout, "HTTP Port", String.valueOf(prefs.getInt("http_port", 8080)));
-        EditText editInterval = createInput(layout, "GPS Wake Interval (ms) [30000=30s]", String.valueOf(prefs.getLong("interval", 30000)));
-        EditText editDist = createInput(layout, "Site Radius Tolerance (meters)", String.valueOf(prefs.getFloat("distance", 50.0f)));
+        final EditText editUser = createLabeledInput(layout, "HTTP Username:", prefs.getString("http_user", "admin"));
+        final EditText editPass = createLabeledInput(layout, "HTTP Password:", prefs.getString("http_pass", "password"));
+        final EditText editPort = createLabeledInput(layout, "HTTP Port:", String.valueOf(prefs.getInt("http_port", 8080)));
+        final EditText editInterval = createLabeledInput(layout, "GPS Check Interval (ms) [60000 = 1 min]:", String.valueOf(prefs.getLong("interval", 60000L)));
+        final EditText editStayMins = createLabeledInput(layout, "Min Stay Time to Record Trip (minutes):", String.valueOf(prefs.getInt("stay_mins", 5)));
+        final EditText editDist = createLabeledInput(layout, "Site Radius Tolerance (meters):", String.valueOf(prefs.getFloat("distance", 50.0f)));
+        final EditText editStartHr = createLabeledInput(layout, "Work Start Hour (0-23):", String.valueOf(prefs.getInt("start_hour", 0)));
+        final EditText editEndHr = createLabeledInput(layout, "Work End Hour (1-24):", String.valueOf(prefs.getInt("end_hour", 24)));
 
-        // Special Locations
-        TextView lblLocs = new TextView(this);
-        lblLocs.setText("\nSpecial Locations (Names & Coords):");
-        layout.addView(lblLocs);
-
+        addLabel(layout, "\nSpecial Locations (Name | Lat,Lon | Track/Omit):");
         locationsLayout = new LinearLayout(this);
         locationsLayout.setOrientation(LinearLayout.VERTICAL);
         layout.addView(locationsLayout);
 
         Button btnAddLoc = new Button(this);
         btnAddLoc.setText("+ Add Special Location");
-        btnAddLoc.setOnClickListener(v -> addLocationRow("OFFICE", "", false));
+        btnAddLoc.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                addLocationRow("OFFICE", "", false);
+            }
+        });
         layout.addView(btnAddLoc);
 
         loadLocationsFromPrefs();
 
         Button btnSave = new Button(this);
         btnSave.setText("Save Settings");
-        btnSave.setOnClickListener(v -> {
-            prefs.edit()
-                .putString("http_user", editUser.getText().toString())
-                .putString("http_pass", editPass.getText().toString())
-                .putInt("http_port", Integer.parseInt(editPort.getText().toString()))
-                .putLong("interval", Long.parseLong(editInterval.getText().toString()))
-                .putFloat("distance", Float.parseFloat(editDist.getText().toString()))
-                .apply();
-            saveLocationsToPrefs();
-            updateLinkText();
-            Toast.makeText(this, "Settings Saved. Restarting Tracker...", Toast.LENGTH_SHORT).show();
-            if (isTracking) {
-                toggleTracker(false);
-                toggleTracker(true);
+        btnSave.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                SharedPreferences.Editor ed = prefs.edit();
+                ed.putBoolean("start_on_boot", chkBoot.isChecked());
+                ed.putString("http_user", editUser.getText().toString().trim());
+                ed.putString("http_pass", editPass.getText().toString().trim());
+                ed.putInt("http_port", parseIntSafe(editPort.getText().toString(), 8080));
+                ed.putLong("interval", parseLongSafe(editInterval.getText().toString(), 60000L));
+                ed.putInt("stay_mins", parseIntSafe(editStayMins.getText().toString(), 5));
+                ed.putFloat("distance", parseFloatSafe(editDist.getText().toString(), 50.0f));
+                ed.putInt("start_hour", parseIntSafe(editStartHr.getText().toString(), 0));
+                ed.putInt("end_hour", parseIntSafe(editEndHr.getText().toString(), 24));
+                ed.commit(); // API 4 compatible
+
+                saveLocationsToPrefs();
+                updateLinkText();
+                Toast.makeText(MainActivity.this, "Settings Saved. Restarting Tracker...", Toast.LENGTH_SHORT).show();
+                if (isTracking) {
+                    toggleTracker(false);
+                    toggleTracker(true);
+                }
             }
         });
         layout.addView(btnSave);
 
-        // Import/Export
         LinearLayout ioLayout = new LinearLayout(this);
         ioLayout.setOrientation(LinearLayout.HORIZONTAL);
-        
-        Button btnExport = new Button(this);
-        btnExport.setText("Export DB");
-        btnExport.setOnClickListener(v -> promptFilename("travel_data.db", "Export DB Name", this::exportFile));
-        
-        Button btnImport = new Button(this);
-        btnImport.setText("Import DB");
-        btnImport.setOnClickListener(v -> promptFilename("travel_data.db", "Import DB Name", this::importFile));
 
-        ioLayout.addView(btnExport);
-        ioLayout.addView(btnImport);
+        Button btnExportDb = new Button(this);
+        btnExportDb.setText("Export DB");
+        btnExportDb.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                promptFilename("travel_data.db", "Export DB Filename", new FileAction() {
+                    @Override
+                    public void execute(String filename) {
+                        exportDb(filename);
+                    }
+                });
+            }
+        });
+
+        Button btnImportDb = new Button(this);
+        btnImportDb.setText("Import DB");
+        btnImportDb.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                promptFilename("travel_data.db", "Import DB Filename", new FileAction() {
+                    @Override
+                    public void execute(String filename) {
+                        importDb(filename);
+                    }
+                });
+            }
+        });
+
+        Button btnExportCfg = new Button(this);
+        btnExportCfg.setText("Export Cfg");
+        btnExportCfg.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                promptFilename("tracker_settings.cfg", "Export Settings Filename", new FileAction() {
+                    @Override
+                    public void execute(String filename) {
+                        exportSettings(filename);
+                    }
+                });
+            }
+        });
+
+        Button btnImportCfg = new Button(this);
+        btnImportCfg.setText("Import Cfg");
+        btnImportCfg.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                promptFilename("tracker_settings.cfg", "Import Settings Filename", new FileAction() {
+                    @Override
+                    public void execute(String filename) {
+                        importSettings(filename);
+                    }
+                });
+            }
+        });
+
+        ioLayout.addView(btnExportDb);
+        ioLayout.addView(btnImportDb);
+        ioLayout.addView(btnExportCfg);
+        ioLayout.addView(btnImportCfg);
         layout.addView(ioLayout);
 
         setContentView(scroll);
 
-        // SAFE PERMISSION CHECK - Only start tracker if permissions already granted
         if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{
                 "android.permission.ACCESS_FINE_LOCATION",
@@ -141,13 +215,12 @@ public class MainActivity extends Activity {
         } else {
             toggleTracker(true);
         }
-        
+
         updateLinkText();
     }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        // Automatically start the tracker the exact moment the user clicks "Allow"
         if (requestCode == 1 && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             toggleTracker(true);
         } else {
@@ -172,24 +245,29 @@ public class MainActivity extends Activity {
     private void addCurrentLocationToOmitted() {
         try {
             LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-            Location loc = null;
-            if (checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") == PackageManager.PERMISSION_GRANTED) {
-                loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                if (loc == null) loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-            }
-            
-            if (loc != null) {
+            Location loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+            if (loc == null) loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+
+            if (loc != null && (loc.getLatitude() != 0.0 || loc.getLongitude() != 0.0)) {
                 addLocationRow("HOME", loc.getLatitude() + "," + loc.getLongitude(), true);
-                Toast.makeText(this, "Added Current Location as Omitted", Toast.LENGTH_SHORT).show();
+                saveLocationsToPrefs();
+                Toast.makeText(this, "Added Current Location as HOME (Omitted)", Toast.LENGTH_SHORT).show();
             } else {
-                Toast.makeText(this, "No GPS fix available", Toast.LENGTH_SHORT).show();
+                double lat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
+                double lon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
+                if (lat != 0.0 || lon != 0.0) {
+                    addLocationRow("HOME", lat + "," + lon, true);
+                    saveLocationsToPrefs();
+                    Toast.makeText(this, "Added Last Known Fix as HOME (Omitted)", Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(this, "No GPS fix available yet", Toast.LENGTH_SHORT).show();
+                }
             }
         } catch (Exception e) {
             Toast.makeText(this, "Failed to get location", Toast.LENGTH_SHORT).show();
         }
     }
 
-    // Safely get IP without requiring WiFi permissions
     private String getLocalIpAddress() {
         try {
             for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
@@ -201,7 +279,7 @@ public class MainActivity extends Activity {
                     }
                 }
             }
-        } catch (Exception ex) {}
+        } catch (Exception ignored) {}
         return "127.0.0.1";
     }
 
@@ -209,17 +287,24 @@ public class MainActivity extends Activity {
         String ip = getLocalIpAddress();
         SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd", Locale.US);
         String today = sdf.format(new Date());
-        
-        String url = "http://" + ip + ":" + prefs.getInt("http_port", 8080) + 
+
+        String url = "http://" + ip + ":" + prefs.getInt("http_port", 8080) +
                      "/download?" + prefs.getString("http_user", "admin") + "=" + prefs.getString("http_pass", "password") +
                      "&" + today + "0000&" + today + "1700";
         if (editLink != null) editLink.setText(url);
     }
 
-    private EditText createInput(LinearLayout parent, String hint, String defVal) {
+    private void addLabel(LinearLayout parent, String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        parent.addView(tv);
+    }
+
+    private EditText createLabeledInput(LinearLayout parent, String label, String defVal) {
+        addLabel(parent, label);
         EditText et = new EditText(this);
-        et.setHint(hint);
         et.setText(defVal);
+        et.setSingleLine(true);
         parent.addView(et);
         return et;
     }
@@ -227,18 +312,25 @@ public class MainActivity extends Activity {
     private void addLocationRow(String name, String coords, boolean omitted) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        
+
         EditText eName = new EditText(this);
         eName.setText(name);
         eName.setHint("Name");
-        
+        eName.setWidth(180);
+
         EditText eCoords = new EditText(this);
         eCoords.setText(coords);
         eCoords.setHint("Lat,Lon");
-        
-        Button btnType = new Button(this);
+        eCoords.setWidth(280);
+
+        final Button btnType = new Button(this);
         btnType.setText(omitted ? "OMIT" : "TRACK");
-        btnType.setOnClickListener(v -> btnType.setText(btnType.getText().toString().equals("OMIT") ? "TRACK" : "OMIT"));
+        btnType.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                btnType.setText(btnType.getText().toString().equals("OMIT") ? "TRACK" : "OMIT");
+            }
+        });
 
         row.addView(eName);
         row.addView(eCoords);
@@ -250,73 +342,125 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < locationsLayout.getChildCount(); i++) {
             LinearLayout row = (LinearLayout) locationsLayout.getChildAt(i);
-            String name = ((EditText) row.getChildAt(0)).getText().toString().replace(";", "").replace("|", "");
-            String coords = ((EditText) row.getChildAt(1)).getText().toString().replace(";", "").replace("|", "");
+            String name = ((EditText) row.getChildAt(0)).getText().toString().replace(";", "").replace("|", "").trim();
+            String coords = ((EditText) row.getChildAt(1)).getText().toString().replace(";", "").replace("|", "").trim();
             boolean omit = ((Button) row.getChildAt(2)).getText().toString().equals("OMIT");
-            
-            if (!name.isEmpty() && !coords.isEmpty()) {
+
+            if (name.length() > 0 && coords.length() > 0) {
                 sb.append(name).append("|").append(coords).append("|").append(omit).append(";");
             }
         }
-        prefs.edit().putString("special_locations", sb.toString()).apply();
+        SharedPreferences.Editor ed = prefs.edit();
+        ed.putString("special_locations", sb.toString());
+        ed.commit();
     }
 
     private void loadLocationsFromPrefs() {
         locationsLayout.removeAllViews();
         String saved = prefs.getString("special_locations", "");
-        if (saved.isEmpty()) return;
-        
-        for (String entry : saved.split(";")) {
-            String[] parts = entry.split("\\|");
+        if (saved.length() == 0) {
+            addLocationRow("OFFICE", "", false);
+            return;
+        }
+        String[] entries = saved.split(";");
+        for (int i = 0; i < entries.length; i++) {
+            String[] parts = entries[i].split("\\|");
             if (parts.length == 3) {
                 addLocationRow(parts[0], parts[1], Boolean.parseBoolean(parts[2]));
             }
         }
     }
 
-    private void promptFilename(String defaultName, String title, java.util.function.Consumer<String> action) {
+    private void promptFilename(String defaultName, String title, final FileAction action) {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle(title);
         final EditText input = new EditText(this);
         input.setText(defaultName);
         builder.setView(input);
-        builder.setPositiveButton("OK", (dialog, which) -> action.accept(input.getText().toString()));
-        builder.setNegativeButton("Cancel", (dialog, which) -> dialog.cancel());
+        builder.setPositiveButton("OK", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                action.execute(input.getText().toString().trim());
+            }
+        });
+        builder.setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                dialog.cancel();
+            }
+        });
         builder.show();
     }
 
-    private void exportFile(String filename) {
+    private void exportDb(String filename) {
         try {
-            File sd = Environment.getExternalStorageDirectory();
-            File currentDB = new File(Environment.getDataDirectory(), "/data/" + getPackageName() + "/databases/travel_events.db");
-            File backupDir = new File(sd, "TrackerBackup");
+            File currentDB = getDatabasePath("travel_events.db");
+            File backupDir = new File(Environment.getExternalStorageDirectory(), "TrackerBackup");
             backupDir.mkdirs();
             copyFile(currentDB, new File(backupDir, filename));
-            Toast.makeText(this, "Exported to SD Card: " + filename, Toast.LENGTH_LONG).show();
-        } catch (Exception e) { Toast.makeText(this, "Export failed", Toast.LENGTH_SHORT).show(); }
+            Toast.makeText(this, "Exported DB: " + filename, Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "DB Export failed", Toast.LENGTH_SHORT).show();
+        }
     }
 
-    private void importFile(String filename) {
+    private void importDb(String filename) {
         try {
-            File sd = Environment.getExternalStorageDirectory();
-            File backupFile = new File(sd, "TrackerBackup/" + filename);
-            File currentDB = new File(Environment.getDataDirectory(), "/data/" + getPackageName() + "/databases/travel_events.db");
+            File backupFile = new File(Environment.getExternalStorageDirectory(), "TrackerBackup/" + filename);
+            File currentDB = getDatabasePath("travel_events.db");
             copyFile(backupFile, currentDB);
-            Toast.makeText(this, "Imported. Restarting Tracker...", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Imported DB. Restarting...", Toast.LENGTH_LONG).show();
             if (isTracking) {
                 toggleTracker(false);
                 toggleTracker(true);
             }
-        } catch (Exception e) { Toast.makeText(this, "Import failed", Toast.LENGTH_SHORT).show(); }
+        } catch (Exception e) {
+            Toast.makeText(this, "DB Import failed", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void exportSettings(String filename) {
+        try {
+            File prefsFile = new File(getApplicationInfo().dataDir + "/shared_prefs/TrackerPrefs.xml");
+            File backupDir = new File(Environment.getExternalStorageDirectory(), "TrackerBackup");
+            backupDir.mkdirs();
+            copyFile(prefsFile, new File(backupDir, filename));
+            Toast.makeText(this, "Exported Settings: " + filename, Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Settings Export failed", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void importSettings(String filename) {
+        try {
+            File backupFile = new File(Environment.getExternalStorageDirectory(), "TrackerBackup/" + filename);
+            File prefsFile = new File(getApplicationInfo().dataDir + "/shared_prefs/TrackerPrefs.xml");
+            copyFile(backupFile, prefsFile);
+            Toast.makeText(this, "Imported Settings. Reopen app to view.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Settings Import failed", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void copyFile(File src, File dst) throws Exception {
         FileInputStream fis = new FileInputStream(src);
         FileOutputStream fos = new FileOutputStream(dst);
-        byte[] buffer = new byte[1024];
+        byte[] buffer = new byte[4096];
         int len;
         while ((len = fis.read(buffer)) > 0) fos.write(buffer, 0, len);
         fos.close();
         fis.close();
+    }
+
+    private int parseIntSafe(String s, int def) {
+        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
+    }
+
+    private long parseLongSafe(String s, long def) {
+        try { return Long.parseLong(s.trim()); } catch (Exception e) { return def; }
+    }
+
+    private float parseFloatSafe(String s, float def) {
+        try { return Float.parseFloat(s.trim()); } catch (Exception e) { return def; }
     }
 }
