@@ -30,8 +30,10 @@ import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 public class TrackerService extends Service {
@@ -40,8 +42,8 @@ public class TrackerService extends Service {
     private LocationManager locationManager;
     private AlarmManager alarmManager;
     private PendingIntent pollPendingIntent;
-    private PowerManager.WakeLock wakeLock;
-    private Handler timeoutHandler;
+    private PowerManager.WakeLock persistentWakeLock;
+    private Handler mainHandler;
 
     private SQLiteDatabase db;
     private ServerSocket serverSocket;
@@ -49,45 +51,61 @@ public class TrackerService extends Service {
     private boolean isWaitingForFix = false;
     private SharedPreferences prefs;
 
-    private static final int STATE_UNKNOWN = 0;
-    private static final int STATE_MOVING = 1;
-    private static final int STATE_STATIONARY = 2;
+    // In-memory GPS breadcrumb point
+    private static class GpsPoint {
+        final double lat;
+        final double lon;
+        final long time;
+        final float accuracy;
 
-    private int currentState = STATE_UNKNOWN;
-    private long stateStartTime = 0;
-    private Location lastValidLocation = null;
-    private Location stationaryCandidate = null;
-    private long stationaryCandidateSince = 0;
-    private Location anchorLocation = null;
+        GpsPoint(double lat, double lon, long time, float accuracy) {
+            this.lat = lat;
+            this.lon = lon;
+            this.time = time;
+            this.accuracy = accuracy;
+        }
+    }
 
-    // Accumulated trip distance in meters
-    private double accumulatedTripMeters = 0.0;
-    private String currentPlaceName = "SITE";
-    private String originName = "SITE";
+    private static class PlaceMatch {
+        final String name;
+        final boolean omitted;
+        PlaceMatch(String n, boolean o) { name = n; omitted = o; }
+    }
 
+    // Confirmed Stay Anchor State
+    private GpsPoint confirmedAnchor = null;
+    private PlaceMatch confirmedPlace = null;
+    private long confirmedStayStart = 0;
+    private long confirmedStayLastSeen = 0;
+
+    // In-Memory Candidate Trip Buffer (only committed once destination stay is verified)
+    private final List<GpsPoint> tripBuffer = new ArrayList<GpsPoint>();
+    private GpsPoint clusterCenter = null;
+    private long clusterStartTime = 0;
+
+    private GpsPoint lastValidPoint = null;
     private static long blockConnectionsUntil = 0;
 
     @Override
     public void onCreate() {
         super.onCreate();
         prefs = getSharedPreferences("TrackerPrefs", MODE_PRIVATE);
-        timeoutHandler = new Handler(Looper.getMainLooper());
+        mainHandler = new Handler(Looper.getMainLooper());
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
 
+        // Hold a continuous PARTIAL_WAKE_LOCK while service is running so CPU never sleeps
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm != null) {
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TravelTracker:PollWakeLock");
-            wakeLock.setReferenceCounted(false);
+            persistentWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TravelTracker: continuousLock");
+            persistentWakeLock.setReferenceCounted(false);
+            persistentWakeLock.acquire();
         }
 
-        // Restore last known valid fix from preferences so coordinates are never 0,0
         double savedLat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
         double savedLon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
-        if (savedLat != 0.0 || savedLon != 0.0) {
-            lastValidLocation = new Location("saved");
-            lastValidLocation.setLatitude(savedLat);
-            lastValidLocation.setLongitude(savedLon);
+        if (isValidCoordinate(savedLat, savedLon)) {
+            lastValidPoint = new GpsPoint(savedLat, savedLon, System.currentTimeMillis(), 20.0f);
         }
 
         db = new SQLiteOpenHelper(this, "travel_events.db", null, 2) {
@@ -106,19 +124,31 @@ public class TrackerService extends Service {
         }.getWritableDatabase();
 
         startForegroundCompatible();
-        scheduleAlarmPolling();
+        scheduleNextPoll(500L);
+        startPeriodicHandlerFallback();
         startHttpServer();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (persistentWakeLock != null && !persistentWakeLock.isHeld()) {
+            try { persistentWakeLock.acquire(); } catch (Exception ignored) {}
+        }
         if (intent != null && ACTION_POLL.equals(intent.getAction())) {
+            long interval = Math.max(10000L, prefs.getLong("interval", 60000L));
+            scheduleNextPoll(interval);
             triggerSingleLocationPoll();
         }
         return 1; // START_STICKY
     }
 
-    // Android 1.6 (API 4) to Android 14 (API 34) compatible foreground notification
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        // Immediately reschedule if swiped away from recents
+        scheduleNextPoll(2000L);
+        super.onTaskRemoved(rootIntent);
+    }
+
     @SuppressWarnings("deprecation")
     private void startForegroundCompatible() {
         Intent intent = new Intent(this, MainActivity.class);
@@ -132,7 +162,7 @@ public class TrackerService extends Service {
             ((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE)).createNotificationChannel(channel);
             notification = new Notification.Builder(this, channelId)
                     .setContentTitle("Travel Expense Tracker Active")
-                    .setContentText("Recording location at preset intervals.")
+                    .setContentText("Recording verified site stays and trips.")
                     .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                     .setContentIntent(pi)
                     .setOngoing(true)
@@ -140,7 +170,7 @@ public class TrackerService extends Service {
         } else if (Build.VERSION.SDK_INT >= 16) {
             notification = new Notification.Builder(this)
                     .setContentTitle("Travel Expense Tracker Active")
-                    .setContentText("Recording location at preset intervals.")
+                    .setContentText("Recording verified site stays and trips.")
                     .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                     .setContentIntent(pi)
                     .setOngoing(true)
@@ -148,18 +178,17 @@ public class TrackerService extends Service {
         } else if (Build.VERSION.SDK_INT >= 11) {
             notification = new Notification.Builder(this)
                     .setContentTitle("Travel Expense Tracker Active")
-                    .setContentText("Recording location at preset intervals.")
+                    .setContentText("Recording verified site stays and trips.")
                     .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                     .setContentIntent(pi)
                     .setOngoing(true)
                     .getNotification();
         } else {
-            // Android 1.6 - 2.3 (API 4 - 10)
             notification = new Notification(android.R.drawable.ic_menu_mylocation, "Travel Expense Tracker Active", System.currentTimeMillis());
             notification.flags |= Notification.FLAG_ONGOING_EVENT;
             try {
                 Method m = notification.getClass().getMethod("setLatestEventInfo", Context.class, CharSequence.class, CharSequence.class, PendingIntent.class);
-                m.invoke(notification, this, "Travel Expense Tracker Active", "Recording location at preset intervals.", pi);
+                m.invoke(notification, this, "Travel Expense Tracker Active", "Recording verified site stays and trips.", pi);
             } catch (Exception ignored) {}
         }
 
@@ -168,7 +197,6 @@ public class TrackerService extends Service {
         } else if (Build.VERSION.SDK_INT >= 5) {
             startForeground(1, notification);
         } else {
-            // Android 1.6 (API 4) fallback
             try {
                 Method setFg = Service.class.getMethod("setForeground", boolean.class);
                 setFg.invoke(this, true);
@@ -177,26 +205,45 @@ public class TrackerService extends Service {
         }
     }
 
-    private void scheduleAlarmPolling() {
-        long interval = prefs.getLong("interval", 60000L);
-        if (interval < 10000L) interval = 10000L;
-
+    // Schedules exact wake-up alarms even in Android 6+ Doze mode
+    private void scheduleNextPoll(long delayMs) {
+        if (alarmManager == null) return;
         Intent pollIntent = new Intent(this, TrackerService.class);
         pollIntent.setAction(ACTION_POLL);
         int piFlags = Build.VERSION.SDK_INT >= 23 ? (PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE) : PendingIntent.FLAG_UPDATE_CURRENT;
         pollPendingIntent = PendingIntent.getService(this, 0, pollIntent, piFlags);
 
-        alarmManager.setRepeating(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 1000L, interval, pollPendingIntent);
+        long triggerAt = System.currentTimeMillis() + delayMs;
+        try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pollPendingIntent);
+            } else if (Build.VERSION.SDK_INT >= 19) {
+                alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pollPendingIntent);
+            } else {
+                alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pollPendingIntent);
+            }
+        } catch (Exception e) {
+            alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pollPendingIntent);
+        }
+    }
+
+    // Secondary in-process heartbeat tied to the continuous WakeLock
+    private void startPeriodicHandlerFallback() {
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!isRunning) return;
+                triggerSingleLocationPoll();
+                long interval = Math.max(10000L, prefs.getLong("interval", 60000L));
+                mainHandler.postDelayed(this, interval);
+            }
+        }, Math.max(10000L, prefs.getLong("interval", 60000L)));
     }
 
     private void triggerSingleLocationPoll() {
         if (!isWorkingTime() || isWaitingForFix) return;
-
-        if (wakeLock != null && !wakeLock.isHeld()) {
-            wakeLock.acquire(15000L);
-        }
-
         isWaitingForFix = true;
+
         try {
             if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0L, 0.0f, oneShotListener);
@@ -206,8 +253,7 @@ public class TrackerService extends Service {
             }
         } catch (SecurityException ignored) {}
 
-        // Shut off GPS radio after 12 seconds if no fresh satellite fix arrives, and reuse last known location
-        timeoutHandler.postDelayed(fixTimeoutRunnable, 12000L);
+        mainHandler.postDelayed(fixTimeoutRunnable, 12000L);
     }
 
     private final Runnable fixTimeoutRunnable = new Runnable() {
@@ -215,11 +261,10 @@ public class TrackerService extends Service {
         public void run() {
             if (!isWaitingForFix) return;
             stopListeningForFix();
-            Location fallback = getBestFallbackLocation();
+            GpsPoint fallback = getBestFallbackPoint();
             if (fallback != null) {
-                processLocation(fallback);
+                onPointSampled(fallback);
             }
-            releaseWakeLock();
         }
     };
 
@@ -227,13 +272,19 @@ public class TrackerService extends Service {
         @Override
         public void onLocationChanged(Location location) {
             if (location == null || !isValidCoordinate(location.getLatitude(), location.getLongitude())) {
-                return; // Ignore invalid 0,0 fixes
+                return;
             }
-            timeoutHandler.removeCallbacks(fixTimeoutRunnable);
+            // Ignore wildly inaccurate cell-tower jumps (> 200m accuracy) if we already have a fix
+            if (location.hasAccuracy() && location.getAccuracy() > 200.0f && lastValidPoint != null) {
+                return;
+            }
+            mainHandler.removeCallbacks(fixTimeoutRunnable);
             stopListeningForFix();
-            saveValidLocation(location);
-            processLocation(location);
-            releaseWakeLock();
+
+            float acc = location.hasAccuracy() ? location.getAccuracy() : 25.0f;
+            GpsPoint pt = new GpsPoint(location.getLatitude(), location.getLongitude(), System.currentTimeMillis(), acc);
+            saveValidPoint(pt);
+            onPointSampled(pt);
         }
 
         @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
@@ -248,62 +299,68 @@ public class TrackerService extends Service {
         } catch (Exception ignored) {}
     }
 
-    private void releaseWakeLock() {
-        if (wakeLock != null && wakeLock.isHeld()) {
-            try { wakeLock.release(); } catch (Exception ignored) {}
-        }
-    }
-
     private boolean isValidCoordinate(double lat, double lon) {
         return Math.abs(lat) > 0.0001 || Math.abs(lon) > 0.0001;
     }
 
-    private void saveValidLocation(Location loc) {
-        lastValidLocation = new Location(loc);
+    private void saveValidPoint(GpsPoint pt) {
+        lastValidPoint = pt;
         SharedPreferences.Editor ed = prefs.edit();
-        ed.putLong("last_valid_lat", Double.doubleToRawLongBits(loc.getLatitude()));
-        ed.putLong("last_valid_lon", Double.doubleToRawLongBits(loc.getLongitude()));
+        ed.putLong("last_valid_lat", Double.doubleToRawLongBits(pt.lat));
+        ed.putLong("last_valid_lon", Double.doubleToRawLongBits(pt.lon));
         ed.commit();
     }
 
-    private Location getBestFallbackLocation() {
+    private GpsPoint getBestFallbackPoint() {
+        long now = System.currentTimeMillis();
         try {
             Location gps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
             if (gps != null && isValidCoordinate(gps.getLatitude(), gps.getLongitude())) {
-                saveValidLocation(gps);
-                return gps;
+                GpsPoint p = new GpsPoint(gps.getLatitude(), gps.getLongitude(), now, gps.hasAccuracy() ? gps.getAccuracy() : 30.0f);
+                saveValidPoint(p);
+                return p;
             }
             Location net = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
             if (net != null && isValidCoordinate(net.getLatitude(), net.getLongitude())) {
-                saveValidLocation(net);
-                return net;
+                GpsPoint p = new GpsPoint(net.getLatitude(), net.getLongitude(), now, net.hasAccuracy() ? net.getAccuracy() : 50.0f);
+                saveValidPoint(p);
+                return p;
             }
         } catch (SecurityException ignored) {}
-        return lastValidLocation;
+
+        if (lastValidPoint != null) {
+            return new GpsPoint(lastValidPoint.lat, lastValidPoint.lon, now, lastValidPoint.accuracy);
+        }
+        return null;
     }
 
-    private static class PlaceMatch {
-        String name;
-        boolean omitted;
-        PlaceMatch(String n, boolean o) { name = n; omitted = o; }
+    // Accurate Haversine distance in meters between two lat/lon pairs
+    private static double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
+        double R = 6371000.0;
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+        double a = Math.sin(dLat / 2.0) * Math.sin(dLat / 2.0) +
+                   Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+                   Math.sin(dLon / 2.0) * Math.sin(dLon / 2.0);
+        double c = 2.0 * Math.atan2(Math.sqrt(a), Math.sqrt(1.0 - a));
+        return R * c;
     }
 
-    private PlaceMatch getPlace(Location loc) {
+    private PlaceMatch getPlace(double lat, double lon) {
         String saved = prefs.getString("special_locations", "");
         if (saved.length() == 0) return new PlaceMatch("SITE", false);
 
-        float threshold = prefs.getFloat("distance", 50.0f);
+        float threshold = Math.max(50.0f, prefs.getFloat("distance", 75.0f));
         String[] entries = saved.split(";");
         for (int i = 0; i < entries.length; i++) {
             String[] parts = entries[i].split("\\|");
             if (parts.length == 3) {
                 try {
                     String[] coords = parts[1].split(",");
-                    Location sLoc = new Location("");
-                    sLoc.setLatitude(Double.parseDouble(coords[0].trim()));
-                    sLoc.setLongitude(Double.parseDouble(coords[1].trim()));
-                    if (loc.distanceTo(sLoc) <= threshold) {
-                        return new PlaceMatch(parts[0], Boolean.parseBoolean(parts[2]));
+                    double sLat = Double.parseDouble(coords[0].trim());
+                    double sLon = Double.parseDouble(coords[1].trim());
+                    if (distanceMeters(lat, lon, sLat, sLon) <= threshold) {
+                        return new PlaceMatch(parts[0].trim(), Boolean.parseBoolean(parts[2].trim()));
                     }
                 } catch (Exception ignored) {}
             }
@@ -311,65 +368,119 @@ public class TrackerService extends Service {
         return new PlaceMatch("SITE", false);
     }
 
-    private void processLocation(Location location) {
-        long now = System.currentTimeMillis();
-        float distThreshold = prefs.getFloat("distance", 50.0f);
-        long stayRequiredMs = prefs.getInt("stay_mins", 5) * 60000L;
-        if (stayRequiredMs < 60000L) stayRequiredMs = 60000L;
+    // Core In-Memory Trajectory & Stay Verification Engine
+    private void onPointSampled(GpsPoint pt) {
+        float siteRadius = Math.max(50.0f, prefs.getFloat("distance", 75.0f));
+        long stayRequiredMs = Math.max(60000L, prefs.getInt("stay_mins", 5) * 60000L);
 
-        if (currentState == STATE_UNKNOWN) {
-            currentState = STATE_STATIONARY;
-            stateStartTime = now;
-            anchorLocation = location;
-            stationaryCandidate = location;
-            stationaryCandidateSince = now;
-            currentPlaceName = getPlace(location).name;
-            originName = currentPlaceName;
-            accumulatedTripMeters = 0.0;
+        // 1. First point ever recorded: lock initial anchor
+        if (confirmedAnchor == null) {
+            confirmedAnchor = pt;
+            confirmedPlace = getPlace(pt.lat, pt.lon);
+            confirmedStayStart = pt.time;
+            confirmedStayLastSeen = pt.time;
             return;
         }
 
-        if (currentState == STATE_STATIONARY) {
-            float moveDist = location.distanceTo(anchorLocation);
-            if (moveDist > distThreshold) {
-                PlaceMatch origin = getPlace(anchorLocation);
-                // Record completed stay duration (0 distance for a stay)
-                if (!origin.omitted) {
-                    logEvent("STAY AT " + currentPlaceName, anchorLocation.getLatitude(), anchorLocation.getLongitude(), stateStartTime, now, 0.0);
-                }
+        // 2. If we have no active trip buffer, check if we are still at confirmedAnchor
+        if (tripBuffer.isEmpty()) {
+            double distFromAnchor = distanceMeters(confirmedAnchor.lat, confirmedAnchor.lon, pt.lat, pt.lon);
+            PlaceMatch currentMatch = getPlace(pt.lat, pt.lon);
 
-                // Transition to moving & start accumulating trip distance
-                currentState = STATE_MOVING;
-                stateStartTime = now;
-                originName = currentPlaceName;
-                accumulatedTripMeters = moveDist;
-                stationaryCandidate = location;
-                stationaryCandidateSince = now;
+            // Same named location OR within radius -> still at the same site
+            boolean sameNamedSite = !confirmedPlace.name.equals("SITE") && confirmedPlace.name.equalsIgnoreCase(currentMatch.name);
+            if (distFromAnchor <= siteRadius || sameNamedSite) {
+                confirmedStayLastSeen = pt.time;
+                return;
             }
-        } else if (currentState == STATE_MOVING) {
-            float stepDist = location.distanceTo(stationaryCandidate);
-            if (stepDist <= distThreshold) {
-                // Staying within radius of candidate destination
-                if ((now - stationaryCandidateSince) >= stayRequiredMs) {
-                    PlaceMatch dest = getPlace(stationaryCandidate);
-                    String tripName = buildTripName(originName, dest.name);
 
-                    // Record trip and accumulated distance now that user has stayed for preset interval
-                    logEvent(tripName, stationaryCandidate.getLatitude(), stationaryCandidate.getLongitude(), stateStartTime, stationaryCandidateSince, accumulatedTripMeters);
+            // Moved outside site radius: start buffering points in memory
+            tripBuffer.add(confirmedAnchor);
+            tripBuffer.add(pt);
+            clusterCenter = pt;
+            clusterStartTime = pt.time;
+            return;
+        }
 
-                    currentState = STATE_STATIONARY;
-                    stateStartTime = stationaryCandidateSince;
-                    anchorLocation = stationaryCandidate;
-                    currentPlaceName = dest.name;
-                    accumulatedTripMeters = 0.0;
+        // 3. Currently buffering a potential trip in memory
+        GpsPoint prevPt = tripBuffer.get(tripBuffer.size() - 1);
+        double stepDist = distanceMeters(prevPt.lat, prevPt.lon, pt.lat, pt.lon);
+        // Only append breadcrumb if movement exceeds GPS jitter floor (15m)
+        if (stepDist >= 15.0) {
+            tripBuffer.add(pt);
+        }
+
+        double distFromCluster = distanceMeters(clusterCenter.lat, clusterCenter.lon, pt.lat, pt.lon);
+        if (distFromCluster <= siteRadius) {
+            // User is stationary around clusterCenter; check if stay duration is met
+            if ((pt.time - clusterStartTime) >= stayRequiredMs) {
+                PlaceMatch newPlace = getPlace(clusterCenter.lat, clusterCenter.lon);
+                double netDisplacement = distanceMeters(confirmedAnchor.lat, confirmedAnchor.lon, clusterCenter.lat, clusterCenter.lon);
+
+                boolean sameNamedPlace = !confirmedPlace.name.equals("SITE") && confirmedPlace.name.equalsIgnoreCase(newPlace.name);
+                booleanreturnedToSameSpot = netDisplacement <= siteRadius;
+
+                if (sameNamedPlace || returnedToSameSpot) {
+                    // False alarm / GPS drift / returned to same site without staying elsewhere:
+                    // Discard buffer so we NEVER log "OFFICE TO OFFICE" or "HOME TO HOME"
+                    confirmedStayLastSeen = pt.time;
+                    tripBuffer.clear();
+                    clusterCenter = null;
+                    return;
                 }
-            } else {
-                // Still moving: accumulate distance and reset stationary candidate timer
-                accumulatedTripMeters += stepDist;
-                stationaryCandidate = location;
-                stationaryCandidateSince = now;
+
+                // VALIDATED TRIP TO A NEW LOCATION:
+                // Step A: Commit the finished stay at the previous anchor (if not omitted)
+                long departureTime = tripBuffer.size() > 1 ? tripBuffer.get(1).time : confirmedStayLastSeen;
+                if (departureTime < confirmedStayLastSeen) departureTime = confirmedStayLastSeen;
+
+                if (!confirmedPlace.omitted && (departureTime - confirmedStayStart) >= 60000L) {
+                    logEvent("STAY AT " + confirmedPlace.name, confirmedAnchor.lat, confirmedAnchor.lon, confirmedStayStart, departureTime, 0.0);
+                }
+
+                // Step B: Calculate verified trip distance across buffered points (prior to cluster arrival)
+                double pathMeters = calculateBufferedTripMeters(clusterCenter, siteRadius);
+                if (pathMeters < netDisplacement) {
+                    pathMeters = netDisplacement; // Never allow distance < straight-line displacement
+                }
+
+                String tripType = buildTripName(confirmedPlace.name, newPlace.name);
+                long arrivalTime = Math.max(departureTime + 1000L, clusterStartTime);
+                logEvent(tripType, clusterCenter.lat, clusterCenter.lon, departureTime, arrivalTime, pathMeters);
+
+                // Step C: Lock in the new confirmed stay anchor
+                confirmedAnchor = clusterCenter;
+                confirmedPlace = newPlace;
+                confirmedStayStart = clusterStartTime;
+                confirmedStayLastSeen = pt.time;
+                tripBuffer.clear();
+                clusterCenter = null;
+            }
+        } else {
+            // Still moving: shift candidate cluster center to current point
+            clusterCenter = pt;
+            clusterStartTime = pt.time;
+        }
+    }
+
+    private double calculateBufferedTripMeters(GpsPoint destCenter, float siteRadius) {
+        double total = 0.0;
+        if (tripBuffer.size() < 2) return 0.0;
+
+        GpsPoint prev = tripBuffer.get(0);
+        for (int i = 1; i < tripBuffer.size(); i++) {
+            GpsPoint curr = tripBuffer.get(i);
+            double step = distanceMeters(prev.lat, prev.lon, curr.lat, curr.lon);
+            // Filter out stationary jitter inside the destination cluster after arrival
+            if (curr.time > clusterStartTime && distanceMeters(destCenter.lat, destCenter.lon, curr.lat, curr.lon) <= siteRadius) {
+                continue;
+            }
+            if (step >= 15.0) {
+                total += step;
+                prev = curr;
             }
         }
+        return total;
     }
 
     private String buildTripName(String orig, String dest) {
@@ -380,7 +491,7 @@ public class TrackerService extends Service {
     }
 
     private void logEvent(String type, double lat, double lon, long start, long end, double distanceMeters) {
-        if ((end - start) < 30000L) return;
+        if (end <= start) return;
         double hours = (end - start) / 3600000.0;
         double distKm = distanceMeters / 1000.0;
         double distMi = distanceMeters / 1609.344;
@@ -455,8 +566,9 @@ public class TrackerService extends Service {
                 return;
             }
 
-            StringBuilder csv = new StringBuilder("Event Type,Latitude,Longitude,Start Time,End Time,Duration (Hours),Distance (km),Distance (mi)\n");
-            Cursor c = db.rawQuery("SELECT type, lat, lon, start_time, end_time, duration_hours, dist_km, dist_mi FROM events WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC",
+            // Distance (km) moved to the last column as requested
+            StringBuilder csv = new StringBuilder("Event Type,Latitude,Longitude,Start Time,End Time,Duration (Hours),Distance (mi),Distance (km)\n");
+            Cursor c = db.rawQuery("SELECT type, lat, lon, start_time, end_time, duration_hours, dist_mi, dist_km FROM events WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC",
                     new String[]{String.valueOf(qStart), String.valueOf(qEnd)});
 
             SimpleDateFormat outFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
@@ -493,13 +605,21 @@ public class TrackerService extends Service {
         if (alarmManager != null && pollPendingIntent != null) {
             alarmManager.cancel(pollPendingIntent);
         }
-        timeoutHandler.removeCallbacks(fixTimeoutRunnable);
+        mainHandler.removeCallbacksAndMessages(null);
         stopListeningForFix();
-        releaseWakeLock();
 
-        if (currentState != STATE_UNKNOWN && lastValidLocation != null) {
-            logEvent("TRACKING STOPPED AT " + currentPlaceName, lastValidLocation.getLatitude(), lastValidLocation.getLongitude(), stateStartTime, System.currentTimeMillis(), accumulatedTripMeters);
+        // Flush any confirmed non-omitted stay before stopping
+        if (confirmedAnchor != null && confirmedPlace != null && !confirmedPlace.omitted) {
+            long end = Math.max(confirmedStayLastSeen, System.currentTimeMillis());
+            if ((end - confirmedStayStart) >= 60000L) {
+                logEvent("STAY AT " + confirmedPlace.name, confirmedAnchor.lat, confirmedAnchor.lon, confirmedStayStart, end, 0.0);
+            }
         }
+
+        if (persistentWakeLock != null && persistentWakeLock.isHeld()) {
+            try { persistentWakeLock.release(); } catch (Exception ignored) {}
+        }
+
         try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
         if (db != null) db.close();
         if (Build.VERSION.SDK_INT < 5) {
@@ -512,4 +632,4 @@ public class TrackerService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-}
+            }
