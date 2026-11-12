@@ -418,7 +418,7 @@ public class TrackerService extends Service {
                 double netDisplacement = distanceMeters(confirmedAnchor.lat, confirmedAnchor.lon, clusterCenter.lat, clusterCenter.lon);
 
                 boolean sameNamedPlace = !confirmedPlace.name.equals("SITE") && confirmedPlace.name.equalsIgnoreCase(newPlace.name);
-                booleanreturnedToSameSpot = netDisplacement <= siteRadius;
+                boolean returnedToSameSpot = netDisplacement <= siteRadius;
 
                 if (sameNamedPlace || returnedToSameSpot) {
                     // False alarm / GPS drift / returned to same site without staying elsewhere:
