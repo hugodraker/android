@@ -6,6 +6,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -96,6 +97,7 @@ public class TrackerService extends Service {
     private final List<GpsPoint> memoryPoints = new ArrayList<GpsPoint>();
     private GpsPoint clusterCenter = null;
     private long clusterStartTime = 0;
+    private long activeTripRowId = -1;
 
     // Latest hardware GNSS location received from native LocationManager
     private GpsPoint latestHardwarePoint = null;
@@ -194,11 +196,14 @@ public class TrackerService extends Service {
                     startHttpServer();
                 }
             } else if (ACTION_ERASE_DATA.equals(action)) {
-                try { db.execSQL("DELETE FROM events"); } catch (Exception ignored) {}
-                memoryPoints.clear();
-                confirmedAnchor = null;
-                confirmedPlace = null;
-                clusterCenter = null;
+                synchronized (this) {
+                    try { db.execSQL("DELETE FROM events"); } catch (Exception ignored) {}
+                    memoryPoints.clear();
+                    confirmedAnchor = null;
+                    confirmedPlace = null;
+                    clusterCenter = null;
+                    activeTripRowId = -1;
+                }
             }
         }
         return 1; // START_STICKY
@@ -266,12 +271,6 @@ public class TrackerService extends Service {
         }
     }
 
-    /**
-     * Organic Maps-style native GNSS provider registration:
-     * Uses pure Android LocationManager without Google Play Services.
-     * While acquiring initial satellite lock, keeps GPS hardware powered at 1000ms (0m)
-     * so cold-start satellite ephemeris download is never interrupted prematurely.
-     */
     private void startNativeGnssProviders() {
         if (locationManager == null) return;
         try {
@@ -279,7 +278,6 @@ public class TrackerService extends Service {
         } catch (Exception ignored) {}
 
         long userInterval = Math.max(1000L, prefs.getLong("interval", 60000L));
-        // Keep GPS chip active at 1s until first satellite fix locks; afterwards poll at min(userInterval, 5000ms)
         long gnssRate = hasAcquiredLiveFix ? Math.min(userInterval, 5000L) : 1000L;
 
         try {
@@ -299,7 +297,6 @@ public class TrackerService extends Service {
             }
         } catch (Exception ignored) {}
 
-        // Seed from any existing kernel last-known location immediately if we have nothing yet
         if (lastValidPoint == null) {
             GpsPoint seed = queryLastKnownNativePoint(System.currentTimeMillis());
             if (seed != null) {
@@ -315,7 +312,6 @@ public class TrackerService extends Service {
             if (location == null || !isValidCoordinate(location.getLatitude(), location.getLongitude())) {
                 return;
             }
-            // If we already have a strong GPS satellite fix, ignore coarse network jumps (>100m)
             if (hasAcquiredLiveFix && !"gps".equalsIgnoreCase(location.getProvider())
                     && location.hasAccuracy() && location.getAccuracy() > 100.0f) {
                 return;
@@ -327,10 +323,16 @@ public class TrackerService extends Service {
             latestHardwarePoint = pt;
             saveValidPoint(pt);
 
-            // Immediately populate UI on the very first satellite fix, then switch to interval cadence
+            long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
             if (!hasAcquiredLiveFix) {
                 hasAcquiredLiveFix = true;
                 startNativeGnssProviders();
+                lastProcessedIntervalTime = now;
+                if (isWorkingTime()) {
+                    onPointSampled(pt);
+                }
+                broadcastCoordinateUpdate();
+            } else if (now - lastProcessedIntervalTime >= interval) {
                 lastProcessedIntervalTime = now;
                 if (isWorkingTime()) {
                     onPointSampled(pt);
@@ -356,7 +358,6 @@ public class TrackerService extends Service {
         }, 2000L);
     }
 
-    // Runs strictly at the user's preset interval to sample coordinates, update UI box, and evaluate site moves
     private void processIntervalTick() {
         long now = System.currentTimeMillis();
         long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
@@ -469,7 +470,6 @@ public class TrackerService extends Service {
     private PlaceMatch getPlace(double lat, double lon) {
         String saved = prefs.getString("special_locations", "");
         if (saved.length() > 0) {
-            // Supports small radii like 0.5m (.5m) without clamping to 25m
             float threshold = Math.max(0.05f, prefs.getFloat("distance", 75.0f));
             String[] entries = saved.split(";");
             PlaceMatch bestMatch = null;
@@ -495,12 +495,18 @@ public class TrackerService extends Service {
         return new PlaceMatch("SITE", lat, lon, false, false);
     }
 
-    // In-Memory Trajectory Engine supporting sub-meter (.5m) radii
-    private void onPointSampled(GpsPoint pt) {
+    /**
+     * In-Memory Trajectory Engine with Live SQLite Synchronization:
+     * 1. Holds trajectory breadcrumbs in memoryPoints while moving.
+     * 2. Immediately inserts and updates the active trip row in SQLite as soon as movement >= siteRadius occurs,
+     *    so the HTTP server always displays current trip data without waiting for stay_mins to elapse.
+     * 3. Uses GPS-jitter-tolerant stationary detection to finalize the trip after stay_mins at the destination.
+     */
+    private synchronized void onPointSampled(GpsPoint pt) {
         float siteRadius = Math.max(0.05f, prefs.getFloat("distance", 75.0f));
         long pollIntervalMs = Math.max(1000L, prefs.getLong("interval", 60000L));
         int stayMins = prefs.getInt("stay_mins", 5);
-        long stayRequiredMs = (stayMins <= 0) ? pollIntervalMs : (stayMins * 60000L);
+        long stayRequiredMs = (stayMins <= 0) ? 0L : (stayMins * 60000L);
 
         // 1. Lock initial starting site if none exists yet
         if (confirmedAnchor == null) {
@@ -513,37 +519,48 @@ public class TrackerService extends Service {
             return;
         }
 
-        // 2. While no trip is active, check if still within current starting site
+        // 2. While no trip is active, check if user moved outside siteRadius
         if (memoryPoints.isEmpty()) {
             double distFromAnchor = distanceMeters(confirmedAnchor.lat, confirmedAnchor.lon, pt.lat, pt.lon);
             PlaceMatch currentMatch = getPlace(pt.lat, pt.lon);
             boolean sameKnownSite = confirmedPlace.isKnown && currentMatch.isKnown && confirmedPlace.name.equalsIgnoreCase(currentMatch.name);
 
-            if (distFromAnchor <= siteRadius || sameKnownSite) {
+            if (distFromAnchor < siteRadius || sameKnownSite) {
                 confirmedStayLastSeen = pt.time;
                 persistAnchorState();
                 return;
             }
 
-            // Moved outside current site radius (even if .5m): start buffering in memory
+            // Moved outside siteRadius: start buffering in memory and immediately create live DB row
             long departTime = confirmedStayLastSeen;
-            if ((pt.time - departTime) > (pollIntervalMs * 3L)) {
+            if (departTime <= 0 || (pt.time - departTime) > (pollIntervalMs * 3L)) {
                 departTime = pt.time - pollIntervalMs;
             }
             memoryPoints.add(new GpsPoint(confirmedAnchor.lat, confirmedAnchor.lon, departTime, confirmedAnchor.accuracy));
             memoryPoints.add(pt);
             clusterCenter = pt;
             clusterStartTime = pt.time;
+            activeTripRowId = -1;
+
+            syncActiveTripToDb(pt, siteRadius);
+
+            if (stayRequiredMs <= 0L) {
+                finalizeActiveTrip(pt, siteRadius);
+            }
             return;
         }
 
-        // 3. Currently moving: append to in-memory buffer
+        // 3. Trip is currently in progress in memory: append new point
         memoryPoints.add(pt);
+        syncActiveTripToDb(pt, siteRadius);
 
+        // Stationary detection tolerance accounts for natural 5-15m GPS drift so small .5m radius settings don't reset forever
+        float stationaryTolerance = Math.max(siteRadius, Math.min(20.0f, Math.max(6.0f, pt.accuracy)));
         double distFromCluster = distanceMeters(clusterCenter.lat, clusterCenter.lon, pt.lat, pt.lon);
-        if (distFromCluster <= siteRadius) {
+
+        if (distFromCluster <= stationaryTolerance) {
             if ((pt.time - clusterStartTime) >= stayRequiredMs) {
-                commitBufferedTripIfValid(pt.time, siteRadius);
+                finalizeActiveTrip(pt, siteRadius);
             }
         } else {
             clusterCenter = pt;
@@ -551,26 +568,29 @@ public class TrackerService extends Service {
         }
     }
 
-    private void commitBufferedTripIfValid(long nowTime, float siteRadius) {
-        if (confirmedAnchor == null || clusterCenter == null || memoryPoints.isEmpty()) return;
+    // Live-inserts or updates the in-progress trip row in SQLite so HTTP queries always return current data
+    private void syncActiveTripToDb(GpsPoint latestPt, float siteRadius) {
+        if (confirmedAnchor == null || memoryPoints.size() < 2) return;
 
-        PlaceMatch newPlace = getPlace(clusterCenter.lat, clusterCenter.lon);
-        double destLat = newPlace.isKnown ? newPlace.lat : clusterCenter.lat;
-        double destLon = newPlace.isKnown ? newPlace.lon : clusterCenter.lon;
+        GpsPoint destTarget = (clusterCenter != null) ? clusterCenter : latestPt;
+        PlaceMatch newPlace = getPlace(destTarget.lat, destTarget.lon);
+        double destLat = newPlace.isKnown ? newPlace.lat : latestPt.lat;
+        double destLon = newPlace.isKnown ? newPlace.lon : latestPt.lon;
 
-        // Starting point coordinates
         double startLat = confirmedAnchor.lat;
         double startLon = confirmedAnchor.lon;
 
         double linearDist = distanceMeters(startLat, startLon, destLat, destLon);
         boolean sameKnownPlace = confirmedPlace.isKnown && newPlace.isKnown && confirmedPlace.name.equalsIgnoreCase(newPlace.name);
-        boolean returnedToSameSite = linearDist <= siteRadius;
 
-        if (sameKnownPlace || returnedToSameSite) {
-            confirmedStayLastSeen = nowTime;
-            persistAnchorState();
-            memoryPoints.clear();
-            clusterCenter = null;
+        if (sameKnownPlace || linearDist < siteRadius) {
+            // Returned to origin site before finishing stay elsewhere: remove temporary row
+            if (activeTripRowId != -1) {
+                try {
+                    db.delete("events", "id = ?", new String[]{String.valueOf(activeTripRowId)});
+                } catch (Exception ignored) {}
+                activeTripRowId = -1;
+            }
             return;
         }
 
@@ -578,17 +598,72 @@ public class TrackerService extends Service {
         double finalDistMeters = Math.max(rollingDist, linearDist);
 
         long departTime = memoryPoints.get(0).time;
-        long arriveTime = Math.max(departTime + 1000L, clusterStartTime);
+        long arriveTime = Math.max(departTime + 1000L, latestPt.time);
         String eventType = buildTripName(confirmedPlace.name, newPlace.name);
 
-        // Log event with starting point coordinates
-        logEvent(eventType, startLat, startLon, departTime, arriveTime, finalDistMeters);
+        double hours = (arriveTime - departTime) / 3600000.0;
+        double distKm = finalDistMeters / 1000.0;
+        double distMi = finalDistMeters / 1609.344;
+
+        ContentValues cv = new ContentValues();
+        cv.put("type", eventType);
+        cv.put("lat", startLat);
+        cv.put("lon", startLon);
+        cv.put("start_time", departTime);
+        cv.put("end_time", arriveTime);
+        cv.put("duration_hours", hours);
+        cv.put("dist_km", distKm);
+        cv.put("dist_mi", distMi);
+
+        try {
+            if (activeTripRowId == -1) {
+                activeTripRowId = db.insert("events", null, cv);
+            } else {
+                int updated = db.update("events", cv, "id = ?", new String[]{String.valueOf(activeTripRowId)});
+                if (updated <= 0) {
+                    activeTripRowId = db.insert("events", null, cv);
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void finalizeActiveTrip(GpsPoint pt, float siteRadius) {
+        if (confirmedAnchor == null || clusterCenter == null || memoryPoints.isEmpty()) return;
+
+        PlaceMatch newPlace = getPlace(clusterCenter.lat, clusterCenter.lon);
+        double destLat = newPlace.isKnown ? newPlace.lat : clusterCenter.lat;
+        double destLon = newPlace.isKnown ? newPlace.lon : clusterCenter.lon;
+
+        double startLat = confirmedAnchor.lat;
+        double startLon = confirmedAnchor.lon;
+
+        double linearDist = distanceMeters(startLat, startLon, destLat, destLon);
+        boolean sameKnownPlace = confirmedPlace.isKnown && newPlace.isKnown && confirmedPlace.name.equalsIgnoreCase(newPlace.name);
+
+        if (sameKnownPlace || linearDist < siteRadius) {
+            if (activeTripRowId != -1) {
+                try {
+                    db.delete("events", "id = ?", new String[]{String.valueOf(activeTripRowId)});
+                } catch (Exception ignored) {}
+                activeTripRowId = -1;
+            }
+            confirmedStayLastSeen = pt.time;
+            persistAnchorState();
+            memoryPoints.clear();
+            clusterCenter = null;
+            return;
+        }
+
+        // Finalize row values up to cluster arrival time and lock new site as confirmedAnchor
+        syncActiveTripToDb(clusterCenter, siteRadius);
 
         confirmedAnchor = new GpsPoint(destLat, destLon, clusterStartTime, clusterCenter.accuracy);
         confirmedPlace = newPlace;
         confirmedStayStart = clusterStartTime;
-        confirmedStayLastSeen = nowTime;
+        confirmedStayLastSeen = pt.time;
         persistAnchorState();
+
+        activeTripRowId = -1;
         memoryPoints.clear();
         clusterCenter = null;
     }
@@ -604,7 +679,7 @@ public class TrackerService extends Service {
 
         for (int i = 1; i < memoryPoints.size(); i++) {
             GpsPoint curr = memoryPoints.get(i);
-            if (curr.time > clusterStartTime && distanceMeters(destLat, destLon, curr.lat, curr.lon) <= siteRadius) {
+            if (clusterCenter != null && curr.time > clusterStartTime && distanceMeters(destLat, destLon, curr.lat, curr.lon) <= siteRadius) {
                 continue;
             }
             double seg = distanceMeters(prev.lat, prev.lon, curr.lat, curr.lon);
@@ -625,15 +700,6 @@ public class TrackerService extends Service {
         String o = (orig == null || orig.length() == 0) ? "SITE" : orig.toUpperCase(Locale.US);
         String d = (dest == null || dest.length() == 0) ? "SITE" : dest.toUpperCase(Locale.US);
         return o + " TO " + d;
-    }
-
-    private void logEvent(String type, double startLat, double startLon, long start, long end, double distanceMeters) {
-        if (end <= start || distanceMeters <= 0.05) return;
-        double hours = (end - start) / 3600000.0;
-        double distKm = distanceMeters / 1000.0;
-        double distMi = distanceMeters / 1609.344;
-        db.execSQL("INSERT INTO events (type, lat, lon, start_time, end_time, duration_hours, dist_km, dist_mi) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                new Object[]{type, startLat, startLon, start, end, hours, distKm, distMi});
     }
 
     private boolean isWorkingTime() {
@@ -683,6 +749,13 @@ public class TrackerService extends Service {
         }).start();
     }
 
+    private static String formatMetric(double val) {
+        if (val > 0.0 && val < 0.01) {
+            return String.format(Locale.US, "%.4f", val);
+        }
+        return String.format(Locale.US, "%.2f", val);
+    }
+
     private void handleRequest(Socket socket) {
         try {
             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
@@ -721,7 +794,13 @@ public class TrackerService extends Service {
             long qStart, qEnd;
             try {
                 qStart = parseFormat.parse(params[1]).getTime();
-                qEnd = parseFormat.parse(params[2]).getTime();
+                qEnd = parseFormat.parse(params[2]).getTime() + 59999L;
+                // If user is querying with the default "...1700" link after 5:00 PM on the same day, include up to 23:59:59
+                if (params[2].endsWith("1700") && params[1].length() >= 8 && params[2].startsWith(params[1].substring(0, 8))) {
+                    if (System.currentTimeMillis() > qEnd) {
+                        qEnd = parseFormat.parse(params[1].substring(0, 8) + "2359").getTime() + 59999L;
+                    }
+                }
             } catch (Exception e) {
                 socket.close();
                 return;
@@ -756,9 +835,9 @@ public class TrackerService extends Service {
                 }
                 csv.append(outFormat.format(new Date(c.getLong(3)))).append(",")
                    .append(outFormat.format(new Date(c.getLong(4)))).append(",")
-                   .append(String.format(Locale.US, "%.2f", c.getDouble(5))).append(",")
-                   .append(String.format(Locale.US, "%.2f", c.getDouble(6))).append(",")
-                   .append(String.format(Locale.US, "%.2f", c.getDouble(7))).append("\n");
+                   .append(formatMetric(c.getDouble(5))).append(",")
+                   .append(formatMetric(c.getDouble(6))).append(",")
+                   .append(formatMetric(c.getDouble(7))).append("\n");
             }
             c.close();
 
@@ -795,7 +874,7 @@ public class TrackerService extends Service {
 
         if (!memoryPoints.isEmpty() && clusterCenter != null) {
             float siteRadius = Math.max(0.05f, prefs.getFloat("distance", 75.0f));
-            commitBufferedTripIfValid(System.currentTimeMillis(), siteRadius);
+            finalizeActiveTrip(clusterCenter, siteRadius);
         }
         persistAnchorState();
 
@@ -815,4 +894,4 @@ public class TrackerService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-                                                                  }
+}
