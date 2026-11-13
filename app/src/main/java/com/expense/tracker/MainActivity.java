@@ -3,10 +3,12 @@ package com.expense.tracker;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.admin.DevicePolicyManager;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.database.sqlite.SQLiteDatabase;
@@ -16,6 +18,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.Editable;
@@ -41,6 +45,7 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import/**/;
 import java.util.Date;
 import java.util.Enumeration;
 import java.util.List;
@@ -53,6 +58,7 @@ public class MainActivity extends Activity {
     private Button btnToggle;
     private LinearLayout locationsLayout;
     private EditText editLink;
+    private EditText editCurrentCoords;
     private EditText editUser;
     private EditText editPass;
     private EditText editPort;
@@ -64,16 +70,37 @@ public class MainActivity extends Activity {
     private CheckBox chkBoot;
     private CheckBox chkOutputLocations;
 
+    private Handler uiIntervalHandler;
+    private boolean receiverRegistered = false;
+
     private interface FileAction {
         void execute(String filename);
     }
+
+    private final BroadcastReceiver coordReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent != null && TrackerService.ACTION_LOCATION_UPDATED.equals(intent.getAction())) {
+                refreshCurrentCoordinatesBox();
+            }
+        }
+    };
+
+    private final Runnable uiCoordUpdateRunnable = new Runnable() {
+        @Override
+        public void run() {
+            refreshCurrentCoordinatesBox();
+            long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
+            uiIntervalHandler.postDelayed(this, interval);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("TrackerPrefs", MODE_PRIVATE);
+        uiIntervalHandler = new Handler(Looper.getMainLooper());
 
-        // Migrate old 9-17 default hours to 0-24 once so tracking isn't blocked in evenings
         if (!prefs.getBoolean("hours_migrated_24", false)) {
             SharedPreferences.Editor ed = prefs.edit();
             ed.putInt("start_hour", 0);
@@ -136,6 +163,12 @@ public class MainActivity extends Activity {
         });
         layout.addView(btnAddKnown);
 
+        addLabel(layout, "Current Coordinates (Updates at Set Interval):");
+        editCurrentCoords = new EditText(this);
+        editCurrentCoords.setSingleLine(true);
+        editCurrentCoords.setSelectAllOnFocus(true);
+        layout.addView(editCurrentCoords);
+
         addLabel(layout, "Copy/Paste Local Server Link (includes &view=1):");
         editLink = new EditText(this);
         editLink.setSelectAllOnFocus(true);
@@ -146,7 +179,7 @@ public class MainActivity extends Activity {
         editPort = createLabeledInput(layout, "HTTP Port:", String.valueOf(prefs.getInt("http_port", 8080)));
         editInterval = createLabeledInput(layout, "GPS Check Interval (ms) [60000 = 1 min]:", String.valueOf(prefs.getLong("interval", 60000L)));
         editStayMins = createLabeledInput(layout, "Min Stay Time to Confirm Site (minutes):", String.valueOf(prefs.getInt("stay_mins", 5)));
-        editDist = createLabeledInput(layout, "Site Radius Tolerance (meters):", String.valueOf(prefs.getFloat("distance", 75.0f)));
+        editDist = createLabeledInput(layout, "Site Radius Tolerance (meters, e.g. .5 or 75):", String.valueOf(prefs.getFloat("distance", 75.0f)));
         editStartHr = createLabeledInput(layout, "Work Start Hour (0-23):", String.valueOf(prefs.getInt("start_hour", 0)));
         editEndHr = createLabeledInput(layout, "Work End Hour (1-24):", String.valueOf(prefs.getInt("end_hour", 24)));
 
@@ -194,6 +227,7 @@ public class MainActivity extends Activity {
                 if (isTracking) {
                     reloadServiceSettings();
                 }
+                restartUiCoordTimer();
             }
         });
         layout.addView(btnSave);
@@ -263,7 +297,6 @@ public class MainActivity extends Activity {
         ioLayout.addView(btnImportCfg);
         layout.addView(ioLayout);
 
-        // Erase All Saved Data Button
         Button btnEraseAll = new Button(this);
         btnEraseAll.setText("Erase All Saved Data");
         btnEraseAll.setOnClickListener(new View.OnClickListener() {
@@ -296,13 +329,89 @@ public class MainActivity extends Activity {
             toggleTracker(true);
         }
 
+        refreshCurrentCoordinatesBox();
         updateLinkText(true);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        if (!receiverRegistered) {
+            IntentFilter filter = new IntentFilter(TrackerService.ACTION_LOCATION_UPDATED);
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(coordReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(coordReceiver, filter);
+            }
+            receiverRegistered = true;
+        }
+        refreshCurrentCoordinatesBox();
+        restartUiCoordTimer();
         updateLinkText(true);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (receiverRegistered) {
+            try { unregisterReceiver(coordReceiver); } catch (Exception ignored) {}
+            receiverRegistered = false;
+        }
+        uiIntervalHandler.removeCallbacks(uiCoordUpdateRunnable);
+    }
+
+    private void restartUiCoordTimer() {
+        uiIntervalHandler.removeCallbacks(uiCoordUpdateRunnable);
+        long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
+        uiIntervalHandler.postDelayed(uiCoordUpdateRunnable, interval);
+    }
+
+    private void refreshCurrentCoordinatesBox() {
+        if (editCurrentCoords == null) return;
+        double lat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
+        double lon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
+
+        if (Math.abs(lat) <= 0.0001 && Math.abs(lon) <= 0.0001) {
+            Location loc = getBestNativeLocation();
+            if (loc != null) {
+                lat = loc.getLatitude();
+                lon = loc.getLongitude();
+                SharedPreferences.Editor ed = prefs.edit();
+                ed.putLong("last_valid_lat", Double.doubleToRawLongBits(lat));
+                ed.putLong("last_valid_lon", Double.doubleToRawLongBits(lon));
+                ed.commit();
+            }
+        }
+
+        if (Math.abs(lat) > 0.0001 || Math.abs(lon) > 0.0001) {
+            editCurrentCoords.setText(String.format(Locale.US, "%.6f,%.6f", lat, lon));
+        } else {
+            editCurrentCoords.setText("Acquiring satellite lock...");
+        }
+    }
+
+    // Queries all native OS providers (like Organic Maps) without Google Play Services
+    private Location getBestNativeLocation() {
+        try {
+            LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            if (lm == null) return null;
+            List<String> providers = lm.getAllProviders();
+            Location best = null;
+            if (providers != null) {
+                for (int i = 0; i < providers.size(); i++) {
+                    String p = providers.get(i);
+                    Location l = lm.getLastKnownLocation(p);
+                    if (l != null && (Math.abs(l.getLatitude()) > 0.0001 || Math.abs(l.getLongitude()) > 0.0001)) {
+                        if (best == null || l.getTime() > best.getTime()) {
+                            best = l;
+                        }
+                    }
+                }
+            }
+            return best;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private void saveAllSettingsToPrefs() {
@@ -312,9 +421,9 @@ public class MainActivity extends Activity {
         ed.putString("http_user", editUser.getText().toString().trim());
         ed.putString("http_pass", editPass.getText().toString().trim());
         ed.putInt("http_port", parseIntSafe(editPort.getText().toString(), 8080));
-        ed.putLong("interval", parseLongSafe(editInterval.getText().toString(), 60000L));
+        ed.putLong("interval", Math.max(1000L, parseLongSafe(editInterval.getText().toString(), 60000L)));
         ed.putInt("stay_mins", parseIntSafe(editStayMins.getText().toString(), 5));
-        ed.putFloat("distance", parseFloatSafe(editDist.getText().toString(), 75.0f));
+        ed.putFloat("distance", Math.max(0.05f, parseFloatSafe(editDist.getText().toString(), 75.0f)));
         ed.putInt("start_hour", parseIntSafe(editStartHr.getText().toString(), 0));
         ed.putInt("end_hour", parseIntSafe(editEndHr.getText().toString(), 24));
         ed.commit();
@@ -337,8 +446,6 @@ public class MainActivity extends Activity {
         ed.remove("anchor_lon");
         ed.remove("anchor_start");
         ed.remove("anchor_last_seen");
-        ed.remove("last_valid_lat");
-        ed.remove("last_valid_lon");
         ed.commit();
 
         Intent serviceIntent = new Intent(this, TrackerService.class);
@@ -379,6 +486,7 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         if (requestCode == 1 && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             toggleTracker(true);
+            refreshCurrentCoordinatesBox();
         } else {
             Toast.makeText(this, "Location permission is required to track.", Toast.LENGTH_LONG).show();
         }
@@ -406,24 +514,30 @@ public class MainActivity extends Activity {
     }
 
     private void promptAddCurrentLocationToNamed() {
-        double lat = 0.0;
-        double lon = 0.0;
-        try {
-            LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-            Location loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            if (loc != null && (Math.abs(loc.getLatitude()) > 0.0001 || Math.abs(loc.getLongitude()) > 0.0001)) {
+        double lat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
+        double lon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
+
+        if (Math.abs(lat) <= 0.0001 && Math.abs(lon) <= 0.0001) {
+            Location loc = getBestNativeLocation();
+            if (loc != null) {
                 lat = loc.getLatitude();
                 lon = loc.getLongitude();
             }
-        } catch (Exception ignored) {}
+        }
 
-        if (Math.abs(lat) <= 0.0001 && Math.abs(lon) <= 0.0001) {
-            lat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
-            lon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
+        if (Math.abs(lat) <= 0.0001 && Math.abs(lon) <= 0.0001 && editCurrentCoords != null) {
+            String boxText = editCurrentCoords.getText().toString().trim();
+            if (boxText.contains(",")) {
+                try {
+                    String[] p = boxText.split(",");
+                    lat = Double.parseDouble(p[0].trim());
+                    lon = Double.parseDouble(p[1].trim());
+                } catch (Exception ignored) {}
+            }
         }
 
         if (Math.abs(lat) <= 0.0001 && Math.abs(lon) <= 0.0001) {
-            Toast.makeText(this, "No valid GPS fix available yet.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Still acquiring satellite fix. Step outdoors or wait a moment.", Toast.LENGTH_LONG).show();
             return;
         }
 
@@ -613,7 +727,6 @@ public class MainActivity extends Activity {
         builder.show();
     }
 
-    // Returns candidate backup directories ordered from most accessible to guaranteed app-specific storage
     private List<File> getCandidateBackupDirs() {
         List<File> dirs = new ArrayList<File>();
         try {
@@ -636,7 +749,6 @@ public class MainActivity extends Activity {
     private void exportDb(String filename) {
         File currentDB = getDatabasePath("travel_events.db");
         if (!currentDB.exists()) {
-            // Ensure DB file is initialized on disk before exporting
             try {
                 if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
                 SQLiteDatabase tmp = SQLiteDatabase.openOrCreateDatabase(currentDB, null);
@@ -687,7 +799,6 @@ public class MainActivity extends Activity {
         try {
             File currentDB = getDatabasePath("travel_events.db");
             if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
-            // Remove any SQLite WAL/SHM sidecar files before replacing DB
             new File(currentDB.getAbsolutePath() + "-wal").delete();
             new File(currentDB.getAbsolutePath() + "-shm").delete();
             new File(currentDB.getAbsolutePath() + "-journal").delete();
@@ -777,7 +888,6 @@ public class MainActivity extends Activity {
             }
             ed.commit();
 
-            // Refresh UI fields immediately
             chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
             chkOutputLocations.setChecked(prefs.getBoolean("output_locations", false));
             editUser.setText(prefs.getString("http_user", "admin"));
@@ -790,6 +900,7 @@ public class MainActivity extends Activity {
             editEndHr.setText(String.valueOf(prefs.getInt("end_hour", 24)));
             loadLocationsFromPrefs();
             updateLinkText(true);
+            refreshCurrentCoordinatesBox();
 
             if (isTracking) reloadServiceSettings();
             Toast.makeText(this, "Imported Settings from:\n" + sourceFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
@@ -819,7 +930,16 @@ public class MainActivity extends Activity {
         try { return Long.parseLong(s.trim()); } catch (Exception e) { return def; }
     }
 
+    // Supports leading decimal values like ".5" or ",5" -> 0.5f
     private float parseFloatSafe(String s, float def) {
-        try { return Float.parseFloat(s.trim()); } catch (Exception e) { return def; }
+        if (s == null) return def;
+        String clean = s.trim().replace(',', '.');
+        if (clean.startsWith(".")) clean = "0" + clean;
+        else if (clean.startsWith("-.")) clean = "-0" + clean.substring(1);
+        try {
+            return Float.parseFloat(clean);
+        } catch (Exception e) {
+            return def;
+        }
     }
-                                       }
+}
