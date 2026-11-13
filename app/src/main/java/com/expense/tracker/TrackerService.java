@@ -41,6 +41,7 @@ public class TrackerService extends Service {
     public static final String ACTION_POLL = "com.expense.tracker.ACTION_POLL";
     public static final String ACTION_RELOAD_SETTINGS = "com.expense.tracker.ACTION_RELOAD_SETTINGS";
     public static final String ACTION_ERASE_DATA = "com.expense.tracker.ACTION_ERASE_DATA";
+    public static final String ACTION_LOCATION_UPDATED = "com.expense.tracker.ACTION_LOCATION_UPDATED";
 
     private LocationManager locationManager;
     private AlarmManager alarmManager;
@@ -52,7 +53,7 @@ public class TrackerService extends Service {
     private ServerSocket serverSocket;
     private int currentServerPort = -1;
     private boolean isRunning = false;
-    private boolean isWaitingForFix = false;
+    private boolean hasAcquiredLiveFix = false;
     private SharedPreferences prefs;
 
     private static class GpsPoint {
@@ -85,19 +86,21 @@ public class TrackerService extends Service {
         }
     }
 
-    // Confirmed starting site where the user was anchored prior to moving
+    // Confirmed starting site
     private GpsPoint confirmedAnchor = null;
     private PlaceMatch confirmedPlace = null;
     private long confirmedStayStart = 0;
     private long confirmedStayLastSeen = 0;
 
-    // In-memory trajectory points collected while moving to a new site
+    // In-memory trajectory points buffered while moving to a new site
     private final List<GpsPoint> memoryPoints = new ArrayList<GpsPoint>();
     private GpsPoint clusterCenter = null;
     private long clusterStartTime = 0;
 
+    // Latest hardware GNSS location received from native LocationManager
+    private GpsPoint latestHardwarePoint = null;
     private GpsPoint lastValidPoint = null;
-    private long lastSampleTimestamp = 0;
+    private long lastProcessedIntervalTime = 0;
     private static long blockConnectionsUntil = 0;
 
     @Override
@@ -119,7 +122,7 @@ public class TrackerService extends Service {
         double savedLat = Double.longBitsToDouble(prefs.getLong("last_valid_lat", 0));
         double savedLon = Double.longBitsToDouble(prefs.getLong("last_valid_lon", 0));
         if (isValidCoordinate(savedLat, savedLon)) {
-            lastValidPoint = new GpsPoint(savedLat, savedLon, System.currentTimeMillis(), 20.0f);
+            lastValidPoint = new GpsPoint(savedLat, savedLon, System.currentTimeMillis(), 15.0f);
         }
 
         double anchorLat = Double.longBitsToDouble(prefs.getLong("anchor_lat", 0));
@@ -127,7 +130,7 @@ public class TrackerService extends Service {
         if (isValidCoordinate(anchorLat, anchorLon)) {
             long aStart = prefs.getLong("anchor_start", System.currentTimeMillis());
             long aLast = prefs.getLong("anchor_last_seen", System.currentTimeMillis());
-            confirmedAnchor = new GpsPoint(anchorLat, anchorLon, aLast, 15.0f);
+            confirmedAnchor = new GpsPoint(anchorLat, anchorLon, aLast, 10.0f);
             confirmedPlace = getPlace(anchorLat, anchorLon);
             confirmedStayStart = aStart;
             confirmedStayLastSeen = aLast;
@@ -137,7 +140,6 @@ public class TrackerService extends Service {
             @Override
             public void onConfigure(SQLiteDatabase db) {
                 super.onConfigure(db);
-                // Disable WAL mode on Android 9+ so travel_events.db is a single file for Export/Import
                 if (Build.VERSION.SDK_INT >= 16) {
                     try { db.disableWriteAheadLogging(); } catch (Exception ignored) {}
                 }
@@ -157,16 +159,15 @@ public class TrackerService extends Service {
             }
         }.getWritableDatabase();
 
-        // Ensure WAL is off even on pre-API 16 or already-opened DBs
         try {
             Cursor c = db.rawQuery("PRAGMA journal_mode=DELETE;", null);
             if (c != null) c.close();
         } catch (Exception ignored) {}
 
         startForegroundCompatible();
-        registerContinuousGpsAtInterval();
+        startNativeGnssProviders();
         scheduleNextPoll(1000L);
-        startPeriodicHandlerLoop();
+        startIntervalTicker();
         startHttpServer();
     }
 
@@ -178,15 +179,15 @@ public class TrackerService extends Service {
         if (intent != null) {
             String action = intent.getAction();
             if (ACTION_POLL.equals(action)) {
-                long interval = Math.max(5000L, prefs.getLong("interval", 60000L));
+                long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
                 scheduleNextPoll(interval);
-                triggerSingleLocationPoll();
+                processIntervalTick();
             } else if (ACTION_RELOAD_SETTINGS.equals(action)) {
                 if (confirmedAnchor != null) {
                     confirmedPlace = getPlace(confirmedAnchor.lat, confirmedAnchor.lon);
                 }
-                registerContinuousGpsAtInterval();
-                long interval = Math.max(5000L, prefs.getLong("interval", 60000L));
+                startNativeGnssProviders();
+                long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
                 scheduleNextPoll(interval);
                 int newPort = prefs.getInt("http_port", 8080);
                 if (newPort != currentServerPort) {
@@ -198,7 +199,6 @@ public class TrackerService extends Service {
                 confirmedAnchor = null;
                 confirmedPlace = null;
                 clusterCenter = null;
-                lastValidPoint = null;
             }
         }
         return 1; // START_STICKY
@@ -223,7 +223,7 @@ public class TrackerService extends Service {
             ((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE)).createNotificationChannel(channel);
             notification = new Notification.Builder(this, channelId)
                     .setContentTitle("Travel Expense Tracker Active")
-                    .setContentText("Offline GPS tracking active.")
+                    .setContentText("Standalone GPS tracking active.")
                     .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                     .setContentIntent(pi)
                     .setOngoing(true)
@@ -231,7 +231,7 @@ public class TrackerService extends Service {
         } else if (Build.VERSION.SDK_INT >= 16) {
             notification = new Notification.Builder(this)
                     .setContentTitle("Travel Expense Tracker Active")
-                    .setContentText("Offline GPS tracking active.")
+                    .setContentText("Standalone GPS tracking active.")
                     .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                     .setContentIntent(pi)
                     .setOngoing(true)
@@ -239,7 +239,7 @@ public class TrackerService extends Service {
         } else if (Build.VERSION.SDK_INT >= 11) {
             notification = new Notification.Builder(this)
                     .setContentTitle("Travel Expense Tracker Active")
-                    .setContentText("Offline GPS tracking active.")
+                    .setContentText("Standalone GPS tracking active.")
                     .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                     .setContentIntent(pi)
                     .setOngoing(true)
@@ -249,7 +249,7 @@ public class TrackerService extends Service {
             notification.flags |= Notification.FLAG_ONGOING_EVENT;
             try {
                 Method m = notification.getClass().getMethod("setLatestEventInfo", Context.class, CharSequence.class, CharSequence.class, PendingIntent.class);
-                m.invoke(notification, this, "Travel Expense Tracker Active", "Offline GPS tracking active.", pi);
+                m.invoke(notification, this, "Travel Expense Tracker Active", "Standalone GPS tracking active.", pi);
             } catch (Exception ignored) {}
         }
 
@@ -266,28 +266,129 @@ public class TrackerService extends Service {
         }
     }
 
-    // Keeps hardware GPS satellite ephemeris warm at the user's configured interval (strictly offline GPS_PROVIDER)
-    private void registerContinuousGpsAtInterval() {
+    /**
+     * Organic Maps-style native GNSS provider registration:
+     * Uses pure Android LocationManager without Google Play Services.
+     * While acquiring initial satellite lock, keeps GPS hardware powered at 1000ms (0m)
+     * so cold-start satellite ephemeris download is never interrupted prematurely.
+     */
+    private void startNativeGnssProviders() {
+        if (locationManager == null) return;
         try {
-            locationManager.removeUpdates(continuousGpsListener);
-            long interval = Math.max(5000L, prefs.getLong("interval", 60000L));
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, interval, 0.0f, continuousGpsListener);
+            locationManager.removeUpdates(nativeGnssListener);
+        } catch (Exception ignored) {}
+
+        long userInterval = Math.max(1000L, prefs.getLong("interval", 60000L));
+        // Keep GPS chip active at 1s until first satellite fix locks; afterwards poll at min(userInterval, 5000ms)
+        long gnssRate = hasAcquiredLiveFix ? Math.min(userInterval, 5000L) : 1000L;
+
+        try {
+            List<String> allProviders = locationManager.getAllProviders();
+            if (allProviders != null) {
+                if (allProviders.contains(LocationManager.GPS_PROVIDER)) {
+                    locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, gnssRate, 0.0f, nativeGnssListener, Looper.getMainLooper());
+                }
+                if (allProviders.contains("passive")) {
+                    locationManager.requestLocationUpdates("passive", gnssRate, 0.0f, nativeGnssListener, Looper.getMainLooper());
+                }
+                if (allProviders.contains(LocationManager.NETWORK_PROVIDER)) {
+                    locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, gnssRate, 0.0f, nativeGnssListener, Looper.getMainLooper());
+                }
+            } else {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, gnssRate, 0.0f, nativeGnssListener, Looper.getMainLooper());
             }
         } catch (Exception ignored) {}
+
+        // Seed from any existing kernel last-known location immediately if we have nothing yet
+        if (lastValidPoint == null) {
+            GpsPoint seed = queryLastKnownNativePoint(System.currentTimeMillis());
+            if (seed != null) {
+                saveValidPoint(seed);
+                broadcastCoordinateUpdate();
+            }
+        }
     }
 
-    private final LocationListener continuousGpsListener = new LocationListener() {
+    private final LocationListener nativeGnssListener = new LocationListener() {
         @Override
         public void onLocationChanged(Location location) {
-            if (!isWorkingTime()) return;
-            handleIncomingGpsLocation(location);
+            if (location == null || !isValidCoordinate(location.getLatitude(), location.getLongitude())) {
+                return;
+            }
+            // If we already have a strong GPS satellite fix, ignore coarse network jumps (>100m)
+            if (hasAcquiredLiveFix && !"gps".equalsIgnoreCase(location.getProvider())
+                    && location.hasAccuracy() && location.getAccuracy() > 100.0f) {
+                return;
+            }
+
+            long now = System.currentTimeMillis();
+            float acc = location.hasAccuracy() ? location.getAccuracy() : 10.0f;
+            GpsPoint pt = new GpsPoint(location.getLatitude(), location.getLongitude(), now, acc);
+            latestHardwarePoint = pt;
+            saveValidPoint(pt);
+
+            // Immediately populate UI on the very first satellite fix, then switch to interval cadence
+            if (!hasAcquiredLiveFix) {
+                hasAcquiredLiveFix = true;
+                startNativeGnssProviders();
+                lastProcessedIntervalTime = now;
+                if (isWorkingTime()) {
+                    onPointSampled(pt);
+                }
+                broadcastCoordinateUpdate();
+            }
         }
 
         @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
         @Override public void onProviderEnabled(String provider) {}
         @Override public void onProviderDisabled(String provider) {}
     };
+
+    private void startIntervalTicker() {
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!isRunning) return;
+                processIntervalTick();
+                long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
+                mainHandler.postDelayed(this, interval);
+            }
+        }, 2000L);
+    }
+
+    // Runs strictly at the user's preset interval to sample coordinates, update UI box, and evaluate site moves
+    private void processIntervalTick() {
+        long now = System.currentTimeMillis();
+        long interval = Math.max(1000L, prefs.getLong("interval", 60000L));
+        if (now - lastProcessedIntervalTime < (interval / 2L)) {
+            return;
+        }
+        lastProcessedIntervalTime = now;
+
+        GpsPoint sample = null;
+        if (latestHardwarePoint != null) {
+            sample = new GpsPoint(latestHardwarePoint.lat, latestHardwarePoint.lon, now, latestHardwarePoint.accuracy);
+        } else {
+            sample = queryLastKnownNativePoint(now);
+            if (sample == null && lastValidPoint != null) {
+                sample = new GpsPoint(lastValidPoint.lat, lastValidPoint.lon, now, lastValidPoint.accuracy);
+            }
+        }
+
+        if (sample != null) {
+            saveValidPoint(sample);
+            broadcastCoordinateUpdate();
+            if (isWorkingTime()) {
+                onPointSampled(sample);
+            }
+        }
+    }
+
+    private void broadcastCoordinateUpdate() {
+        Intent intent = new Intent(ACTION_LOCATION_UPDATED);
+        intent.setPackage(getPackageName());
+        sendBroadcast(intent);
+    }
 
     private void scheduleNextPoll(long delayMs) {
         if (alarmManager == null) return;
@@ -308,87 +409,6 @@ public class TrackerService extends Service {
         } catch (Exception e) {
             alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pollPendingIntent);
         }
-    }
-
-    private void startPeriodicHandlerLoop() {
-        mainHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (!isRunning) return;
-                triggerSingleLocationPoll();
-                long interval = Math.max(5000L, prefs.getLong("interval", 60000L));
-                mainHandler.postDelayed(this, interval);
-            }
-        }, 2000L);
-    }
-
-    private void triggerSingleLocationPoll() {
-        if (!isWorkingTime() || isWaitingForFix) return;
-        isWaitingForFix = true;
-
-        try {
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0L, 0.0f, oneShotGpsListener);
-            }
-        } catch (SecurityException ignored) {}
-
-        long interval = Math.max(5000L, prefs.getLong("interval", 60000L));
-        long timeout = Math.min(15000L, Math.max(4000L, interval - 1000L));
-        mainHandler.postDelayed(fixTimeoutRunnable, timeout);
-    }
-
-    private final LocationListener oneShotGpsListener = new LocationListener() {
-        @Override
-        public void onLocationChanged(Location location) {
-            handleIncomingGpsLocation(location);
-        }
-
-        @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
-        @Override public void onProviderEnabled(String provider) {}
-        @Override public void onProviderDisabled(String provider) {}
-    };
-
-    private void handleIncomingGpsLocation(Location location) {
-        if (location == null || !isValidCoordinate(location.getLatitude(), location.getLongitude())) {
-            return;
-        }
-        if (location.hasAccuracy() && location.getAccuracy() > 150.0f && lastValidPoint != null) {
-            return;
-        }
-        mainHandler.removeCallbacks(fixTimeoutRunnable);
-        stopOneShotListener();
-
-        long now = System.currentTimeMillis();
-        // Avoid duplicate rapid callbacks within 2 seconds
-        if (now - lastSampleTimestamp < 2000L) return;
-        lastSampleTimestamp = now;
-
-        float acc = location.hasAccuracy() ? location.getAccuracy() : 15.0f;
-        GpsPoint pt = new GpsPoint(location.getLatitude(), location.getLongitude(), now, acc);
-        saveValidPoint(pt);
-        onPointSampled(pt);
-    }
-
-    // Critical indoor/stationary fallback: reuses last known GPS location when satellites time out indoors
-    // so destination stay timers advance and trips are reliably committed.
-    private final Runnable fixTimeoutRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (!isWaitingForFix) return;
-            stopOneShotListener();
-
-            long now = System.currentTimeMillis();
-            GpsPoint fallback = getBestOfflineFallbackPoint(now);
-            if (fallback != null) {
-                lastSampleTimestamp = now;
-                onPointSampled(fallback);
-            }
-        }
-    };
-
-    private void stopOneShotListener() {
-        isWaitingForFix = false;
-        try { locationManager.removeUpdates(oneShotGpsListener); } catch (Exception ignored) {}
     }
 
     private boolean isValidCoordinate(double lat, double lon) {
@@ -413,19 +433,25 @@ public class TrackerService extends Service {
         ed.commit();
     }
 
-    private GpsPoint getBestOfflineFallbackPoint(long now) {
+    private GpsPoint queryLastKnownNativePoint(long now) {
+        if (locationManager == null) return null;
         try {
-            Location gps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            if (gps != null && isValidCoordinate(gps.getLatitude(), gps.getLongitude())) {
-                GpsPoint p = new GpsPoint(gps.getLatitude(), gps.getLongitude(), now, gps.hasAccuracy() ? gps.getAccuracy() : 25.0f);
-                saveValidPoint(p);
-                return p;
+            List<String> providers = locationManager.getAllProviders();
+            Location best = null;
+            if (providers != null) {
+                for (int i = 0; i < providers.size(); i++) {
+                    Location l = locationManager.getLastKnownLocation(providers.get(i));
+                    if (l != null && isValidCoordinate(l.getLatitude(), l.getLongitude())) {
+                        if (best == null || l.getTime() > best.getTime()) {
+                            best = l;
+                        }
+                    }
+                }
             }
-        } catch (SecurityException ignored) {}
-
-        if (lastValidPoint != null) {
-            return new GpsPoint(lastValidPoint.lat, lastValidPoint.lon, now, lastValidPoint.accuracy);
-        }
+            if (best != null) {
+                return new GpsPoint(best.getLatitude(), best.getLongitude(), now, best.hasAccuracy() ? best.getAccuracy() : 20.0f);
+            }
+        } catch (Exception ignored) {}
         return null;
     }
 
@@ -443,7 +469,8 @@ public class TrackerService extends Service {
     private PlaceMatch getPlace(double lat, double lon) {
         String saved = prefs.getString("special_locations", "");
         if (saved.length() > 0) {
-            float threshold = Math.max(25.0f, prefs.getFloat("distance", 75.0f));
+            // Supports small radii like 0.5m (.5m) without clamping to 25m
+            float threshold = Math.max(0.05f, prefs.getFloat("distance", 75.0f));
             String[] entries = saved.split(";");
             PlaceMatch bestMatch = null;
             double bestDist = Double.MAX_VALUE;
@@ -468,11 +495,12 @@ public class TrackerService extends Service {
         return new PlaceMatch("SITE", lat, lon, false, false);
     }
 
-    // In-Memory Trajectory Engine: buffers points while moving and writes once arrival at a new site is confirmed
+    // In-Memory Trajectory Engine supporting sub-meter (.5m) radii
     private void onPointSampled(GpsPoint pt) {
-        float siteRadius = Math.max(25.0f, prefs.getFloat("distance", 75.0f));
-        long stayRequiredMs = Math.max(30000L, prefs.getInt("stay_mins", 5) * 60000L);
-        long pollIntervalMs = Math.max(5000L, prefs.getLong("interval", 60000L));
+        float siteRadius = Math.max(0.05f, prefs.getFloat("distance", 75.0f));
+        long pollIntervalMs = Math.max(1000L, prefs.getLong("interval", 60000L));
+        int stayMins = prefs.getInt("stay_mins", 5);
+        long stayRequiredMs = (stayMins <= 0) ? pollIntervalMs : (stayMins * 60000L);
 
         // 1. Lock initial starting site if none exists yet
         if (confirmedAnchor == null) {
@@ -497,7 +525,7 @@ public class TrackerService extends Service {
                 return;
             }
 
-            // Moved outside current site: begin buffering trip in memory
+            // Moved outside current site radius (even if .5m): start buffering in memory
             long departTime = confirmedStayLastSeen;
             if ((pt.time - departTime) > (pollIntervalMs * 3L)) {
                 departTime = pt.time - pollIntervalMs;
@@ -514,12 +542,10 @@ public class TrackerService extends Service {
 
         double distFromCluster = distanceMeters(clusterCenter.lat, clusterCenter.lon, pt.lat, pt.lon);
         if (distFromCluster <= siteRadius) {
-            // Stationary at destination candidate; check if stay duration is met
             if ((pt.time - clusterStartTime) >= stayRequiredMs) {
                 commitBufferedTripIfValid(pt.time, siteRadius);
             }
         } else {
-            // Still moving: shift destination cluster center to current point
             clusterCenter = pt;
             clusterStartTime = pt.time;
         }
@@ -532,7 +558,7 @@ public class TrackerService extends Service {
         double destLat = newPlace.isKnown ? newPlace.lat : clusterCenter.lat;
         double destLon = newPlace.isKnown ? newPlace.lon : clusterCenter.lon;
 
-        // Starting point coordinates (always logged as the event coordinates)
+        // Starting point coordinates
         double startLat = confirmedAnchor.lat;
         double startLon = confirmedAnchor.lon;
 
@@ -548,7 +574,6 @@ public class TrackerService extends Service {
             return;
         }
 
-        // Rolling distance with linear distance fallback
         double rollingDist = calculateRollingTripMeters(destLat, destLon, siteRadius);
         double finalDistMeters = Math.max(rollingDist, linearDist);
 
@@ -556,10 +581,9 @@ public class TrackerService extends Service {
         long arriveTime = Math.max(departTime + 1000L, clusterStartTime);
         String eventType = buildTripName(confirmedPlace.name, newPlace.name);
 
-        // Log event using STARTING POINT coordinates (startLat, startLon)
+        // Log event with starting point coordinates
         logEvent(eventType, startLat, startLon, departTime, arriveTime, finalDistMeters);
 
-        // Advance anchor so destination becomes the starting point of the next trip
         confirmedAnchor = new GpsPoint(destLat, destLon, clusterStartTime, clusterCenter.accuracy);
         confirmedPlace = newPlace;
         confirmedStayStart = clusterStartTime;
@@ -575,6 +599,7 @@ public class TrackerService extends Service {
         }
 
         double rolling = 0.0;
+        double minStep = Math.min(2.0, siteRadius * 0.25);
         GpsPoint prev = memoryPoints.get(0);
 
         for (int i = 1; i < memoryPoints.size(); i++) {
@@ -583,14 +608,14 @@ public class TrackerService extends Service {
                 continue;
             }
             double seg = distanceMeters(prev.lat, prev.lon, curr.lat, curr.lon);
-            if (seg >= 8.0) {
+            if (seg >= minStep) {
                 rolling += seg;
                 prev = curr;
             }
         }
 
         double tail = distanceMeters(prev.lat, prev.lon, destLat, destLon);
-        if (tail >= 8.0) {
+        if (tail >= minStep) {
             rolling += tail;
         }
         return rolling;
@@ -603,7 +628,7 @@ public class TrackerService extends Service {
     }
 
     private void logEvent(String type, double startLat, double startLon, long start, long end, double distanceMeters) {
-        if (end <= start || distanceMeters <= 1.0) return;
+        if (end <= start || distanceMeters <= 0.05) return;
         double hours = (end - start) / 3600000.0;
         double distKm = distanceMeters / 1000.0;
         double distMi = distanceMeters / 1609.344;
@@ -626,7 +651,6 @@ public class TrackerService extends Service {
         }
     }
 
-    // Strict check ensuring only loopback (127.0.0.1) or private LAN IPs can talk to the HTTP server
     private boolean isLocalOrLanAddress(InetAddress addr) {
         if (addr == null) return false;
         return addr.isLoopbackAddress() || addr.isSiteLocalAddress() || addr.isLinkLocalAddress();
@@ -767,12 +791,10 @@ public class TrackerService extends Service {
             alarmManager.cancel(pollPendingIntent);
         }
         mainHandler.removeCallbacksAndMessages(null);
-        stopOneShotListener();
-        try { locationManager.removeUpdates(continuousGpsListener); } catch (Exception ignored) {}
+        try { locationManager.removeUpdates(nativeGnssListener); } catch (Exception ignored) {}
 
-        // If stopping the service while a valid move to a new site is in memory, commit it before closing
         if (!memoryPoints.isEmpty() && clusterCenter != null) {
-            float siteRadius = Math.max(25.0f, prefs.getFloat("distance", 75.0f));
+            float siteRadius = Math.max(0.05f, prefs.getFloat("distance", 75.0f));
             commitBufferedTripIfValid(System.currentTimeMillis(), siteRadius);
         }
         persistAnchorState();
@@ -793,4 +815,4 @@ public class TrackerService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-            }
+                                                                  }
