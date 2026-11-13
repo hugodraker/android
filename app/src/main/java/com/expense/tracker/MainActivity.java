@@ -9,6 +9,7 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.database.sqlite.SQLiteDatabase;
 import android.location.Location;
 import android.location.LocationManager;
 import android.net.Uri;
@@ -29,16 +30,22 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.Enumeration;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public class MainActivity extends Activity {
     private SharedPreferences prefs;
@@ -49,6 +56,11 @@ public class MainActivity extends Activity {
     private EditText editUser;
     private EditText editPass;
     private EditText editPort;
+    private EditText editInterval;
+    private EditText editStayMins;
+    private EditText editDist;
+    private EditText editStartHr;
+    private EditText editEndHr;
     private CheckBox chkBoot;
     private CheckBox chkOutputLocations;
 
@@ -60,6 +72,15 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("TrackerPrefs", MODE_PRIVATE);
+
+        // Migrate old 9-17 default hours to 0-24 once so tracking isn't blocked in evenings
+        if (!prefs.getBoolean("hours_migrated_24", false)) {
+            SharedPreferences.Editor ed = prefs.edit();
+            ed.putInt("start_hour", 0);
+            ed.putInt("end_hour", 24);
+            ed.putBoolean("hours_migrated_24", true);
+            ed.commit();
+        }
 
         ScrollView scroll = new ScrollView(this);
         LinearLayout layout = new LinearLayout(this);
@@ -115,7 +136,7 @@ public class MainActivity extends Activity {
         });
         layout.addView(btnAddKnown);
 
-        addLabel(layout, "Copy/Paste Server Link (includes &view=1):");
+        addLabel(layout, "Copy/Paste Local Server Link (includes &view=1):");
         editLink = new EditText(this);
         editLink.setSelectAllOnFocus(true);
         layout.addView(editLink);
@@ -123,11 +144,11 @@ public class MainActivity extends Activity {
         editUser = createLabeledInput(layout, "HTTP Username:", prefs.getString("http_user", "admin"));
         editPass = createLabeledInput(layout, "HTTP Password:", prefs.getString("http_pass", "password"));
         editPort = createLabeledInput(layout, "HTTP Port:", String.valueOf(prefs.getInt("http_port", 8080)));
-        final EditText editInterval = createLabeledInput(layout, "GPS Check Interval (ms) [60000 = 1 min]:", String.valueOf(prefs.getLong("interval", 60000L)));
-        final EditText editStayMins = createLabeledInput(layout, "Min Stay Time to Confirm Site (minutes):", String.valueOf(prefs.getInt("stay_mins", 5)));
-        final EditText editDist = createLabeledInput(layout, "Site Radius Tolerance (meters):", String.valueOf(prefs.getFloat("distance", 75.0f)));
-        final EditText editStartHr = createLabeledInput(layout, "Work Start Hour (0-23):", String.valueOf(prefs.getInt("start_hour", 0)));
-        final EditText editEndHr = createLabeledInput(layout, "Work End Hour (1-24):", String.valueOf(prefs.getInt("end_hour", 24)));
+        editInterval = createLabeledInput(layout, "GPS Check Interval (ms) [60000 = 1 min]:", String.valueOf(prefs.getLong("interval", 60000L)));
+        editStayMins = createLabeledInput(layout, "Min Stay Time to Confirm Site (minutes):", String.valueOf(prefs.getInt("stay_mins", 5)));
+        editDist = createLabeledInput(layout, "Site Radius Tolerance (meters):", String.valueOf(prefs.getFloat("distance", 75.0f)));
+        editStartHr = createLabeledInput(layout, "Work Start Hour (0-23):", String.valueOf(prefs.getInt("start_hour", 0)));
+        editEndHr = createLabeledInput(layout, "Work End Hour (1-24):", String.valueOf(prefs.getInt("end_hour", 24)));
 
         TextWatcher linkWatcher = new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
@@ -168,21 +189,7 @@ public class MainActivity extends Activity {
         btnSave.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                SharedPreferences.Editor ed = prefs.edit();
-                ed.putBoolean("start_on_boot", chkBoot.isChecked());
-                ed.putBoolean("output_locations", chkOutputLocations.isChecked());
-                ed.putString("http_user", editUser.getText().toString().trim());
-                ed.putString("http_pass", editPass.getText().toString().trim());
-                ed.putInt("http_port", parseIntSafe(editPort.getText().toString(), 8080));
-                ed.putLong("interval", parseLongSafe(editInterval.getText().toString(), 60000L));
-                ed.putInt("stay_mins", parseIntSafe(editStayMins.getText().toString(), 5));
-                ed.putFloat("distance", parseFloatSafe(editDist.getText().toString(), 75.0f));
-                ed.putInt("start_hour", parseIntSafe(editStartHr.getText().toString(), 0));
-                ed.putInt("end_hour", parseIntSafe(editEndHr.getText().toString(), 24));
-                ed.commit();
-
-                saveLocationsToPrefs();
-                updateLinkText(true);
+                saveAllSettingsToPrefs();
                 Toast.makeText(MainActivity.this, "Settings Saved.", Toast.LENGTH_SHORT).show();
                 if (isTracking) {
                     reloadServiceSettings();
@@ -256,12 +263,32 @@ public class MainActivity extends Activity {
         ioLayout.addView(btnImportCfg);
         layout.addView(ioLayout);
 
+        // Erase All Saved Data Button
+        Button btnEraseAll = new Button(this);
+        btnEraseAll.setText("Erase All Saved Data");
+        btnEraseAll.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Erase All Saved Data")
+                        .setMessage("Are you sure you want to permanently erase all recorded travel events and reset current trip memory?")
+                        .setPositiveButton("Erase Everything", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                                eraseAllSavedData();
+                            }
+                        })
+                        .setNegativeButton("Cancel", null)
+                        .show();
+            }
+        });
+        layout.addView(btnEraseAll);
+
         setContentView(scroll);
 
         if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{
                 "android.permission.ACCESS_FINE_LOCATION",
-                "android.permission.ACCESS_COARSE_LOCATION",
                 "android.permission.WRITE_EXTERNAL_STORAGE",
                 "android.permission.READ_EXTERNAL_STORAGE"
             }, 1);
@@ -276,6 +303,50 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         updateLinkText(true);
+    }
+
+    private void saveAllSettingsToPrefs() {
+        SharedPreferences.Editor ed = prefs.edit();
+        ed.putBoolean("start_on_boot", chkBoot.isChecked());
+        ed.putBoolean("output_locations", chkOutputLocations.isChecked());
+        ed.putString("http_user", editUser.getText().toString().trim());
+        ed.putString("http_pass", editPass.getText().toString().trim());
+        ed.putInt("http_port", parseIntSafe(editPort.getText().toString(), 8080));
+        ed.putLong("interval", parseLongSafe(editInterval.getText().toString(), 60000L));
+        ed.putInt("stay_mins", parseIntSafe(editStayMins.getText().toString(), 5));
+        ed.putFloat("distance", parseFloatSafe(editDist.getText().toString(), 75.0f));
+        ed.putInt("start_hour", parseIntSafe(editStartHr.getText().toString(), 0));
+        ed.putInt("end_hour", parseIntSafe(editEndHr.getText().toString(), 24));
+        ed.commit();
+        saveLocationsToPrefs();
+        updateLinkText(true);
+    }
+
+    private void eraseAllSavedData() {
+        try {
+            File dbFile = getDatabasePath("travel_events.db");
+            if (dbFile.exists()) {
+                SQLiteDatabase db = SQLiteDatabase.openDatabase(dbFile.getAbsolutePath(), null, SQLiteDatabase.OPEN_READWRITE);
+                db.execSQL("DELETE FROM events");
+                db.close();
+            }
+        } catch (Exception ignored) {}
+
+        SharedPreferences.Editor ed = prefs.edit();
+        ed.remove("anchor_lat");
+        ed.remove("anchor_lon");
+        ed.remove("anchor_start");
+        ed.remove("anchor_last_seen");
+        ed.remove("last_valid_lat");
+        ed.remove("last_valid_lon");
+        ed.commit();
+
+        Intent serviceIntent = new Intent(this, TrackerService.class);
+        serviceIntent.setAction(TrackerService.ACTION_ERASE_DATA);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent);
+        else startService(serviceIntent);
+
+        Toast.makeText(this, "All saved data erased.", Toast.LENGTH_LONG).show();
     }
 
     private void enableAdminAndBatteryExemption() {
@@ -340,7 +411,6 @@ public class MainActivity extends Activity {
         try {
             LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
             Location loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            if (loc == null) loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
             if (loc != null && (Math.abs(loc.getLatitude()) > 0.0001 || Math.abs(loc.getLongitude()) > 0.0001)) {
                 lat = loc.getLatitude();
                 lon = loc.getLongitude();
@@ -543,53 +613,190 @@ public class MainActivity extends Activity {
         builder.show();
     }
 
-    private void exportDb(String filename) {
+    // Returns candidate backup directories ordered from most accessible to guaranteed app-specific storage
+    private List<File> getCandidateBackupDirs() {
+        List<File> dirs = new ArrayList<File>();
         try {
-            File currentDB = getDatabasePath("travel_events.db");
-            File backupDir = new File(Environment.getExternalStorageDirectory(), "TrackerBackup");
-            backupDir.mkdirs();
-            copyFile(currentDB, new File(backupDir, filename));
-            Toast.makeText(this, "Exported DB: " + filename, Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "DB Export failed", Toast.LENGTH_SHORT).show();
+            File ext = Environment.getExternalStorageDirectory();
+            if (ext != null) {
+                dirs.add(new File(ext, "TrackerBackup"));
+                dirs.add(new File(ext, "Download"));
+            }
+        } catch (Exception ignored) {}
+        try {
+            if (Build.VERSION.SDK_INT >= 8) {
+                File appExt = getExternalFilesDir(null);
+                if (appExt != null) dirs.add(appExt);
+            }
+        } catch (Exception ignored) {}
+        dirs.add(getFilesDir());
+        return dirs;
+    }
+
+    private void exportDb(String filename) {
+        File currentDB = getDatabasePath("travel_events.db");
+        if (!currentDB.exists()) {
+            // Ensure DB file is initialized on disk before exporting
+            try {
+                if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
+                SQLiteDatabase tmp = SQLiteDatabase.openOrCreateDatabase(currentDB, null);
+                tmp.execSQL("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, lat REAL, lon REAL, start_time INTEGER, end_time INTEGER, duration_hours REAL, dist_km REAL, dist_mi REAL)");
+                tmp.close();
+            } catch (Exception ignored) {}
         }
+
+        for (File dir : getCandidateBackupDirs()) {
+            try {
+                if (!dir.exists()) dir.mkdirs();
+                File out = new File(dir, filename);
+                copyFile(currentDB, out);
+                if (out.exists() && out.length() > 0) {
+                    Toast.makeText(this, "Exported DB to:\n" + out.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+        Toast.makeText(this, "DB Export failed on all storage paths", Toast.LENGTH_LONG).show();
     }
 
     private void importDb(String filename) {
-        try {
-            File backupFile = new File(Environment.getExternalStorageDirectory(), "TrackerBackup/" + filename);
-            File currentDB = getDatabasePath("travel_events.db");
-            copyFile(backupFile, currentDB);
-            Toast.makeText(this, "Imported DB. Restarting...", Toast.LENGTH_LONG).show();
-            if (isTracking) {
-                toggleTracker(false);
-                toggleTracker(true);
+        File sourceFile = null;
+        File direct = new File(filename);
+        if (direct.isAbsolute() && direct.exists()) {
+            sourceFile = direct;
+        } else {
+            for (File dir : getCandidateBackupDirs()) {
+                File candidate = new File(dir, filename);
+                if (candidate.exists() && candidate.length() > 0) {
+                    sourceFile = candidate;
+                    break;
+                }
             }
+        }
+
+        if (sourceFile == null) {
+            Toast.makeText(this, "Backup file not found: " + filename, Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        boolean wasTracking = isTracking;
+        if (wasTracking) {
+            toggleTracker(false);
+        }
+
+        try {
+            File currentDB = getDatabasePath("travel_events.db");
+            if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
+            // Remove any SQLite WAL/SHM sidecar files before replacing DB
+            new File(currentDB.getAbsolutePath() + "-wal").delete();
+            new File(currentDB.getAbsolutePath() + "-shm").delete();
+            new File(currentDB.getAbsolutePath() + "-journal").delete();
+
+            copyFile(sourceFile, currentDB);
+            Toast.makeText(this, "Imported DB from:\n" + sourceFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
         } catch (Exception e) {
-            Toast.makeText(this, "DB Import failed", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "DB Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+
+        if (wasTracking) {
+            toggleTracker(true);
         }
     }
 
     private void exportSettings(String filename) {
-        try {
-            File prefsFile = new File(getApplicationInfo().dataDir + "/shared_prefs/TrackerPrefs.xml");
-            File backupDir = new File(Environment.getExternalStorageDirectory(), "TrackerBackup");
-            backupDir.mkdirs();
-            copyFile(prefsFile, new File(backupDir, filename));
-            Toast.makeText(this, "Exported Settings: " + filename, Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "Settings Export failed", Toast.LENGTH_SHORT).show();
+        saveAllSettingsToPrefs();
+        Map<String, ?> all = prefs.getAll();
+
+        for (File dir : getCandidateBackupDirs()) {
+            FileWriter fw = null;
+            try {
+                if (!dir.exists()) dir.mkdirs();
+                File out = new File(dir, filename);
+                fw = new FileWriter(out, false);
+                for (Map.Entry<String, ?> entry : all.entrySet()) {
+                    String k = entry.getKey();
+                    Object v = entry.getValue();
+                    if (v instanceof Boolean) fw.write(k + "=B:" + v + "\n");
+                    else if (v instanceof Integer) fw.write(k + "=I:" + v + "\n");
+                    else if (v instanceof Long) fw.write(k + "=L:" + v + "\n");
+                    else if (v instanceof Float) fw.write(k + "=F:" + v + "\n");
+                    else if (v instanceof String) fw.write(k + "=S:" + v.toString().replace("\n", "") + "\n");
+                }
+                fw.flush();
+                fw.close();
+                fw = null;
+                if (out.exists()) {
+                    Toast.makeText(this, "Exported Settings to:\n" + out.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                    return;
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (fw != null) try { fw.close(); } catch (Exception ignored) {}
+            }
         }
+        Toast.makeText(this, "Settings Export failed", Toast.LENGTH_SHORT).show();
     }
 
     private void importSettings(String filename) {
+        File sourceFile = null;
+        File direct = new File(filename);
+        if (direct.isAbsolute() && direct.exists()) {
+            sourceFile = direct;
+        } else {
+            for (File dir : getCandidateBackupDirs()) {
+                File candidate = new File(dir, filename);
+                if (candidate.exists()) {
+                    sourceFile = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (sourceFile == null) {
+            Toast.makeText(this, "Settings file not found: " + filename, Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        BufferedReader br = null;
         try {
-            File backupFile = new File(Environment.getExternalStorageDirectory(), "TrackerBackup/" + filename);
-            File prefsFile = new File(getApplicationInfo().dataDir + "/shared_prefs/TrackerPrefs.xml");
-            copyFile(backupFile, prefsFile);
-            Toast.makeText(this, "Imported Settings. Reopen app to view.", Toast.LENGTH_LONG).show();
+            br = new BufferedReader(new FileReader(sourceFile));
+            SharedPreferences.Editor ed = prefs.edit();
+            String line;
+            while ((line = br.readLine()) != null) {
+                int eq = line.indexOf('=');
+                if (eq <= 0 || eq + 3 > line.length()) continue;
+                String key = line.substring(0, eq).trim();
+                String type = line.substring(eq + 1, eq + 3);
+                String val = line.substring(eq + 3);
+
+                if ("B:".equals(type)) ed.putBoolean(key, Boolean.parseBoolean(val));
+                else if ("I:".equals(type)) ed.putInt(key, parseIntSafe(val, 0));
+                else if ("L:".equals(type)) ed.putLong(key, parseLongSafe(val, 0L));
+                else if ("F:".equals(type)) ed.putFloat(key, parseFloatSafe(val, 0.0f));
+                else if ("S:".equals(type)) ed.putString(key, val);
+            }
+            ed.commit();
+
+            // Refresh UI fields immediately
+            chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
+            chkOutputLocations.setChecked(prefs.getBoolean("output_locations", false));
+            editUser.setText(prefs.getString("http_user", "admin"));
+            editPass.setText(prefs.getString("http_pass", "password"));
+            editPort.setText(String.valueOf(prefs.getInt("http_port", 8080)));
+            editInterval.setText(String.valueOf(prefs.getLong("interval", 60000L)));
+            editStayMins.setText(String.valueOf(prefs.getInt("stay_mins", 5)));
+            editDist.setText(String.valueOf(prefs.getFloat("distance", 75.0f)));
+            editStartHr.setText(String.valueOf(prefs.getInt("start_hour", 0)));
+            editEndHr.setText(String.valueOf(prefs.getInt("end_hour", 24)));
+            loadLocationsFromPrefs();
+            updateLinkText(true);
+
+            if (isTracking) reloadServiceSettings();
+            Toast.makeText(this, "Imported Settings from:\n" + sourceFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
         } catch (Exception e) {
-            Toast.makeText(this, "Settings Import failed", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Settings Import failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        } finally {
+            if (br != null) try { br.close(); } catch (Exception ignored) {}
         }
     }
 
@@ -599,6 +806,7 @@ public class MainActivity extends Activity {
         byte[] buffer = new byte[4096];
         int len;
         while ((len = fis.read(buffer)) > 0) fos.write(buffer, 0, len);
+        fos.getFD().sync();
         fos.close();
         fis.close();
     }
@@ -614,4 +822,4 @@ public class MainActivity extends Activity {
     private float parseFloatSafe(String s, float def) {
         try { return Float.parseFloat(s.trim()); } catch (Exception e) { return def; }
     }
-    }
+                                       }
