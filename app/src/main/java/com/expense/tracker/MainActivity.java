@@ -45,7 +45,6 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-
 import java.util.Date;
 import java.util.Enumeration;
 import java.util.List;
@@ -390,7 +389,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // Queries all native OS providers (like Organic Maps) without Google Play Services
     private Location getBestNativeLocation() {
         try {
             LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
@@ -930,7 +928,6 @@ public class MainActivity extends Activity {
         try { return Long.parseLong(s.trim()); } catch (Exception e) { return def; }
     }
 
-    // Supports leading decimal values like ".5" or ",5" -> 0.5f
     private float parseFloatSafe(String s, float def) {
         if (s == null) return def;
         String clean = s.trim().replace(',', '.');
