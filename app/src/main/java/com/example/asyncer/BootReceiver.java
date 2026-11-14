@@ -8,6 +8,7 @@ import android.os.Build;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.lang.reflect.Method;
 
 public class BootReceiver extends BroadcastReceiver {
 
@@ -16,29 +17,33 @@ public class BootReceiver extends BroadcastReceiver {
         if (intent == null || intent.getAction() == null) return;
         String action = intent.getAction();
 
-        if (action.equals(Intent.ACTION_BOOT_COMPLETED) || 
+        if (action.equals(Intent.ACTION_BOOT_COMPLETED) ||
             action.equals("android.intent.action.QUICKBOOT_POWERON")) {
-            
-            // Check if the user enabled "Run on start" in the UI
+
             if (shouldRunOnStart(context)) {
                 Intent serviceIntent = new Intent(context, AsyncerService.class);
-                
-                // Android 8.0+ (API 26) requires startForegroundService for boot receivers
-                if (Build.VERSION.SDK_INT >= 26) {
-                    context.startForegroundService(serviceIntent);
-                } else {
-                    // Android 1.6 through 7.1
-                    context.startService(serviceIntent);
-                }
+                startServiceCompat(context, serviceIntent);
             }
         }
+    }
+
+    public static void startServiceCompat(Context context, Intent serviceIntent) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            try {
+                Method m = Context.class.getMethod("startForegroundService", Intent.class);
+                m.invoke(context, serviceIntent);
+                return;
+            } catch (Throwable ignored) {}
+        }
+        context.startService(serviceIntent);
     }
 
     private boolean shouldRunOnStart(Context context) {
         File iniFile = new File(context.getFilesDir(), "asyncer.ini");
         if (!iniFile.exists()) return false;
+        BufferedReader br = null;
         try {
-            BufferedReader br = new BufferedReader(new FileReader(iniFile));
+            br = new BufferedReader(new FileReader(iniFile));
             String line;
             boolean inGlobal = false;
             while ((line = br.readLine()) != null) {
@@ -49,12 +54,13 @@ public class BootReceiver extends BroadcastReceiver {
                     inGlobal = false;
                 } else if (inGlobal && line.toLowerCase().startsWith("run_on_start=")) {
                     String val = line.substring(line.indexOf('=') + 1).trim();
-                    br.close();
                     return val.equals("1") || val.equalsIgnoreCase("true");
                 }
             }
-            br.close();
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        } finally {
+            try { if (br != null) br.close(); } catch (Exception ignored) {}
+        }
         return false;
     }
 }
