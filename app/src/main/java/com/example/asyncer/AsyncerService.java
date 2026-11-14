@@ -60,39 +60,64 @@ public class AsyncerService extends Service {
 
     private void promoteToForeground() {
         try {
-            String channelId = "asyncer_background_channel";
-            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-
-            if (Build.VERSION.SDK_INT >= 26) {
-                NotificationChannel channel = new NotificationChannel(
-                        channelId,
-                        "Asyncer Background Sync",
-                        NotificationManager.IMPORTANCE_LOW
-                );
-                if (nm != null) nm.createNotificationChannel(channel);
-            }
-
             Intent notificationIntent = new Intent(this, MainActivity.class);
-            int flags = (Build.VERSION.SDK_INT >= 23) ? 
-                    PendingIntent.FLAG_UPDATE_CURRENT | 0x04000000 /* FLAG_IMMUTABLE */ : 
-                    PendingIntent.FLAG_UPDATE_CURRENT;
+            int flags = (Build.VERSION.SDK_INT >= 23)
+                    ? (PendingIntent.FLAG_UPDATE_CURRENT | 0x04000000) // FLAG_IMMUTABLE
+                    : PendingIntent.FLAG_UPDATE_CURRENT;
             PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, notificationIntent, flags);
 
-            Notification.Builder builder;
+            Notification notification = null;
+
             if (Build.VERSION.SDK_INT >= 26) {
-                builder = new Notification.Builder(this, channelId);
+                // Reflection so Android 1.6 Dalvik verifier never sees NotificationChannel or Builder
+                String channelId = "asyncer_background_channel";
+                NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                Class<?> chanClass = Class.forName("android.app.NotificationChannel");
+                Object channel = chanClass.getConstructor(String.class, CharSequence.class, int.class)
+                        .newInstance(channelId, "Asyncer Background Sync", Integer.valueOf(2)); // IMPORTANCE_LOW = 2
+                Method createChan = NotificationManager.class.getMethod("createNotificationChannel", chanClass);
+                if (nm != null) createChan.invoke(nm, channel);
+
+                Class<?> builderClass = Class.forName("android.app.Notification$Builder");
+                Object builder = builderClass.getConstructor( android.content.Context.class, String.class)
+                        .newInstance(this, channelId);
+                builderClass.getMethod("setContentTitle", CharSequence.class).invoke(builder, "Asyncer");
+                builderClass.getMethod("setContentText", CharSequence.class).invoke(builder, "Running background sync...");
+                builderClass.getMethod("setContentIntent", PendingIntent.class).invoke(builder, pendingIntent);
+                builderClass.getMethod("setSmallIcon", int.class).invoke(builder, Integer.valueOf(android.R.drawable.ic_popup_sync));
+                notification = (Notification) builderClass.getMethod("build").invoke(builder);
+
+            } else if (Build.VERSION.SDK_INT >= 11) {
+                Class<?> builderClass = Class.forName("android.app.Notification$Builder");
+                Object builder = builderClass.getConstructor(android.content.Context.class).newInstance(this);
+                builderClass.getMethod("setContentTitle", CharSequence.class).invoke(builder, "Asyncer");
+                builderClass.getMethod("setContentText", CharSequence.class).invoke(builder, "Running background sync...");
+                builderClass.getMethod("setContentIntent", PendingIntent.class).invoke(builder, pendingIntent);
+                builderClass.getMethod("setSmallIcon", int.class).invoke(builder, Integer.valueOf(android.R.drawable.ic_popup_sync));
+                if (Build.VERSION.SDK_INT >= 16) {
+                    notification = (Notification) builderClass.getMethod("build").invoke(builder);
+                } else {
+                    notification = (Notification) builderClass.getMethod("getNotification").invoke(builder);
+                }
+
             } else {
-                builder = new Notification.Builder(this);
+                // Android 1.6 (API 4) to 2.3 (API 10)
+                notification = new Notification(android.R.drawable.ic_popup_sync, "Asyncer", System.currentTimeMillis());
+                Method setLatest = Notification.class.getMethod(
+                        "setLatestEventInfo", android.content.Context.class, CharSequence.class, CharSequence.class, PendingIntent.class);
+                setLatest.invoke(notification, this, "Asyncer", "Running background sync...", pendingIntent);
             }
 
-            builder.setContentTitle("Asyncer")
-                   .setContentText("Running background synchronization...")
-                   .setContentIntent(pendingIntent)
-                   .setSmallIcon(android.R.drawable.ic_popup_sync);
-
-            Notification notification = (Build.VERSION.SDK_INT >= 16) ? builder.build() : builder.getNotification();
-            startForeground(199, notification);
-        } catch (Exception ignored) {}
+            if (Build.VERSION.SDK_INT >= 5 && notification != null) {
+                // Service.startForeground(int, Notification) was added in API 5 (Android 2.0)
+                Method startFg = Service.class.getMethod("startForeground", int.class, Notification.class);
+                startFg.invoke(this, Integer.valueOf(199), notification);
+            } else {
+                // Android 1.6 (API 4) fallback
+                Method setFg = Service.class.getMethod("setForeground", boolean.class);
+                setFg.invoke(this, Boolean.TRUE);
+            }
+        } catch (Throwable ignored) {}
     }
 
     // =========================================================================
