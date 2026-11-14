@@ -296,7 +296,7 @@ public class AsyncerService extends Service {
         SmbClient.ConnectionProfile prof = new SmbClient.ConnectionProfile();
         prof.server = unc.server;
         prof.share = unc.share;
-        prof.port = "445";
+        prof.port = 445;
         prof.protoPref = SmbClient.PROTO_AUTO;
 
         String credStr = credsMap.get(unc.shareKey);
