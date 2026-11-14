@@ -17,6 +17,10 @@ import java.util.StringTokenizer;
 
 public class FtpClient {
 
+    public interface LogListener {
+        void onLog(String msg);
+    }
+
     public static class FtpItem {
         public String name = "";
         public String path = "";
@@ -30,16 +34,35 @@ public class FtpClient {
     private OutputStream writer;
     private String connectedHost = "";
     private int connectedPort = 21;
-    private int timeoutMs = 8000;
+    private int timeoutMs = 10000;
     private boolean loggedIn = false;
+    private String lastReply = "";
+    private LogListener logger;
+    private Boolean mlsdSupported = null;
+
+    public void setLogListener(LogListener l) {
+        this.logger = l;
+    }
+
+    private void log(String msg) {
+        if (logger != null) logger.onLog(msg);
+    }
+
+    public String getLastReply() {
+        return lastReply;
+    }
 
     public synchronized boolean connect(String host, int port, String user, String pass) {
         disconnect();
         if (host == null || host.trim().length() == 0) return false;
         this.connectedHost = host.trim();
         this.connectedPort = port > 0 ? port : 21;
-        String u = (user == null || user.trim().length() == 0) ? "anonymous" : user.trim();
-        String p = (pass == null) ? "guest@" : pass;
+        this.mlsdSupported = null;
+
+        String u = (user == null || user.trim().length() == 0 || "guest".equalsIgnoreCase(user.trim()))
+                ? "anonymous" : user.trim();
+        String p = (pass == null || pass.length() == 0)
+                ? ("anonymous".equalsIgnoreCase(u) ? "anonymous@example.com" : "") : pass;
 
         try {
             ctrlSocket = new Socket();
@@ -50,30 +73,44 @@ public class FtpClient {
 
             int code = readReplyCode();
             if (code != 220) {
+                log("FTP banner rejected: " + lastReply);
                 disconnect();
                 return false;
             }
 
             sendCmd("USER " + u);
             code = readReplyCode();
-            if (code == 331) {
+            if (code == 331 || code == 332) {
                 sendCmd("PASS " + p);
                 code = readReplyCode();
             }
             if (code != 230 && code != 202) {
+                // If user left "guest" in UI and server rejected anonymous, retry literal "guest"
+                if ("anonymous".equalsIgnoreCase(u) && user != null && "guest".equalsIgnoreCase(user.trim())) {
+                    sendCmd("USER guest");
+                    code = readReplyCode();
+                    if (code == 331 || code == 332) {
+                        sendCmd("PASS " + (pass != null ? pass : ""));
+                        code = readReplyCode();
+                    }
+                }
+            }
+            if (code != 230 && code != 202) {
+                log("FTP login failed: " + lastReply);
                 disconnect();
                 return false;
             }
 
-            // Binary mode + UTF8
             sendCmd("TYPE I");
             readReplyCode();
             sendCmd("OPTS UTF8 ON");
             readReplyCode();
 
             loggedIn = true;
+            log("FTP authenticated to " + connectedHost + ":" + connectedPort);
             return true;
         } catch (Exception e) {
+            log("FTP connect error: " + e.getMessage());
             disconnect();
             return false;
         }
@@ -100,8 +137,9 @@ public class FtpClient {
     }
 
     public static String normalizeFtpPath(String path) {
-        if (path == null || path.trim().length() == 0) return "/";
+        if (path == null) return "/";
         String p = path.replace('\\', '/').trim();
+        if (p.length() == 0 || "PUBLIC".equalsIgnoreCase(p)) return "/";
         if (!p.startsWith("/")) p = "/" + p;
         while (p.length() > 1 && p.endsWith("/")) {
             p = p.substring(0, p.length() - 1);
@@ -112,16 +150,14 @@ public class FtpClient {
     public synchronized List<String> probeRootDirectories(String basePath) throws Exception {
         List<String> dirs = new ArrayList<String>();
         String norm = normalizeFtpPath(basePath);
+        dirs.add(norm);
         List<FtpItem> items = listSingleDirectory(norm, "");
         for (int i = 0; i < items.size(); i++) {
             FtpItem it = items.get(i);
             if (it.isDirectory) {
                 String full = "/".equals(norm) ? ("/" + it.name) : (norm + "/" + it.name);
-                dirs.add(full);
+                if (!dirs.contains(full)) dirs.add(full);
             }
-        }
-        if (dirs.isEmpty()) {
-            dirs.add("/");
         }
         return dirs;
     }
@@ -132,7 +168,9 @@ public class FtpClient {
         String base = normalizeFtpPath(remoteBaseDir);
         try {
             fetchDirRecursive(base, "", recursive, out);
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            log("FTP list error: " + e.getMessage());
+        }
         return out;
     }
 
@@ -155,24 +193,53 @@ public class FtpClient {
         List<FtpItem> list = new ArrayList<FtpItem>();
         if (!isConnected()) return list;
 
-        sendCmd("CWD " + normalizeFtpPath(absDirPath));
+        String normDir = normalizeFtpPath(absDirPath);
+        sendCmd("CWD " + normDir);
         int cwdCode = readReplyCode();
         if (cwdCode != 250 && cwdCode != 200) {
-            return list;
+            // Try relative CWD if root slash was rejected
+            if (normDir.startsWith("/") && normDir.length() > 1) {
+                sendCmd("CWD " + normDir.substring(1));
+                cwdCode = readReplyCode();
+            }
+            if (cwdCode != 250 && cwdCode != 200) {
+                log("FTP CWD " + normDir + " failed: " + lastReply);
+                return list;
+            }
         }
 
-        Socket dataSock = openPassiveSocket();
-        if (dataSock == null) return list;
+        Socket dataSock = null;
+        boolean usedMlsd = false;
 
-        boolean useMlsd = true;
-        sendCmd("MLSD");
-        int code = readReplyCode();
-        if (code != 150 && code != 125) {
-            useMlsd = false;
+        // Try MLSD first only if not already known to be unsupported
+        if (mlsdSupported == null || mlsdSupported.booleanValue()) {
+            dataSock = openDataSocket();
+            if (dataSock != null) {
+                sendCmd("MLSD");
+                int code = readReplyCode();
+                if (code == 150 || code == 125) {
+                    mlsdSupported = Boolean.TRUE;
+                    usedMlsd = true;
+                } else {
+                    mlsdSupported = Boolean.FALSE;
+                    try { dataSock.close(); } catch (Exception ignored) {}
+                    dataSock = null;
+                }
+            }
+        }
+
+        // Fallback to standard LIST with a fresh PASV socket
+        if (!usedMlsd) {
+            dataSock = openDataSocket();
+            if (dataSock == null) {
+                log("FTP passive data connection failed for LIST");
+                return list;
+            }
             sendCmd("LIST");
-            code = readReplyCode();
+            int code = readReplyCode();
             if (code != 150 && code != 125) {
                 try { dataSock.close(); } catch (Exception ignored) {}
+                log("FTP LIST failed: " + lastReply);
                 return list;
             }
         }
@@ -182,16 +249,16 @@ public class FtpClient {
             dataReader = new BufferedReader(new InputStreamReader(dataSock.getInputStream(), "UTF-8"));
             String line;
             while ((line = dataReader.readLine()) != null) {
-                FtpItem item = useMlsd ? parseMlsdLine(line, prefixRel) : parseListLine(line, prefixRel);
+                FtpItem item = usedMlsd ? parseMlsdLine(line, prefixRel) : parseListLine(line, prefixRel);
                 if (item != null && item.name.length() > 0 && !".".equals(item.name) && !"..".equals(item.name)) {
                     list.add(item);
                 }
             }
         } finally {
             try { if (dataReader != null) dataReader.close(); } catch (Exception ignored) {}
-            try { dataSock.close(); } catch (Exception ignored) {}
+            try { if (dataSock != null) dataSock.close(); } catch (Exception ignored) {}
         }
-        readReplyCode(); // 226 Transfer complete
+        readReplyCode(); // Consume 226 Transfer complete
         return list;
     }
 
@@ -230,12 +297,11 @@ public class FtpClient {
         if (line.length() == 0 || line.startsWith("total ")) return null;
 
         FtpItem item = new FtpItem();
-        // Windows DOS style: 11-14-26  01:05PM       <DIR>           FolderName
         if (Character.isDigit(line.charAt(0))) {
             StringTokenizer st = new StringTokenizer(line);
             if (st.countTokens() < 4) return null;
-            st.nextToken(); // date
-            st.nextToken(); // time
+            st.nextToken();
+            st.nextToken();
             String dirOrSize = st.nextToken();
             if ("<DIR>".equalsIgnoreCase(dirOrSize)) {
                 item.isDirectory = true;
@@ -248,14 +314,13 @@ public class FtpClient {
             return item;
         }
 
-        // Unix style: drwxr-xr-x 2 user group 4096 Nov 14 12:00 filename
         char first = line.charAt(0);
         if (first != 'd' && first != '-' && first != 'l') return null;
         item.isDirectory = (first == 'd');
 
         StringTokenizer st = new StringTokenizer(line);
         if (st.countTokens() < 9) return null;
-        st.nextToken(); // perms
+        st.nextToken(); // permissions
         st.nextToken(); // links
         st.nextToken(); // owner
         st.nextToken(); // group
@@ -293,21 +358,35 @@ public class FtpClient {
     public synchronized boolean uploadFile(File localFile, String remoteFullFilePath) {
         if (!isConnected() || localFile == null || !localFile.exists()) return false;
         String norm = normalizeFtpPath(remoteFullFilePath);
+        String parentDir = "/";
+        String fileName = norm;
         int lastSlash = norm.lastIndexOf('/');
-        if (lastSlash > 0) {
-            mkdirRecursive(norm.substring(0, lastSlash));
+        if (lastSlash >= 0) {
+            parentDir = lastSlash == 0 ? "/" : norm.substring(0, lastSlash);
+            fileName = norm.substring(lastSlash + 1);
         }
+
+        mkdirRecursive(parentDir);
 
         Socket dataSock = null;
         InputStream fis = null;
         OutputStream dos = null;
         try {
-            dataSock = openPassiveSocket();
-            if (dataSock == null) return false;
+            // CWD into parent directory first so STOR uses simple filename
+            sendCmd("CWD " + parentDir);
+            int cwdCode = readReplyCode();
 
-            sendCmd("STOR " + norm);
+            dataSock = openDataSocket();
+            if (dataSock == null) {
+                log("FTP PASV failed before uploading " + fileName);
+                return false;
+            }
+
+            String storArg = (cwdCode == 250 || cwdCode == 200) ? fileName : norm;
+            sendCmd("STOR " + storArg);
             int code = readReplyCode();
             if (code != 150 && code != 125) {
+                log("FTP STOR rejected (" + storArg + "): " + lastReply);
                 dataSock.close();
                 return false;
             }
@@ -326,8 +405,11 @@ public class FtpClient {
             dataSock = null;
 
             int endCode = readReplyCode();
-            return endCode == 226 || endCode == 250;
+            boolean ok = (endCode == 226 || endCode == 250);
+            if (!ok) log("FTP STOR finish error: " + lastReply);
+            return ok;
         } catch (Exception e) {
+            log("FTP upload exception (" + fileName + "): " + e.getMessage());
             return false;
         } finally {
             try { if (fis != null) fis.close(); } catch (Exception ignored) {}
@@ -342,16 +424,32 @@ public class FtpClient {
         if (parent != null && !parent.exists()) parent.mkdirs();
 
         String norm = normalizeFtpPath(remoteFullFilePath);
+        String parentDir = "/";
+        String fileName = norm;
+        int lastSlash = norm.lastIndexOf('/');
+        if (lastSlash >= 0) {
+            parentDir = lastSlash == 0 ? "/" : norm.substring(0, lastSlash);
+            fileName = norm.substring(lastSlash + 1);
+        }
+
         Socket dataSock = null;
         InputStream dis = null;
         OutputStream fos = null;
         try {
-            dataSock = openPassiveSocket();
-            if (dataSock == null) return false;
+            sendCmd("CWD " + parentDir);
+            int cwdCode = readReplyCode();
 
-            sendCmd("RETR " + norm);
+            dataSock = openDataSocket();
+            if (dataSock == null) {
+                log("FTP PASV failed before downloading " + fileName);
+                return false;
+            }
+
+            String retrArg = (cwdCode == 250 || cwdCode == 200) ? fileName : norm;
+            sendCmd("RETR " + retrArg);
             int code = readReplyCode();
             if (code != 150 && code != 125) {
+                log("FTP RETR rejected (" + retrArg + "): " + lastReply);
                 dataSock.close();
                 return false;
             }
@@ -372,8 +470,11 @@ public class FtpClient {
             dataSock = null;
 
             int endCode = readReplyCode();
-            return endCode == 226 || endCode == 250;
+            boolean ok = (endCode == 226 || endCode == 250);
+            if (!ok) log("FTP RETR finish error: " + lastReply);
+            return ok;
         } catch (Exception e) {
+            log("FTP download exception (" + fileName + "): " + e.getMessage());
             return false;
         } finally {
             try { if (dis != null) dis.close(); } catch (Exception ignored) {}
@@ -394,32 +495,44 @@ public class FtpClient {
         }
     }
 
-    public synchronized boolean copyLocalSubtreeToRemote(File localDir, String remoteBaseDir, boolean recursive) {
-        if (localDir == null || !localDir.exists()) return false;
+    public synchronized int copyLocalSubtreeToRemote(File localDir, String remoteBaseDir, boolean recursive) {
+        if (localDir == null || !localDir.exists()) {
+            log("Local folder does not exist: " + (localDir != null ? localDir.getAbsolutePath() : "null"));
+            return 0;
+        }
         File[] files = localDir.listFiles();
-        if (files == null) return true;
+        if (files == null) {
+            log("Cannot list local folder (check storage permissions): " + localDir.getAbsolutePath());
+            return 0;
+        }
         String base = normalizeFtpPath(remoteBaseDir);
         mkdirRecursive(base);
 
+        int count = 0;
         for (int i = 0; i < files.length; i++) {
             File f = files[i];
             String targetRemote = "/".equals(base) ? ("/" + f.getName()) : (base + "/" + f.getName());
             if (f.isDirectory()) {
                 if (recursive) {
                     mkdirRecursive(targetRemote);
-                    if (!copyLocalSubtreeToRemote(f, targetRemote, true)) return false;
+                    count += copyLocalSubtreeToRemote(f, targetRemote, true);
                 }
             } else if (f.isFile()) {
-                if (!uploadFile(f, targetRemote)) return false;
+                log("FTP Uploading: " + f.getName() + " (" + f.length() + " B)");
+                if (uploadFile(f, targetRemote)) {
+                    count++;
+                }
             }
         }
-        return true;
+        return count;
     }
 
-    public synchronized boolean copySubtreeToLocal(String remoteBaseDir, File localDir, boolean recursive) {
+    public synchronized int copySubtreeToLocal(String remoteBaseDir, File localDir, boolean recursive) {
         if (!localDir.exists()) localDir.mkdirs();
         String base = normalizeFtpPath(remoteBaseDir);
         List<FtpItem> items = fetchRemoteDirContents(base, recursive);
+        log("FTP found " + items.size() + " remote item(s) in " + base);
+        int count = 0;
         for (int i = 0; i < items.size(); i++) {
             FtpItem item = items.get(i);
             File dest = new File(localDir, item.path.replace('/', File.separatorChar));
@@ -427,15 +540,33 @@ public class FtpClient {
                 dest.mkdirs();
             } else {
                 String fullRemote = "/".equals(base) ? ("/" + item.path) : (base + "/" + item.path);
-                if (!downloadFile(fullRemote, dest)) return false;
+                log("FTP Downloading: " + item.path + " (" + item.size + " B)");
+                if (downloadFile(fullRemote, dest)) {
+                    count++;
+                }
             }
         }
-        return true;
+        return count;
     }
 
-    private Socket openPassiveSocket() throws Exception {
-        sendCmd("PASV");
+    // Tries EPSV first (NAT/IPv6 friendly), then falls back to PASV
+    private Socket openDataSocket() throws Exception {
+        sendCmd("EPSV");
         String reply = readFullReply();
+        if (reply != null && reply.startsWith("229")) {
+            int open = reply.indexOf("(|||");
+            int close = reply.indexOf("|)", open + 4);
+            if (open >= 0 && close > open) {
+                int dataPort = Integer.parseInt(reply.substring(open + 4, close).trim());
+                Socket data = new Socket();
+                data.connect(new InetSocketAddress(connectedHost, dataPort), timeoutMs);
+                data.setSoTimeout(timeoutMs);
+                return data;
+            }
+        }
+
+        sendCmd("PASV");
+        reply = readFullReply();
         if (reply == null || !reply.startsWith("227")) return null;
 
         int open = reply.indexOf('(');
@@ -446,7 +577,8 @@ public class FtpClient {
         if (nums.length < 6) return null;
 
         String ip = nums[0].trim() + "." + nums[1].trim() + "." + nums[2].trim() + "." + nums[3].trim();
-        if ("0.0.0.0".equals(ip) || ip.startsWith("127.")) {
+        if ("0.0.0.0".equals(ip) || ip.startsWith("127.") || ip.startsWith("10.") || ip.startsWith("192.168.") || ip.startsWith("172.")) {
+            // Use the control socket host IP so NAT/router port-forwards work reliably
             ip = connectedHost;
         }
         int p1 = Integer.parseInt(nums[4].trim());
@@ -479,6 +611,7 @@ public class FtpClient {
         String line;
         while ((line = reader.readLine()) != null) {
             lastLine = line;
+            this.lastReply = line;
             if (line.length() >= 4 && Character.isDigit(line.charAt(0))
                     && Character.isDigit(line.charAt(1))
                     && Character.isDigit(line.charAt(2))
