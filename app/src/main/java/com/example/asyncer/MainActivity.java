@@ -104,10 +104,21 @@ public class MainActivity extends Activity {
         appendLog("Connecting to \\\\" + host + "\\" + share + " ...");
         new Thread(new Runnable() {
             public void run() {
-                SmbClient.SmbClientSession session =
-                        new SmbClient.SmbClientSession(host, port, user, pass);
+                // Use SmbClient directly instead of SmbClientSession
+                SmbClient client = new SmbClient();
                 try {
-                    session.connectShare(share);
+                    SmbClient.ConnectionProfile prof = new SmbClient.ConnectionProfile();
+                    prof.host = host;
+                    prof.port = port;
+                    prof.share = share;
+                    prof.username = user;
+                    prof.password = pass;
+                    
+                    // Connect using the profile
+                    if (!client.connect(prof)) {
+                        throw new Exception("Connection failed (Authentication or Network error).");
+                    }
+                    
                     File[] files = localFolder.listFiles();
                     int uploaded = 0;
                     if (files != null) {
@@ -115,7 +126,7 @@ public class MainActivity extends Activity {
                             File f = files[i];
                             if (f.isFile() && f.canRead()) {
                                 appendLog("Uploading " + f.getName() + " (" + f.length() + " bytes)...");
-                                session.uploadFile(f.getName(), f);
+                                client.uploadFile(f.getName(), f);
                                 uploaded++;
                             }
                         }
@@ -124,7 +135,7 @@ public class MainActivity extends Activity {
                 } catch (Exception e) {
                     appendLog("Sync failed: " + e.getMessage());
                 } finally {
-                    session.close();
+                    client.disconnect(); // Cleanly close the socket
                 }
             }
         }).start();
