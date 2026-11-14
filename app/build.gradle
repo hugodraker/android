@@ -9,9 +9,10 @@ android {
     defaultConfig {
         applicationId "com.example.asyncer"
         minSdk 4
-        targetSdk 34
+        targetSdk 22
         versionCode 1
         versionName "1.0"
+        multiDexEnabled false
     }
 
     buildTypes {
