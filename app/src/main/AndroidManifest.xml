@@ -4,22 +4,22 @@
     android:versionCode="1"
     android:versionName="1.0">
 
-    <!-- Network & Storage Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
-    
-    <!-- Required for Run on Start and background persistence -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <application
+        android:icon="@drawable/ic_launcher"
         android:label="Asyncer"
         android:requestLegacyExternalStorage="true">
-        
+
         <activity
             android:name=".MainActivity"
+            android:icon="@drawable/ic_launcher"
+            android:label="Asyncer"
             android:exported="true"
             android:configChanges="orientation|keyboardHidden|screenSize">
             <intent-filter>
@@ -32,7 +32,6 @@
             android:name=".AsyncerService"
             android:exported="false" />
 
-        <!-- Intercepts the boot sequence -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true">
