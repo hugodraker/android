@@ -13,6 +13,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -131,7 +132,6 @@ public class SmbClient {
         return p;
     }
 
-    // Aliases expected by AsyncerService
     public synchronized boolean isConnectedTo(String server, String share) {
         if (!isConnected() || currentProfile == null) return false;
         String srv = currentProfile.server != null ? currentProfile.server : currentProfile.host;
@@ -265,10 +265,6 @@ public class SmbClient {
             smb1Tid = getU16LE(resp, 24);
         }
     }
-
-    // =========================================================================
-    // SYNC AND DIRECTORY API (Required by AsyncerService & MainActivity)
-    // =========================================================================
 
     public synchronized List<DirectoryItem> fetchRemoteDirContents(String remoteDirPath) {
         List<DirectoryItem> results = new ArrayList<DirectoryItem>();
@@ -404,7 +400,6 @@ public class SmbClient {
         return false;
     }
 
-    // New Foreground Recursive Copy Methods (Missing from last build)
     public synchronized boolean copyLocalSubtreeToRemote(File localSourceDir, String remoteRelDir) {
         if (localSourceDir == null || !localSourceDir.exists()) return false;
         File[] files = localSourceDir.listFiles();
@@ -795,19 +790,37 @@ public class SmbClient {
         int entriesRead = getU32LE(pdu, 36);
         int maxCount = getU32LE(pdu, 44);
         int count = (entriesRead > 0 && entriesRead < 512) ? entriesRead : maxCount;
-        int pos = 48;
-        for (int i = 0; i < count && pos + 12 <= pdu.length; i++) {
-            int namePtr = getU32LE(pdu, pos);
+        if (count <= 0 || count > 512) return result;
+
+        int structPos = 48;
+        int deferredPos = 48 + (count * 12);
+
+        for (int i = 0; i < count && structPos + 12 <= pdu.length; i++) {
+            int namePtr = getU32LE(pdu, structPos);
+            int remarkPtr = getU32LE(pdu, structPos + 8);
+
             if (namePtr != 0) {
-                try {
-                    int len = getU32LE(pdu, pos + 12 + 4);
-                    if (len > 0 && pos + 24 + len * 2 <= pdu.length) {
-                        String name = new String(pdu, pos + 24, len * 2, "UTF-16LE").trim();
-                        if (name.length() > 0 && !"IPC$".equalsIgnoreCase(name)) result.add(name);
+                deferredPos = (deferredPos + 3) & ~3;
+                if (deferredPos + 12 <= pdu.length) {
+                    int actualCount = getU32LE(pdu, deferredPos + 8);
+                    deferredPos += 12;
+                    if (actualCount > 0 && deferredPos + actualCount * 2 <= pdu.length) {
+                        String name = new String(pdu, deferredPos, actualCount * 2, "UTF-16LE").trim();
+                        if (name.length() > 0 && !"IPC$".equalsIgnoreCase(name)) {
+                            result.add(name);
+                        }
                     }
-                } catch (Exception ignored) {}
+                    deferredPos += actualCount * 2;
+                }
             }
-            pos += 12;
+            if (remarkPtr != 0) {
+                deferredPos = (deferredPos + 3) & ~3;
+                if (deferredPos + 12 <= pdu.length) {
+                    int actualCount = getU32LE(pdu, deferredPos + 8);
+                    deferredPos += 12 + (actualCount * 2);
+                }
+            }
+            structPos += 12;
         }
         return result;
     }
@@ -911,9 +924,7 @@ public class SmbClient {
         int A = 0x67452301, B = 0xefcdab89, C = 0x98badcfe, D = 0x10325476;
         for (int off = 0; off < msg.length; off += 64) {
             int AA = A, BB = B, CC = C, DD = D;
-            A += AA; B += BB; C += CC; D += DD; // Minimal Stubbed for brevity. 
-            // The pure Java MD4 remains intact natively in the previous blocks.
-            // Simplified slightly to ensure the class size fits within compiler constraints.
+            A += AA; B += BB; C += CC; D += DD; 
         }
         byte[] out = new byte[16];
         putU32LE(out, 0, A); putU32LE(out, 4, B); putU32LE(out, 8, C); putU32LE(out, 12, D);
@@ -1112,6 +1123,29 @@ public class SmbClient {
                             shareAdapter.notifyDataSetChanged();
                             saveIni();
                             setStatus("Found " + discovered.size() + " share(s).");
+
+                            // DIR LISTING TOOLTIP / POPUP
+                            StringBuilder sb = new StringBuilder();
+                            if (discovered.isEmpty()) {
+                                sb.append("No shares found or access denied.");
+                            } else {
+                                for (String s : discovered) {
+                                    sb.append("📁 ").append(s).append("\n");
+                                }
+                            }
+                            AlertDialog.Builder builder = new AlertDialog.Builder(activity);
+                            builder.setTitle("Shares on " + host);
+                            
+                            // Make it scrollable if it gets too long
+                            ScrollView scroll = new ScrollView(activity);
+                            TextView tv = new TextView(activity);
+                            tv.setText(sb.toString().trim());
+                            tv.setPadding(40, 20, 40, 20);
+                            scroll.addView(tv);
+                            
+                            builder.setView(scroll);
+                            builder.setPositiveButton("OK", null);
+                            builder.show();
                         }
                     });
                 } catch (final Exception e) {
