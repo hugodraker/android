@@ -17,7 +17,7 @@ import java.io.File;
 
 public class MainActivity extends Activity {
 
-    private SmbClientModule smbModule;
+    private SmbClient smbModule;
     private EditText etLocalDir;
     private TextView tvConsole;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
@@ -32,7 +32,7 @@ public class MainActivity extends Activity {
         mainLayout.setPadding(10, 10, 10, 10);
 
         File iniFile = new File(getFilesDir(), "asyncer.ini");
-        smbModule = new SmbClientModule(this, iniFile);
+        smbModule = new SmbClient(this, iniFile);
         mainLayout.addView(smbModule.buildSmbPanel());
 
         // Local Folder Row
@@ -104,8 +104,8 @@ public class MainActivity extends Activity {
         appendLog("Connecting to \\\\" + host + "\\" + share + " ...");
         new Thread(new Runnable() {
             public void run() {
-                SmbClientModule.SmbClientSession session =
-                        new SmbClientModule.SmbClientSession(host, port, user, pass);
+                SmbClient.SmbClientSession session =
+                        new SmbClient.SmbClientSession(host, port, user, pass);
                 try {
                     session.connectShare(share);
                     File[] files = localFolder.listFiles();
