@@ -805,9 +805,13 @@ public class SmbClient {
                     int actualCount = getU32LE(pdu, deferredPos + 8);
                     deferredPos += 12;
                     if (actualCount > 0 && deferredPos + actualCount * 2 <= pdu.length) {
-                        String name = new String(pdu, deferredPos, actualCount * 2, "UTF-16LE").trim();
-                        if (name.length() > 0 && !"IPC$".equalsIgnoreCase(name)) {
-                            result.add(name);
+                        try {
+                            String name = new String(pdu, deferredPos, actualCount * 2, "UTF-16LE").trim();
+                            if (name.length() > 0 && !"IPC$".equalsIgnoreCase(name)) {
+                                result.add(name);
+                            }
+                        } catch (Exception ignored) {
+                            // Fallback if UTF-16LE is missing
                         }
                     }
                     deferredPos += actualCount * 2;
