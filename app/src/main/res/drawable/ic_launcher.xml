@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#1565C0" />
+            <corners android:radius="8dp" />
+            <size android:width="48dp" android:height="48dp" />
+        </shape>
+    </item>
+    <item android:top="6dp" android:bottom="6dp" android:left="6dp" android:right="6dp">
+        <bitmap android:src="@android:drawable/ic_popup_sync" android:gravity="center" />
+    </item>
+</layer-list>
