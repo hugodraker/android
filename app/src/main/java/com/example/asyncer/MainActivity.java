@@ -335,7 +335,7 @@ public class MainActivity extends Activity {
     }
 
     // =========================================================================
-    // INI PERSISTENCE (Saves Shares Dropdown List + All 5 Jobs + Run on Start)
+    // INI PERSISTENCE
     // =========================================================================
 
     private void loadAllFromIni() {
@@ -506,7 +506,7 @@ public class MainActivity extends Activity {
     }
 
     // =========================================================================
-    // TEST / PROBE BUTTON (Probes SMB Shares or FTP Directories + Tooltip Dialog)
+    // PROBE & TEST BUTTON
     // =========================================================================
 
     private void probeServerSharesOrFtpDirs() {
@@ -551,7 +551,6 @@ public class MainActivity extends Activity {
                             for (int i = 0; i < discovered.size(); i++) {
                                 sampleListing.add("[SHARE] " + discovered.get(i));
                             }
-                            // Also list files inside the first share if available
                             if (!discovered.isEmpty()) {
                                 SmbClient.ConnectionProfile p = new SmbClient.ConnectionProfile();
                                 p.host = host;
@@ -590,7 +589,7 @@ public class MainActivity extends Activity {
                             }
                             saveCurrentJobToMemory();
                             saveAllToIni();
-                            appendLog("Probe succeeded: " + discovered.size() + " share(s)/folder(s) saved to INI.");
+                            appendLog("Probe succeeded: " + discovered.size() + " share(s)/folder(s) saved.");
 
                             showProbeListingDialog(host, sampleListing);
                         }
@@ -632,11 +631,11 @@ public class MainActivity extends Activity {
     }
 
     // =========================================================================
-    // FOREGROUND SYNC (Supports Both SMB and FTP)
+    // FOREGROUND SYNC (SMB & FTP)
     // =========================================================================
 
     private void runSyncForegroundThread() {
-        final int proto = spProtocol.getSelectedItemPosition(); // 0=SMB, 1=FTP
+        final int proto = spProtocol.getSelectedItemPosition();
         final String host = etHost.getText().toString().trim();
         final int port = parseIntSafe(etPort.getText().toString().trim(), proto == 1 ? 21 : 445);
         final String user = etUser.getText().toString().trim();
@@ -644,7 +643,9 @@ public class MainActivity extends Activity {
         final String remotePath = getEffectiveRemotePath();
         final File localFolder = new File(etLocalDir.getText().toString().trim());
         final int direction = spDirection.getSelectedItemPosition();
+        final int mode = spMode.getSelectedItemPosition();
         final boolean recursive = cbRecursive.isChecked();
+        final boolean deleteExtras = cbDeleteExtras.isChecked();
 
         if (host.length() == 0 || (proto == 0 && remotePath.length() == 0)) {
             appendLog("Error: Missing Host or Share.");
@@ -652,32 +653,37 @@ public class MainActivity extends Activity {
         }
 
         if (!localFolder.exists()) {
-            localFolder.mkdirs();
-            appendLog("Created local folder: " + localFolder.getAbsolutePath());
+            if (localFolder.mkdirs()) {
+                appendLog("Created local folder: " + localFolder.getAbsolutePath());
+            } else {
+                appendLog("Warning: Could not create " + localFolder.getAbsolutePath());
+            }
         }
 
         new Thread(new Runnable() {
             public void run() {
                 if (proto == 1) {
                     FtpClient ftp = new FtpClient();
+                    ftp.setLogListener(new FtpClient.LogListener() {
+                        public void onLog(String msg) { appendLog(msg); }
+                    });
                     try {
-                        String ftpPath = remotePath.length() > 0 ? remotePath : "/";
-                        appendLog("Connecting to FTP " + host + ":" + port + " (" + ftpPath + ")...");
+                        String ftpPath = (remotePath.length() == 0 || "PUBLIC".equalsIgnoreCase(remotePath)) ? "/" : remotePath;
+                        appendLog("Connecting to FTP " + host + ":" + port + "...");
                         if (!ftp.connect(host, port, user, pass)) {
-                            throw new Exception("FTP connect/login failed");
+                            throw new Exception("FTP login failed (" + ftp.getLastReply() + ")");
                         }
                         if (direction == 0) {
-                            appendLog("Uploading Local -> FTP...");
-                            ftp.copyLocalSubtreeToRemote(localFolder, ftpPath, recursive);
+                            int up = ftp.copyLocalSubtreeToRemote(localFolder, ftpPath, recursive);
+                            appendLog("FTP Upload finished: " + up + " file(s).");
                         } else if (direction == 1) {
-                            appendLog("Downloading FTP -> Local...");
-                            ftp.copySubtreeToLocal(ftpPath, localFolder, recursive);
+                            int down = ftp.copySubtreeToLocal(ftpPath, localFolder, recursive);
+                            appendLog("FTP Download finished: " + down + " file(s).");
                         } else {
-                            appendLog("Bi-Directional FTP sync...");
-                            ftp.copyLocalSubtreeToRemote(localFolder, ftpPath, recursive);
-                            ftp.copySubtreeToLocal(ftpPath, localFolder, recursive);
+                            int up = ftp.copyLocalSubtreeToRemote(localFolder, ftpPath, recursive);
+                            int down = ftp.copySubtreeToLocal(ftpPath, localFolder, recursive);
+                            appendLog("FTP Two-Way Sync finished: " + up + " up, " + down + " down.");
                         }
-                        appendLog("FTP Sync complete.");
                     } catch (Exception e) {
                         appendLog("FTP Sync failed: " + e.getMessage());
                     } finally {
@@ -689,25 +695,28 @@ public class MainActivity extends Activity {
                         appendLog("Connecting to SMB \\\\" + host + "\\" + remotePath + "...");
                         SmbClient.ConnectionProfile prof = new SmbClient.ConnectionProfile();
                         prof.host = host;
+                        prof.server = host;
                         prof.port = port;
                         prof.share = remotePath;
                         prof.username = user;
+                        prof.user = user;
                         prof.password = pass;
+                        prof.pass = pass;
+
                         if (!smb.connect(prof)) {
                             throw new Exception("SMB connect/auth failed");
                         }
                         if (direction == 0) {
-                            appendLog("Uploading Local -> SMB...");
-                            smb.copyLocalSubtreeToRemote(localFolder, "");
+                            int up = syncLocalToSmbForeground(smb, localFolder, "", recursive, mode, deleteExtras);
+                            appendLog("SMB Upload finished: " + up + " file(s).");
                         } else if (direction == 1) {
-                            appendLog("Downloading SMB -> Local...");
-                            smb.copySubtreeToLocal("", localFolder);
+                            int down = syncSmbToLocalForeground(smb, "", localFolder, recursive, mode);
+                            appendLog("SMB Download finished: " + down + " file(s).");
                         } else {
-                            appendLog("Bi-Directional SMB sync...");
-                            smb.copyLocalSubtreeToRemote(localFolder, "");
-                            smb.copySubtreeToLocal("", localFolder);
+                            int up = syncLocalToSmbForeground(smb, localFolder, "", recursive, 0, false);
+                            int down = syncSmbToLocalForeground(smb, "", localFolder, recursive, 0);
+                            appendLog("SMB Two-Way Sync finished: " + up + " up, " + down + " down.");
                         }
-                        appendLog("SMB Sync complete.");
                     } catch (Exception e) {
                         appendLog("SMB Sync failed: " + e.getMessage());
                     } finally {
@@ -716,6 +725,49 @@ public class MainActivity extends Activity {
                 }
             }
         }).start();
+    }
+
+    private int syncLocalToSmbForeground(SmbClient smb, File localDir, String remoteRel,
+                                         boolean recursive, int mode, boolean deleteExtras) {
+        File[] files = localDir.listFiles();
+        if (files == null) return 0;
+        if (remoteRel.length() > 0) smb.mkdirRecursive(remoteRel);
+        int uploaded = 0;
+        for (int i = 0; i < files.length; i++) {
+            File f = files[i];
+            String targetRel = remoteRel.length() > 0 ? (remoteRel + "\\" + f.getName()) : f.getName();
+            if (f.isDirectory()) {
+                if (recursive) {
+                    uploaded += syncLocalToSmbForeground(smb, f, targetRel, true, mode, deleteExtras);
+                }
+            } else if (f.isFile()) {
+                appendLog("SMB Uploading: " + targetRel + " (" + f.length() + " B)");
+                if (smb.copySingleL2r(f.getAbsolutePath(), targetRel)) uploaded++;
+            }
+        }
+        return uploaded;
+    }
+
+    private int syncSmbToLocalForeground(SmbClient smb, String remoteRel, File localDir,
+                                         boolean recursive, int mode) {
+        if (!localDir.exists()) localDir.mkdirs();
+        List<SmbClient.DirectoryItem> items = smb.fetchRemoteDirContents(remoteRel);
+        int downloaded = 0;
+        for (int i = 0; i < items.size(); i++) {
+            SmbClient.DirectoryItem item = items.get(i);
+            if (!recursive && item.path.indexOf('\\') >= 0) continue;
+            File dest = new File(localDir, item.path.replace('\\', File.separatorChar));
+            if (item.isDirectory) {
+                dest.mkdirs();
+            } else {
+                if (mode == 2 && dest.exists()) continue;
+                if (mode == 0 && dest.exists() && dest.length() == item.size) continue;
+                String fullRemote = remoteRel.length() > 0 ? (remoteRel + "\\" + item.path) : item.path;
+                appendLog("SMB Downloading: " + item.path + " (" + item.size + " B)");
+                if (smb.copySingleR2l(fullRemote, dest.getAbsolutePath())) downloaded++;
+            }
+        }
+        return downloaded;
     }
 
     private void appendLog(final String msg) {
@@ -727,7 +779,7 @@ public class MainActivity extends Activity {
     }
 
     // =========================================================================
-    // LUAJ SCRIPT BROWSER & RUNNER
+    // LUAJ BROWSER & RUNNER
     // =========================================================================
 
     public void showLuaFileBrowser(final File dir) {
