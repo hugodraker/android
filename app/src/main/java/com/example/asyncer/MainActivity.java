@@ -4,13 +4,16 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
+import android.view.Window;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -26,6 +29,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -34,6 +38,7 @@ import java.util.Map;
 public class MainActivity extends Activity {
 
     public static final int REQ_PICK_LUA = 9001;
+    public static final int REQ_PERMS = 9002;
 
     private File iniFile;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
@@ -67,15 +72,16 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        try {
+            requestWindowFeature(Window.FEATURE_LEFT_ICON);
+        } catch (Throwable ignored) {}
+
         disableStrictModeSafely();
+        ensureModernStoragePermissions();
 
         iniFile = new File(getFilesDir(), "asyncer.ini");
 
-        // Ensure default /sdcard/sync folder exists on launch
-        File defaultSyncFolder = new File(Environment.getExternalStorageDirectory(), "sync");
-        if (!defaultSyncFolder.exists()) {
-            try { defaultSyncFolder.mkdirs(); } catch (Throwable ignored) {}
-        }
+        File defaultSyncFolder = getDefaultSyncFolder();
 
         ScrollView scroll = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
@@ -134,7 +140,6 @@ public class MainActivity extends Activity {
         etUser = addLabeledInput(root, "Username:", "guest", false);
         etPass = addLabeledInput(root, "Password:", "", true);
 
-        // Share / Remote Folder Dropdown + Test/Probe Button
         TextView lblShare = new TextView(this);
         lblShare.setText("Discovered Shares / FTP Folders:");
         root.addView(lblShare);
@@ -219,7 +224,7 @@ public class MainActivity extends Activity {
         btnBrowseLua.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 File startDir = new File(etLocalDir.getText().toString().trim());
-                if (!startDir.exists()) startDir = Environment.getExternalStorageDirectory();
+                if (!startDir.exists()) startDir = getDefaultSyncFolder();
                 showLuaFileBrowser(startDir);
             }
         });
@@ -289,6 +294,10 @@ public class MainActivity extends Activity {
         scroll.addView(root);
         setContentView(scroll);
 
+        try {
+            getWindow().setFeatureDrawableResource(Window.FEATURE_LEFT_ICON, android.R.drawable.ic_popup_sync);
+        } catch (Throwable ignored) {}
+
         spJobSelect.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
                 if (isUpdatingUI) return;
@@ -307,6 +316,55 @@ public class MainActivity extends Activity {
                 BootReceiver.startServiceCompat(this, new Intent(this, AsyncerService.class));
             } catch (Exception ignored) {}
         }
+    }
+
+    // Requests runtime storage & notification permissions on Android 6 - 15+ via reflection (safe on Android 1.6)
+    private void ensureModernStoragePermissions() {
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                // Check Environment.isExternalStorageManager() on Android 11+ (API 30+)
+                Method isMgr = Environment.class.getMethod("isExternalStorageManager");
+                Boolean granted = (Boolean) isMgr.invoke(null);
+                if (granted != null && !granted.booleanValue()) {
+                    Intent intent = new Intent("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION");
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                }
+            } else if (Build.VERSION.SDK_INT >= 23) {
+                Method checkSelf = Activity.class.getMethod("checkSelfPermission", String.class);
+                Integer res = (Integer) checkSelf.invoke(this, "android.permission.WRITE_EXTERNAL_STORAGE");
+                if (res != null && res.intValue() != PackageManager.PERMISSION_GRANTED) {
+                    Method reqPerms = Activity.class.getMethod("requestPermissions", String[].class, int.class);
+                    reqPerms.invoke(this, new String[] {
+                            "android.permission.READ_EXTERNAL_STORAGE",
+                            "android.permission.WRITE_EXTERNAL_STORAGE"
+                    }, Integer.valueOf(REQ_PERMS));
+                }
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                Method checkSelf = Activity.class.getMethod("checkSelfPermission", String.class);
+                Integer res = (Integer) checkSelf.invoke(this, "android.permission.POST_NOTIFICATIONS");
+                if (res != null && res.intValue() != PackageManager.PERMISSION_GRANTED) {
+                    Method reqPerms = Activity.class.getMethod("requestPermissions", String[].class, int.class);
+                    reqPerms.invoke(this, new String[] { "android.permission.POST_NOTIFICATIONS" }, Integer.valueOf(REQ_PERMS));
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private File getDefaultSyncFolder() {
+        try {
+            File ext = Environment.getExternalStorageDirectory();
+            if (ext != null) {
+                File syncDir = new File(ext, "sync");
+                if (syncDir.exists() || syncDir.mkdirs()) {
+                    return syncDir;
+                }
+            }
+        } catch (Throwable ignored) {}
+        File fallback = new File(getFilesDir(), "sync");
+        if (!fallback.exists()) fallback.mkdirs();
+        return fallback;
     }
 
     private void disableStrictModeSafely() {
@@ -468,7 +526,7 @@ public class MainActivity extends Activity {
         }
         etRemoteSubPath.setText(map.containsKey("remote_override") ? map.get("remote_override") : "");
 
-        String defSync = new File(Environment.getExternalStorageDirectory(), "sync").getAbsolutePath();
+        String defSync = getDefaultSyncFolder().getAbsolutePath();
         String ld = map.containsKey("local_dir") && map.get("local_dir").length() > 0 ? map.get("local_dir") : defSync;
         etLocalDir.setText(ld);
 
@@ -672,13 +730,15 @@ public class MainActivity extends Activity {
             try {
                 if (localFolder.mkdirs()) {
                     appendLog("Created local folder: " + localFolder.getAbsolutePath());
+                } else {
+                    appendLog("Cannot create " + localFolder.getAbsolutePath() + " - grant All Files Access permission.");
+                    ensureModernStoragePermissions();
                 }
             } catch (Throwable t) {
                 appendLog("Warning: Could not create local folder.");
             }
         }
 
-        // Run sync on background thread to prevent NetworkOnMainThreadException on Android 3.0+
         new Thread(new Runnable() {
             public void run() {
                 if (proto == 1) {
@@ -749,7 +809,10 @@ public class MainActivity extends Activity {
     private int syncLocalToSmbForeground(SmbClient smb, File localDir, String remoteRel,
                                          boolean recursive, int mode, boolean deleteExtras) {
         File[] files = localDir.listFiles();
-        if (files == null) return 0;
+        if (files == null) {
+            appendLog("Cannot read local folder (grant storage permission): " + localDir.getAbsolutePath());
+            return 0;
+        }
         if (remoteRel.length() > 0) smb.mkdirRecursive(remoteRel);
         int uploaded = 0;
         for (int i = 0; i < files.length; i++) {
@@ -819,7 +882,10 @@ public class MainActivity extends Activity {
     private int uploadLocalTreeToFtpForeground(FtpClient ftp, File curLocalDir, String normBase, String relPrefix,
                                                boolean recursive, int mode, Map<String, FtpClient.FtpItem> remoteMap) {
         File[] files = curLocalDir.listFiles();
-        if (files == null) return 0;
+        if (files == null) {
+            appendLog("Cannot read local folder (grant storage permission): " + curLocalDir.getAbsolutePath());
+            return 0;
+        }
         int uploaded = 0;
         for (int i = 0; i < files.length; i++) {
             File f = files[i];
@@ -1026,4 +1092,4 @@ public class MainActivity extends Activity {
             return def;
         }
     }
-        }
+    }
