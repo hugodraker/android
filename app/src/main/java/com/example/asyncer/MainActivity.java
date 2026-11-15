@@ -67,12 +67,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        disableStrictModeSafely();
+
         iniFile = new File(getFilesDir(), "asyncer.ini");
 
         // Ensure default /sdcard/sync folder exists on launch
         File defaultSyncFolder = new File(Environment.getExternalStorageDirectory(), "sync");
         if (!defaultSyncFolder.exists()) {
-            defaultSyncFolder.mkdirs();
+            try { defaultSyncFolder.mkdirs(); } catch (Throwable ignored) {}
         }
 
         ScrollView scroll = new ScrollView(this);
@@ -307,6 +309,18 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void disableStrictModeSafely() {
+        try {
+            Class<?> smClass = Class.forName("android.os.StrictMode");
+            Class<?> tpClass = Class.forName("android.os.StrictMode$ThreadPolicy");
+            Class<?> bldClass = Class.forName("android.os.StrictMode$ThreadPolicy$Builder");
+            Object bld = bldClass.getConstructor().newInstance();
+            bld = bldClass.getMethod("permitAll").invoke(bld);
+            Object pol = bldClass.getMethod("build").invoke(bld);
+            smClass.getMethod("setThreadPolicy", tpClass).invoke(null, pol);
+        } catch (Throwable ignored) {}
+    }
+
     private EditText addLabeledInput(LinearLayout parent, String label, String defVal, boolean isPass) {
         TextView tv = new TextView(this);
         tv.setText(label);
@@ -487,7 +501,9 @@ public class MainActivity extends Activity {
         }
 
         File localFolder = new File(etLocalDir.getText().toString().trim());
-        if (!localFolder.exists()) localFolder.mkdirs();
+        if (!localFolder.exists()) {
+            try { localFolder.mkdirs(); } catch (Throwable ignored) {}
+        }
 
         map.put("protocol", String.valueOf(spProtocol.getSelectedItemPosition()));
         map.put("host", etHost.getText().toString().trim());
@@ -653,13 +669,16 @@ public class MainActivity extends Activity {
         }
 
         if (!localFolder.exists()) {
-            if (localFolder.mkdirs()) {
-                appendLog("Created local folder: " + localFolder.getAbsolutePath());
-            } else {
-                appendLog("Warning: Could not create " + localFolder.getAbsolutePath());
+            try {
+                if (localFolder.mkdirs()) {
+                    appendLog("Created local folder: " + localFolder.getAbsolutePath());
+                }
+            } catch (Throwable t) {
+                appendLog("Warning: Could not create local folder.");
             }
         }
 
+        // Run sync on background thread to prevent NetworkOnMainThreadException on Android 3.0+
         new Thread(new Runnable() {
             public void run() {
                 if (proto == 1) {
@@ -674,14 +693,14 @@ public class MainActivity extends Activity {
                             throw new Exception("FTP login failed (" + ftp.getLastReply() + ")");
                         }
                         if (direction == 0) {
-                            int up = ftp.copyLocalSubtreeToRemote(localFolder, ftpPath, recursive);
+                            int up = syncLocalToFtpForeground(ftp, localFolder, ftpPath, recursive, mode, deleteExtras);
                             appendLog("FTP Upload finished: " + up + " file(s).");
                         } else if (direction == 1) {
-                            int down = ftp.copySubtreeToLocal(ftpPath, localFolder, recursive);
+                            int down = syncFtpToLocalForeground(ftp, ftpPath, localFolder, recursive, mode, deleteExtras);
                             appendLog("FTP Download finished: " + down + " file(s).");
                         } else {
-                            int up = ftp.copyLocalSubtreeToRemote(localFolder, ftpPath, recursive);
-                            int down = ftp.copySubtreeToLocal(ftpPath, localFolder, recursive);
+                            int up = syncLocalToFtpForeground(ftp, localFolder, ftpPath, recursive, 0, false);
+                            int down = syncFtpToLocalForeground(ftp, ftpPath, localFolder, recursive, 0, false);
                             appendLog("FTP Two-Way Sync finished: " + up + " up, " + down + " down.");
                         }
                     } catch (Exception e) {
@@ -768,6 +787,121 @@ public class MainActivity extends Activity {
             }
         }
         return downloaded;
+    }
+
+    private int syncLocalToFtpForeground(FtpClient ftp, File localDir, String remoteBaseDir,
+                                         boolean recursive, int mode, boolean deleteExtras) {
+        String normBase = FtpClient.normalizeFtpPath(remoteBaseDir);
+        ftp.mkdirRecursive(normBase);
+
+        List<FtpClient.FtpItem> remoteItems = ftp.fetchRemoteDirContents(normBase, recursive);
+        Map<String, FtpClient.FtpItem> remoteMap = new HashMap<String, FtpClient.FtpItem>();
+        for (int i = 0; i < remoteItems.size(); i++) {
+            FtpClient.FtpItem it = remoteItems.get(i);
+            remoteMap.put(it.path.toLowerCase(), it);
+        }
+
+        int uploaded = uploadLocalTreeToFtpForeground(ftp, localDir, normBase, "", recursive, mode, remoteMap);
+
+        if (deleteExtras) {
+            for (Map.Entry<String, FtpClient.FtpItem> e : remoteMap.entrySet()) {
+                FtpClient.FtpItem extra = e.getValue();
+                if (!extra.isDirectory) {
+                    String fullRemote = "/".equals(normBase) ? ("/" + extra.path) : (normBase + "/" + extra.path);
+                    appendLog("FTP Deleting extra: " + fullRemote);
+                    ftp.deleteRemote(fullRemote, false);
+                }
+            }
+        }
+        return uploaded;
+    }
+
+    private int uploadLocalTreeToFtpForeground(FtpClient ftp, File curLocalDir, String normBase, String relPrefix,
+                                               boolean recursive, int mode, Map<String, FtpClient.FtpItem> remoteMap) {
+        File[] files = curLocalDir.listFiles();
+        if (files == null) return 0;
+        int uploaded = 0;
+        for (int i = 0; i < files.length; i++) {
+            File f = files[i];
+            String relPath = relPrefix.length() > 0 ? (relPrefix + "/" + f.getName()) : f.getName();
+            String fullRemote = "/".equals(normBase) ? ("/" + relPath) : (normBase + "/" + relPath);
+
+            if (f.isDirectory()) {
+                if (recursive) {
+                    ftp.mkdirRecursive(fullRemote);
+                    uploaded += uploadLocalTreeToFtpForeground(ftp, f, normBase, relPath, true, mode, remoteMap);
+                }
+            } else if (f.isFile()) {
+                FtpClient.FtpItem existing = remoteMap.remove(relPath.toLowerCase());
+                boolean shouldUpload = true;
+                if (existing != null) {
+                    if (mode == 2) {
+                        shouldUpload = false;
+                    } else if (mode == 0 && existing.size == f.length()) {
+                        shouldUpload = false;
+                    }
+                }
+                if (shouldUpload) {
+                    appendLog("FTP Uploading: " + relPath + " (" + f.length() + " B)");
+                    if (ftp.uploadFile(f, fullRemote)) uploaded++;
+                }
+            }
+        }
+        return uploaded;
+    }
+
+    private int syncFtpToLocalForeground(FtpClient ftp, String remoteBaseDir, File localFolder,
+                                         boolean recursive, int mode, boolean deleteExtras) {
+        if (!localFolder.exists()) localFolder.mkdirs();
+        String normBase = FtpClient.normalizeFtpPath(remoteBaseDir);
+        List<FtpClient.FtpItem> remoteItems = ftp.fetchRemoteDirContents(normBase, recursive);
+        Map<String, Boolean> seenLocalPaths = new HashMap<String, Boolean>();
+
+        int downloaded = 0;
+        for (int i = 0; i < remoteItems.size(); i++) {
+            FtpClient.FtpItem item = remoteItems.get(i);
+            File localDest = new File(localFolder, item.path.replace('/', File.separatorChar));
+            seenLocalPaths.put(localDest.getAbsolutePath().toLowerCase(), Boolean.TRUE);
+
+            if (item.isDirectory) {
+                localDest.mkdirs();
+            } else {
+                boolean shouldDownload = true;
+                if (localDest.exists()) {
+                    if (mode == 2) {
+                        shouldDownload = false;
+                    } else if (mode == 0 && localDest.length() == item.size) {
+                        shouldDownload = false;
+                    }
+                }
+                if (shouldDownload) {
+                    String fullRemote = "/".equals(normBase) ? ("/" + item.path) : (normBase + "/" + item.path);
+                    appendLog("FTP Downloading: " + item.path + " (" + item.size + " B)");
+                    if (ftp.downloadFile(fullRemote, localDest)) downloaded++;
+                }
+            }
+        }
+
+        if (deleteExtras) {
+            pruneUnseenLocalFiles(localFolder, seenLocalPaths, recursive);
+        }
+        return downloaded;
+    }
+
+    private void pruneUnseenLocalFiles(File dir, Map<String, Boolean> seenMap, boolean recursive) {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (int i = 0; i < files.length; i++) {
+            File f = files[i];
+            if (f.isDirectory()) {
+                if (recursive) pruneUnseenLocalFiles(f, seenMap, true);
+            } else {
+                if (!seenMap.containsKey(f.getAbsolutePath().toLowerCase())) {
+                    appendLog("Deleting extra local file: " + f.getName());
+                    f.delete();
+                }
+            }
+        }
     }
 
     private void appendLog(final String msg) {
@@ -892,4 +1026,4 @@ public class MainActivity extends Activity {
             return def;
         }
     }
-}
+        }
