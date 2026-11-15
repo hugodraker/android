@@ -13,7 +13,6 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,17 +35,22 @@ public class AsyncerService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        promoteToForeground();
         if (!isRunning) {
             isRunning = true;
             syncThread = new Thread(new Runnable() {
                 public void run() {
-                    executeAllSyncJobs();
-                    stopSelf();
+                    try {
+                        executeAllSyncJobs();
+                    } finally {
+                        isRunning = false;
+                        stopSelf();
+                    }
                 }
             });
             syncThread.start();
         }
-        return 2; // START_NOT_STICKY (value 2, safe on API 4)
+        return 2; // START_NOT_STICKY
     }
 
     @Override
@@ -58,12 +62,12 @@ public class AsyncerService extends Service {
         super.onDestroy();
     }
 
-    // Reflection-backed foreground service promotion so Android 1.6 Dalvik Verifier never crashes
+    // Reflection-backed foreground service promotion for Android 1.6 (API 4) through Android 15+ (API 34+)
     private void promoteToForeground() {
         try {
             Intent notificationIntent = new Intent(this, MainActivity.class);
             int flags = (Build.VERSION.SDK_INT >= 23)
-                    ? (PendingIntent.FLAG_UPDATE_CURRENT | 0x04000000)
+                    ? (PendingIntent.FLAG_UPDATE_CURRENT | 0x04000000) // FLAG_IMMUTABLE
                     : PendingIntent.FLAG_UPDATE_CURRENT;
             PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, notificationIntent, flags);
 
@@ -107,19 +111,19 @@ public class AsyncerService extends Service {
                 setLatest.invoke(notification, this, "Asyncer", "Running background sync...", pendingIntent);
             }
 
-            if (Build.VERSION.SDK_INT >= 5 && notification != null) {
-                Method startFg = Service.class.getMethod("startForeground", int.class, Notification.class);
-                startFg.invoke(this, Integer.valueOf(199), notification);
+            if (Build.VERSION.SDK_INT >= 29 && notification != null) {
+                // Android 10 - 15+ (API 29 - 34+): pass FOREGROUND_SERVICE_TYPE_DATA_SYNC = 1
+                Method startFg3 = Service.class.getMethod("startForeground", int.class, Notification.class, int.class);
+                startFg3.invoke(this, Integer.valueOf(199), notification, Integer.valueOf(1));
+            } else if (Build.VERSION.SDK_INT >= 5 && notification != null) {
+                Method startFg2 = Service.class.getMethod("startForeground", int.class, Notification.class);
+                startFg2.invoke(this, Integer.valueOf(199), notification);
             } else {
                 Method setFg = Service.class.getMethod("setForeground", boolean.class);
                 setFg.invoke(this, Boolean.TRUE);
             }
         } catch (Throwable ignored) {}
     }
-
-    // =========================================================================
-    // MULTI-JOB EXECUTION (SMB & FTP)
-    // =========================================================================
 
     private void executeAllSyncJobs() {
         File iniFile = new File(getFilesDir(), "asyncer.ini");
@@ -135,15 +139,15 @@ public class AsyncerService extends Service {
             if (!isRunning) break;
             Map<String, String> job = entry.getValue();
 
-            int protocol = parseIntSafe(job.get("protocol"), 0); // 0 = SMB, 1 = FTP
+            int protocol = parseIntSafe(job.get("protocol"), 0);
             String host = job.get("host");
             String portStr = job.get("port");
             String user = job.get("user");
             String pass = job.get("pass");
             String remotePath = job.get("remote_path");
             String localDirStr = job.get("local_dir");
-            int direction = parseIntSafe(job.get("direction"), 0); // 0=L->R, 1=R->L, 2=BiDir
-            int mode = parseIntSafe(job.get("mode"), 0);           // 0=Update, 1=Overwrite, 2=Skip
+            int direction = parseIntSafe(job.get("direction"), 0);
+            int mode = parseIntSafe(job.get("mode"), 0);
             boolean recursive = !"0".equals(job.get("recursive"));
             boolean deleteExtras = "1".equals(job.get("delete_extras"));
 
@@ -155,11 +159,10 @@ public class AsyncerService extends Service {
                     : new File(Environment.getExternalStorageDirectory(), "sync");
 
             if (!localDir.exists()) {
-                localDir.mkdirs();
+                try { localDir.mkdirs(); } catch (Throwable ignored) {}
             }
 
             if (protocol == 1) {
-                // FTP JOB
                 int ftpPort = parseIntSafe(portStr, 21);
                 String ftpRemote = (remotePath == null || remotePath.trim().length() == 0) ? "/" : remotePath.trim();
                 try {
@@ -178,7 +181,6 @@ public class AsyncerService extends Service {
                     ftpClient.disconnect();
                 }
             } else {
-                // SMB JOB
                 int smbPort = parseIntSafe(portStr, 445);
                 try {
                     SmbClient.ConnectionProfile prof = new SmbClient.ConnectionProfile();
@@ -208,10 +210,6 @@ public class AsyncerService extends Service {
             }
         }
     }
-
-    // =========================================================================
-    // SMB SYNC ENGINE
-    // =========================================================================
 
     private void syncLocalToSmb(SmbClient client, File localFolder, String remoteSubPath,
                                 boolean recursive, int mode, boolean deleteExtras) {
@@ -244,9 +242,9 @@ public class AsyncerService extends Service {
                 boolean shouldUpload = true;
                 if (existing != null) {
                     if (mode == 2) {
-                        shouldUpload = false; // Skip Existing
+                        shouldUpload = false;
                     } else if (mode == 0 && existing.size == f.length() && existing.getUnixTimeMs() >= f.lastModified()) {
-                        shouldUpload = false; // Update mode: remote is same/newer
+                        shouldUpload = false;
                     }
                 }
                 if (shouldUpload) {
@@ -269,7 +267,6 @@ public class AsyncerService extends Service {
                                 boolean recursive, int mode, boolean deleteExtras) {
         if (!localFolder.exists()) localFolder.mkdirs();
         List<SmbClient.DirectoryItem> remoteItems = client.fetchRemoteDirContents(remoteSubPath);
-
         Map<String, Boolean> seenRelPaths = new HashMap<String, Boolean>();
 
         for (int i = 0; i < remoteItems.size(); i++) {
@@ -302,10 +299,6 @@ public class AsyncerService extends Service {
             pruneUnseenLocalFiles(localFolder, seenRelPaths, recursive);
         }
     }
-
-    // =========================================================================
-    // FTP SYNC ENGINE
-    // =========================================================================
 
     private void syncLocalToFtp(FtpClient ftp, File localFolder, String remoteBaseDir,
                                 boolean recursive, int mode, boolean deleteExtras) {
@@ -465,4 +458,4 @@ public class AsyncerService extends Service {
             return def;
         }
     }
-}
+                    }
