@@ -263,11 +263,6 @@ public class TrackerService extends Service {
         }
     }
 
-    /**
-     * Organic Maps-style Single-Shot GNSS Polling:
-     * Powers on the GPS hardware only for the exact duration of a fix poll,
-     * then IMMEDIATELY unregisters updates so the system GPS icon turns off.
-     */
     private void triggerSingleShotGpsPoll() {
         if (locationManager == null) return;
         try {
@@ -294,17 +289,16 @@ public class TrackerService extends Service {
                 } else if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
                     locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0L, 0.0f, oneShot, Looper.getMainLooper());
                 }
-                // Timeout failsafe after 10 seconds to ensure GPS is never left active
                 mainHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
                         try { locationManager.removeUpdates(oneShot); } catch (Exception ignored) {}
-                        handleSampledLocation(getBestOfflineFallbackLocation(System.currentTimeMillis()));
+                        handleSampledLocation(getBestOfflineFallbackLocation());
                     }
                 }, 10000L);
             }
         } catch (Exception ignored) {
-            handleSampledLocation(getBestOfflineFallbackLocation(System.currentTimeMillis()));
+            handleSampledLocation(getBestOfflineFallbackLocation());
         }
     }
 
@@ -317,7 +311,13 @@ public class TrackerService extends Service {
             pt = new GpsPoint(loc.getLatitude(), loc.getLongitude(), now, acc);
             saveValidPoint(pt);
         } else {
-            pt = getBestOfflineFallbackLocation(now);
+            Location fallback = getBestOfflineFallbackLocation();
+            if (fallback != null && isValidCoordinate(fallback.getLatitude(), fallback.getLongitude())) {
+                float acc = fallback.hasAccuracy() ? fallback.getAccuracy() : 20.0f;
+                pt = new GpsPoint(fallback.getLatitude(), fallback.getLongitude(), now, acc);
+            } else if (lastValidPoint != null) {
+                pt = new GpsPoint(lastValidPoint.lat, lastValidPoint.lon, now, lastValidPoint.accuracy);
+            }
         }
 
         if (pt != null) {
@@ -389,7 +389,8 @@ public class TrackerService extends Service {
         ed.commit();
     }
 
-    private GpsPoint getBestOfflineFallbackLocation(long now) {
+    private Location getBestOfflineFallbackLocation() {
+        if (locationManager == null) return null;
         try {
             List<String> providers = locationManager.getAllProviders();
             Location best = null;
@@ -403,15 +404,10 @@ public class TrackerService extends Service {
                     }
                 }
             }
-            if (best != null) {
-                return new GpsPoint(best.getLatitude(), best.getLongitude(), now, best.hasAccuracy() ? best.getAccuracy() : 20.0f);
-            }
-        } catch (Exception ignored) {}
-
-        if (lastValidPoint != null) {
-            return new GpsPoint(lastValidPoint.lat, lastValidPoint.lon, now, lastValidPoint.accuracy);
+            return best;
+        } catch (Exception ignored) {
+            return null;
         }
-        return null;
     }
 
     private static double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
@@ -835,4 +831,4 @@ public class TrackerService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-                        }
+                }
