@@ -40,6 +40,9 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -52,6 +55,11 @@ import java.util.Locale;
 import java.util.Map;
 
 public class MainActivity extends Activity {
+    private static final int REQ_EXPORT_DB = 101;
+    private static final int REQ_IMPORT_DB = 102;
+    private static final int REQ_EXPORT_CFG = 103;
+    private static final int REQ_IMPORT_CFG = 104;
+
     private SharedPreferences prefs;
     private boolean isTracking = false;
     private Button btnToggle;
@@ -231,20 +239,15 @@ public class MainActivity extends Activity {
         });
         layout.addView(btnSave);
 
-        LinearLayout ioLayout = new LinearLayout(this);
-        ioLayout.setOrientation(LinearLayout.HORIZONTAL);
-
+        // =====================================================================
+        // FILE OPERATIONS: 2x2 Grid Layout
+        // =====================================================================
         Button btnExportDb = new Button(this);
         btnExportDb.setText("Export DB");
         btnExportDb.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                promptFilename("travel_data.db", "Export DB Filename", new FileAction() {
-                    @Override
-                    public void execute(String filename) {
-                        exportDb(filename);
-                    }
-                });
+                exportDb();
             }
         });
 
@@ -253,12 +256,7 @@ public class MainActivity extends Activity {
         btnImportDb.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                promptFilename("travel_data.db", "Import DB Filename", new FileAction() {
-                    @Override
-                    public void execute(String filename) {
-                        importDb(filename);
-                    }
-                });
+                importDb();
             }
         });
 
@@ -267,12 +265,7 @@ public class MainActivity extends Activity {
         btnExportCfg.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                promptFilename("tracker_settings.cfg", "Export Settings Filename", new FileAction() {
-                    @Override
-                    public void execute(String filename) {
-                        exportSettings(filename);
-                    }
-                });
+                exportSettings();
             }
         });
 
@@ -281,21 +274,32 @@ public class MainActivity extends Activity {
         btnImportCfg.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                promptFilename("tracker_settings.cfg", "Import Settings Filename", new FileAction() {
-                    @Override
-                    public void execute(String filename) {
-                        importSettings(filename);
-                    }
-                });
+                importSettings();
             }
         });
 
-        ioLayout.addView(btnExportDb);
-        ioLayout.addView(btnImportDb);
-        ioLayout.addView(btnExportCfg);
-        ioLayout.addView(btnImportCfg);
-        layout.addView(ioLayout);
+        LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f);
+        btnExportDb.setLayoutParams(btnParams);
+        btnImportDb.setLayoutParams(btnParams);
+        btnExportCfg.setLayoutParams(btnParams);
+        btnImportCfg.setLayoutParams(btnParams);
 
+        LinearLayout dbLayout = new LinearLayout(this);
+        dbLayout.setOrientation(LinearLayout.HORIZONTAL);
+        dbLayout.addView(btnExportDb);
+        dbLayout.addView(btnImportDb);
+        
+        LinearLayout cfgLayout = new LinearLayout(this);
+        cfgLayout.setOrientation(LinearLayout.HORIZONTAL);
+        cfgLayout.addView(btnExportCfg);
+        cfgLayout.addView(btnImportCfg);
+
+        layout.addView(dbLayout);
+        layout.addView(cfgLayout);
+
+        // =====================================================================
+        // ERASE ALL DATA
+        // =====================================================================
         Button btnEraseAll = new Button(this);
         btnEraseAll.setText("Erase All Saved Data");
         btnEraseAll.setOnClickListener(new View.OnClickListener() {
@@ -444,6 +448,8 @@ public class MainActivity extends Activity {
         ed.remove("anchor_lon");
         ed.remove("anchor_start");
         ed.remove("anchor_last_seen");
+        ed.remove("last_valid_lat");
+        ed.remove("last_valid_lon");
         ed.commit();
 
         Intent serviceIntent = new Intent(this, TrackerService.class);
@@ -637,7 +643,6 @@ public class MainActivity extends Activity {
         eCoords.setHint("Lat,Lon");
         eCoords.setWidth(280);
 
-        // When a location name or coordinate is edited, automatically update all other rows sharing matching coordinates
         TextWatcher renameWatcher = new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
@@ -689,7 +694,6 @@ public class MainActivity extends Activity {
         locationsLayout.addView(row);
     }
 
-    // Automatically batch-updates matching coordinate entries across all special locations
     private void saveLocationsToPrefs() {
         List<String[]> entries = new ArrayList<String[]>();
         for (int i = 0; i < locationsLayout.getChildCount(); i++) {
@@ -699,12 +703,11 @@ public class MainActivity extends Activity {
             boolean omit = ((Button) row.getChildAt(2)).getText().toString().equals("OMIT");
 
             if (name.length() > 0 && coords.length() > 0) {
-                // Check if any existing entry has matching coordinates; if so, batch update its name
                 boolean merged = false;
                 for (int j = 0; j < entries.size(); j++) {
                     String[] existing = entries.get(j);
                     if (existing[1].equalsIgnoreCase(coords)) {
-                        existing[0] = name; // Update name for all matching coordinate entries
+                        existing[0] = name;
                         existing[2] = String.valueOf(omit);
                         merged = true;
                         break;
@@ -743,6 +746,215 @@ public class MainActivity extends Activity {
         }
     }
 
+    // =====================================================================
+    // NATIVE FILE PICKER & STORAGE OPERATIONS
+    // =====================================================================
+
+    private void ensureDbExists() {
+        File currentDB = getDatabasePath("travel_events.db");
+        if (!currentDB.exists()) {
+            try {
+                if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
+                SQLiteDatabase tmp = SQLiteDatabase.openOrCreateDatabase(currentDB, null);
+                tmp.execSQL("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, lat REAL, lon REAL, start_time INTEGER, end_time INTEGER, duration_hours REAL, dist_km REAL, dist_mi REAL)");
+                tmp.close();
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void exportDb() {
+        ensureDbExists();
+        if (Build.VERSION.SDK_INT >= 19) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("application/octet-stream");
+                intent.putExtra(Intent.EXTRA_TITLE, "travel_data.db");
+                startActivityForResult(intent, REQ_EXPORT_DB);
+            } catch (Exception e) {
+                exportDbLegacy();
+            }
+        } else {
+            exportDbLegacy();
+        }
+    }
+
+    private void importDb() {
+        if (Build.VERSION.SDK_INT >= 19) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                startActivityForResult(intent, REQ_IMPORT_DB);
+            } catch (Exception e) {
+                importDbLegacy();
+            }
+        } else {
+            importDbLegacy();
+        }
+    }
+
+    private void exportSettings() {
+        saveAllSettingsToPrefs();
+        if (Build.VERSION.SDK_INT >= 19) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("text/plain");
+                intent.putExtra(Intent.EXTRA_TITLE, "tracker_settings.cfg");
+                startActivityForResult(intent, REQ_EXPORT_CFG);
+            } catch (Exception e) {
+                exportSettingsLegacy();
+            }
+        } else {
+            exportSettingsLegacy();
+        }
+    }
+
+    private void importSettings() {
+        if (Build.VERSION.SDK_INT >= 19) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                startActivityForResult(intent, REQ_IMPORT_CFG);
+            } catch (Exception e) {
+                importSettingsLegacy();
+            }
+        } else {
+            importSettingsLegacy();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri uri = data.getData();
+            try {
+                if (requestCode == REQ_EXPORT_DB) {
+                    exportDbToUri(uri);
+                } else if (requestCode == REQ_IMPORT_DB) {
+                    importDbFromUri(uri);
+                } else if (requestCode == REQ_EXPORT_CFG) {
+                    exportCfgToUri(uri);
+                } else if (requestCode == REQ_IMPORT_CFG) {
+                    importCfgFromUri(uri);
+                }
+            } catch (Exception e) {
+                Toast.makeText(this, "Operation failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    private void copyStream(InputStream is, OutputStream os) throws Exception {
+        byte[] buffer = new byte[4096];
+        int len;
+        while ((len = is.read(buffer)) > 0) {
+            os.write(buffer, 0, len);
+        }
+        os.flush();
+    }
+
+    private void exportDbToUri(Uri uri) throws Exception {
+        File currentDB = getDatabasePath("travel_events.db");
+        InputStream is = new FileInputStream(currentDB);
+        OutputStream os = getContentResolver().openOutputStream(uri);
+        if (os != null) {
+            copyStream(is, os);
+            os.close();
+            is.close();
+            Toast.makeText(this, "DB Exported Successfully", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void importDbFromUri(Uri uri) throws Exception {
+        boolean wasTracking = isTracking;
+        if (wasTracking) toggleTracker(false);
+
+        File currentDB = getDatabasePath("travel_events.db");
+        if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
+        new File(currentDB.getAbsolutePath() + "-wal").delete();
+        new File(currentDB.getAbsolutePath() + "-shm").delete();
+        new File(currentDB.getAbsolutePath() + "-journal").delete();
+
+        InputStream is = getContentResolver().openInputStream(uri);
+        OutputStream os = new FileOutputStream(currentDB);
+        if (is != null) {
+            copyStream(is, os);
+            os.close();
+            is.close();
+            Toast.makeText(this, "DB Imported Successfully. Restarting...", Toast.LENGTH_LONG).show();
+        }
+        
+        if (wasTracking) toggleTracker(true);
+    }
+
+    private void exportCfgToUri(Uri uri) throws Exception {
+        OutputStream os = getContentResolver().openOutputStream(uri);
+        if (os == null) return;
+        Map<String, ?> all = prefs.getAll();
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, ?> entry : all.entrySet()) {
+            String k = entry.getKey();
+            Object v = entry.getValue();
+            if (v instanceof Boolean) sb.append(k).append("=B:").append(v).append("\n");
+            else if (v instanceof Integer) sb.append(k).append("=I:").append(v).append("\n");
+            else if (v instanceof Long) sb.append(k).append("=L:").append(v).append("\n");
+            else if (v instanceof Float) sb.append(k).append("=F:").append(v).append("\n");
+            else if (v instanceof String) sb.append(k).append("=S:").append(v.toString().replace("\n", "")).append("\n");
+        }
+        os.write(sb.toString().getBytes("UTF-8"));
+        os.flush();
+        os.close();
+        Toast.makeText(this, "Config Exported Successfully", Toast.LENGTH_SHORT).show();
+    }
+
+    private void importCfgFromUri(Uri uri) throws Exception {
+        InputStream is = getContentResolver().openInputStream(uri);
+        if (is == null) return;
+        BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+        SharedPreferences.Editor ed = prefs.edit();
+        String line;
+        while ((line = br.readLine()) != null) {
+            int eq = line.indexOf('=');
+            if (eq <= 0 || eq + 3 > line.length()) continue;
+            String key = line.substring(0, eq).trim();
+            String type = line.substring(eq + 1, eq + 3);
+            String val = line.substring(eq + 3);
+
+            if ("B:".equals(type)) ed.putBoolean(key, Boolean.parseBoolean(val));
+            else if ("I:".equals(type)) ed.putInt(key, parseIntSafe(val, 0));
+            else if ("L:".equals(type)) ed.putLong(key, parseLongSafe(val, 0L));
+            else if ("F:".equals(type)) ed.putFloat(key, parseFloatSafe(val, 0.0f));
+            else if ("S:".equals(type)) ed.putString(key, val);
+        }
+        br.close();
+        is.close();
+        ed.commit();
+
+        chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
+        chkOutputLocations.setChecked(prefs.getBoolean("output_locations", false));
+        editUser.setText(prefs.getString("http_user", "admin"));
+        editPass.setText(prefs.getString("http_pass", "password"));
+        editPort.setText(String.valueOf(prefs.getInt("http_port", 8080)));
+        editInterval.setText(String.valueOf(prefs.getLong("interval", 60000L)));
+        editStayMins.setText(String.valueOf(prefs.getInt("stay_mins", 5)));
+        editDist.setText(String.valueOf(prefs.getFloat("distance", 75.0f)));
+        editStartHr.setText(String.valueOf(prefs.getInt("start_hour", 0)));
+        editEndHr.setText(String.valueOf(prefs.getInt("end_hour", 24)));
+        loadLocationsFromPrefs();
+        updateLinkText(true);
+        refreshCurrentCoordinatesBox();
+
+        if (isTracking) reloadServiceSettings();
+        Toast.makeText(this, "Config Imported Successfully", Toast.LENGTH_SHORT).show();
+    }
+
+    // =====================================================================
+    // LEGACY STORAGE FALLBACK (For Android 1.6 - 4.3)
+    // =====================================================================
+
     private void promptFilename(String defaultName, String title, final FileAction action) {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle(title);
@@ -778,180 +990,176 @@ public class MainActivity extends Activity {
         return dirs;
     }
 
-    private void exportDb(String filename) {
-        File currentDB = getDatabasePath("travel_events.db");
-        if (!currentDB.exists()) {
-            try {
-                if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
-                SQLiteDatabase tmp = SQLiteDatabase.openOrCreateDatabase(currentDB, null);
-                tmp.execSQL("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, lat REAL, lon REAL, start_time INTEGER, end_time INTEGER, duration_hours REAL, dist_km REAL, dist_mi REAL)");
-                tmp.close();
-            } catch (Exception ignored) {}
-        }
+    private void exportDbLegacy() {
+        promptFilename("travel_data.db", "Export DB Filename", new FileAction() {
+            @Override
+            public void execute(String filename) {
+                File currentDB = getDatabasePath("travel_events.db");
+                for (File dir : getCandidateBackupDirs()) {
+                    try {
+                        if (!dir.exists()) dir.mkdirs();
+                        File out = new File(dir, filename);
+                        copyStream(new FileInputStream(currentDB), new FileOutputStream(out));
+                        if (out.exists() && out.length() > 0) {
+                            Toast.makeText(MainActivity.this, "Exported DB to:\n" + out.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                            return;
+                        }
+                    } catch (Exception ignored) {}
+                }
+                Toast.makeText(MainActivity.this, "DB Export failed on all storage paths", Toast.LENGTH_LONG).show();
+            }
+        });
+    }
 
-        for (File dir : getCandidateBackupDirs()) {
-            try {
-                if (!dir.exists()) dir.mkdirs();
-                File out = new File(dir, filename);
-                copyFile(currentDB, out);
-                if (out.exists() && out.length() > 0) {
-                    Toast.makeText(this, "Exported DB to:\n" + out.getAbsolutePath(), Toast.LENGTH_LONG).show();
+    private void importDbLegacy() {
+        promptFilename("travel_data.db", "Import DB Filename", new FileAction() {
+            @Override
+            public void execute(String filename) {
+                File sourceFile = null;
+                File direct = new File(filename);
+                if (direct.isAbsolute() && direct.exists()) {
+                    sourceFile = direct;
+                } else {
+                    for (File dir : getCandidateBackupDirs()) {
+                        File candidate = new File(dir, filename);
+                        if (candidate.exists() && candidate.length() > 0) {
+                            sourceFile = candidate;
+                            break;
+                        }
+                    }
+                }
+
+                if (sourceFile == null) {
+                    Toast.makeText(MainActivity.this, "Backup file not found: " + filename, Toast.LENGTH_LONG).show();
                     return;
                 }
-            } catch (Exception ignored) {}
-        }
-        Toast.makeText(this, "DB Export failed on all storage paths", Toast.LENGTH_LONG).show();
-    }
 
-    private void importDb(String filename) {
-        File sourceFile = null;
-        File direct = new File(filename);
-        if (direct.isAbsolute() && direct.exists()) {
-            sourceFile = direct;
-        } else {
-            for (File dir : getCandidateBackupDirs()) {
-                File candidate = new File(dir, filename);
-                if (candidate.exists() && candidate.length() > 0) {
-                    sourceFile = candidate;
-                    break;
+                boolean wasTracking = isTracking;
+                if (wasTracking) toggleTracker(false);
+
+                try {
+                    File currentDB = getDatabasePath("travel_events.db");
+                    if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
+                    new File(currentDB.getAbsolutePath() + "-wal").delete();
+                    new File(currentDB.getAbsolutePath() + "-shm").delete();
+                    new File(currentDB.getAbsolutePath() + "-journal").delete();
+
+                    copyStream(new FileInputStream(sourceFile), new FileOutputStream(currentDB));
+                    Toast.makeText(MainActivity.this, "Imported DB from:\n" + sourceFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "DB Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 }
+
+                if (wasTracking) toggleTracker(true);
             }
-        }
-
-        if (sourceFile == null) {
-            Toast.makeText(this, "Backup file not found: " + filename, Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        boolean wasTracking = isTracking;
-        if (wasTracking) {
-            toggleTracker(false);
-        }
-
-        try {
-            File currentDB = getDatabasePath("travel_events.db");
-            if (currentDB.getParentFile() != null) currentDB.getParentFile().mkdirs();
-            new File(currentDB.getAbsolutePath() + "-wal").delete();
-            new File(currentDB.getAbsolutePath() + "-shm").delete();
-            new File(currentDB.getAbsolutePath() + "-journal").delete();
-
-            copyFile(sourceFile, currentDB);
-            Toast.makeText(this, "Imported DB from:\n" + sourceFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "DB Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
-
-        if (wasTracking) {
-            toggleTracker(true);
-        }
+        });
     }
 
-    private void exportSettings(String filename) {
-        saveAllSettingsToPrefs();
-        Map<String, ?> all = prefs.getAll();
+    private void exportSettingsLegacy() {
+        promptFilename("tracker_settings.cfg", "Export Settings Filename", new FileAction() {
+            @Override
+            public void execute(String filename) {
+                saveAllSettingsToPrefs();
+                Map<String, ?> all = prefs.getAll();
 
-        for (File dir : getCandidateBackupDirs()) {
-            FileWriter fw = null;
-            try {
-                if (!dir.exists()) dir.mkdirs();
-                File out = new File(dir, filename);
-                fw = new FileWriter(out, false);
-                for (Map.Entry<String, ?> entry : all.entrySet()) {
-                    String k = entry.getKey();
-                    Object v = entry.getValue();
-                    if (v instanceof Boolean) fw.write(k + "=B:" + v + "\n");
-                    else if (v instanceof Integer) fw.write(k + "=I:" + v + "\n");
-                    else if (v instanceof Long) fw.write(k + "=L:" + v + "\n");
-                    else if (v instanceof Float) fw.write(k + "=F:" + v + "\n");
-                    else if (v instanceof String) fw.write(k + "=S:" + v.toString().replace("\n", "") + "\n");
+                for (File dir : getCandidateBackupDirs()) {
+                    FileWriter fw = null;
+                    try {
+                        if (!dir.exists()) dir.mkdirs();
+                        File out = new File(dir, filename);
+                        fw = new FileWriter(out, false);
+                        for (Map.Entry<String, ?> entry : all.entrySet()) {
+                            String k = entry.getKey();
+                            Object v = entry.getValue();
+                            if (v instanceof Boolean) fw.write(k + "=B:" + v + "\n");
+                            else if (v instanceof Integer) fw.write(k + "=I:" + v + "\n");
+                            else if (v instanceof Long) fw.write(k + "=L:" + v + "\n");
+                            else if (v instanceof Float) fw.write(k + "=F:" + v + "\n");
+                            else if (v instanceof String) fw.write(k + "=S:" + v.toString().replace("\n", "") + "\n");
+                        }
+                        fw.flush();
+                        fw.close();
+                        fw = null;
+                        if (out.exists()) {
+                            Toast.makeText(MainActivity.this, "Exported Settings to:\n" + out.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                            return;
+                        }
+                    } catch (Exception ignored) {
+                    } finally {
+                        if (fw != null) try { fw.close(); } catch (Exception ignored) {}
+                    }
                 }
-                fw.flush();
-                fw.close();
-                fw = null;
-                if (out.exists()) {
-                    Toast.makeText(this, "Exported Settings to:\n" + out.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                Toast.makeText(MainActivity.this, "Settings Export failed", Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    private void importSettingsLegacy() {
+        promptFilename("tracker_settings.cfg", "Import Settings Filename", new FileAction() {
+            @Override
+            public void execute(String filename) {
+                File sourceFile = null;
+                File direct = new File(filename);
+                if (direct.isAbsolute() && direct.exists()) {
+                    sourceFile = direct;
+                } else {
+                    for (File dir : getCandidateBackupDirs()) {
+                        File candidate = new File(dir, filename);
+                        if (candidate.exists()) {
+                            sourceFile = candidate;
+                            break;
+                        }
+                    }
+                }
+
+                if (sourceFile == null) {
+                    Toast.makeText(MainActivity.this, "Settings file not found: " + filename, Toast.LENGTH_LONG).show();
                     return;
                 }
-            } catch (Exception ignored) {
-            } finally {
-                if (fw != null) try { fw.close(); } catch (Exception ignored) {}
-            }
-        }
-        Toast.makeText(this, "Settings Export failed", Toast.LENGTH_SHORT).show();
-    }
 
-    private void importSettings(String filename) {
-        File sourceFile = null;
-        File direct = new File(filename);
-        if (direct.isAbsolute() && direct.exists()) {
-            sourceFile = direct;
-        } else {
-            for (File dir : getCandidateBackupDirs()) {
-                File candidate = new File(dir, filename);
-                if (candidate.exists()) {
-                    sourceFile = candidate;
-                    break;
+                BufferedReader br = null;
+                try {
+                    br = new BufferedReader(new FileReader(sourceFile));
+                    SharedPreferences.Editor ed = prefs.edit();
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        int eq = line.indexOf('=');
+                        if (eq <= 0 || eq + 3 > line.length()) continue;
+                        String key = line.substring(0, eq).trim();
+                        String type = line.substring(eq + 1, eq + 3);
+                        String val = line.substring(eq + 3);
+
+                        if ("B:".equals(type)) ed.putBoolean(key, Boolean.parseBoolean(val));
+                        else if ("I:".equals(type)) ed.putInt(key, parseIntSafe(val, 0));
+                        else if ("L:".equals(type)) ed.putLong(key, parseLongSafe(val, 0L));
+                        else if ("F:".equals(type)) ed.putFloat(key, parseFloatSafe(val, 0.0f));
+                        else if ("S:".equals(type)) ed.putString(key, val);
+                    }
+                    ed.commit();
+
+                    chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
+                    chkOutputLocations.setChecked(prefs.getBoolean("output_locations", false));
+                    editUser.setText(prefs.getString("http_user", "admin"));
+                    editPass.setText(prefs.getString("http_pass", "password"));
+                    editPort.setText(String.valueOf(prefs.getInt("http_port", 8080)));
+                    editInterval.setText(String.valueOf(prefs.getLong("interval", 60000L)));
+                    editStayMins.setText(String.valueOf(prefs.getInt("stay_mins", 5)));
+                    editDist.setText(String.valueOf(prefs.getFloat("distance", 75.0f)));
+                    editStartHr.setText(String.valueOf(prefs.getInt("start_hour", 0)));
+                    editEndHr.setText(String.valueOf(prefs.getInt("end_hour", 24)));
+                    loadLocationsFromPrefs();
+                    updateLinkText(true);
+                    refreshCurrentCoordinatesBox();
+
+                    if (isTracking) reloadServiceSettings();
+                    Toast.makeText(MainActivity.this, "Imported Settings from:\n" + sourceFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "Settings Import failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                } finally {
+                    if (br != null) try { br.close(); } catch (Exception ignored) {}
                 }
             }
-        }
-
-        if (sourceFile == null) {
-            Toast.makeText(this, "Settings file not found: " + filename, Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        BufferedReader br = null;
-        try {
-            br = new BufferedReader(new FileReader(sourceFile));
-            SharedPreferences.Editor ed = prefs.edit();
-            String line;
-            while ((line = br.readLine()) != null) {
-                int eq = line.indexOf('=');
-                if (eq <= 0 || eq + 3 > line.length()) continue;
-                String key = line.substring(0, eq).trim();
-                String type = line.substring(eq + 1, eq + 3);
-                String val = line.substring(eq + 3);
-
-                if ("B:".equals(type)) ed.putBoolean(key, Boolean.parseBoolean(val));
-                else if ("I:".equals(type)) ed.putInt(key, parseIntSafe(val, 0));
-                else if ("L:".equals(type)) ed.putLong(key, parseLongSafe(val, 0L));
-                else if ("F:".equals(type)) ed.putFloat(key, parseFloatSafe(val, 0.0f));
-                else if ("S:".equals(type)) ed.putString(key, val);
-            }
-            ed.commit();
-
-            chkBoot.setChecked(prefs.getBoolean("start_on_boot", true));
-            chkOutputLocations.setChecked(prefs.getBoolean("output_locations", false));
-            editUser.setText(prefs.getString("http_user", "admin"));
-            editPass.setText(prefs.getString("http_pass", "password"));
-            editPort.setText(String.valueOf(prefs.getInt("http_port", 8080)));
-            editInterval.setText(String.valueOf(prefs.getLong("interval", 60000L)));
-            editStayMins.setText(String.valueOf(prefs.getInt("stay_mins", 5)));
-            editDist.setText(String.valueOf(prefs.getFloat("distance", 75.0f)));
-            editStartHr.setText(String.valueOf(prefs.getInt("start_hour", 0)));
-            editEndHr.setText(String.valueOf(prefs.getInt("end_hour", 24)));
-            loadLocationsFromPrefs();
-            updateLinkText(true);
-            refreshCurrentCoordinatesBox();
-
-            if (isTracking) reloadServiceSettings();
-            Toast.makeText(this, "Imported Settings from:\n" + sourceFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "Settings Import failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-        } finally {
-            if (br != null) try { br.close(); } catch (Exception ignored) {}
-        }
-    }
-
-    private void copyFile(File src, File dst) throws Exception {
-        FileInputStream fis = new FileInputStream(src);
-        FileOutputStream fos = new FileOutputStream(dst);
-        byte[] buffer = new byte[4096];
-        int len;
-        while ((len = fis.read(buffer)) > 0) fos.write(buffer, 0, len);
-        fos.getFD().sync();
-        fos.close();
-        fis.close();
+        });
     }
 
     private int parseIntSafe(String s, int def) {
@@ -973,4 +1181,4 @@ public class MainActivity extends Activity {
             return def;
         }
     }
-    }
+                }
