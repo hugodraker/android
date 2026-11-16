@@ -632,10 +632,23 @@ public class MainActivity extends Activity {
         eName.setHint("Name");
         eName.setWidth(180);
 
-        EditText eCoords = new EditText(this);
+        final EditText eCoords = new EditText(this);
         eCoords.setText(coords);
         eCoords.setHint("Lat,Lon");
         eCoords.setWidth(280);
+
+        // When a location name or coordinate is edited, automatically update all other rows sharing matching coordinates
+        TextWatcher renameWatcher = new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override
+            public void afterTextChanged(Editable s) {
+                saveLocationsToPrefs();
+                if (isTracking) reloadServiceSettings();
+            }
+        };
+        eName.addTextChangedListener(renameWatcher);
+        eCoords.addTextChangedListener(renameWatcher);
 
         final Button btnType = new Button(this);
         btnType.setText(omitted ? "OMIT" : "TRACK");
@@ -676,8 +689,9 @@ public class MainActivity extends Activity {
         locationsLayout.addView(row);
     }
 
+    // Automatically batch-updates matching coordinate entries across all special locations
     private void saveLocationsToPrefs() {
-        StringBuilder sb = new StringBuilder();
+        List<String[]> entries = new ArrayList<String[]>();
         for (int i = 0; i < locationsLayout.getChildCount(); i++) {
             LinearLayout row = (LinearLayout) locationsLayout.getChildAt(i);
             String name = ((EditText) row.getChildAt(0)).getText().toString().replace(";", "").replace("|", "").trim();
@@ -685,9 +699,29 @@ public class MainActivity extends Activity {
             boolean omit = ((Button) row.getChildAt(2)).getText().toString().equals("OMIT");
 
             if (name.length() > 0 && coords.length() > 0) {
-                sb.append(name).append("|").append(coords).append("|").append(omit).append(";");
+                // Check if any existing entry has matching coordinates; if so, batch update its name
+                boolean merged = false;
+                for (int j = 0; j < entries.size(); j++) {
+                    String[] existing = entries.get(j);
+                    if (existing[1].equalsIgnoreCase(coords)) {
+                        existing[0] = name; // Update name for all matching coordinate entries
+                        existing[2] = String.valueOf(omit);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) {
+                    entries.add(new String[]{name, coords, String.valueOf(omit)});
+                }
             }
         }
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < entries.size(); i++) {
+            String[] e = entries.get(i);
+            sb.append(e[0]).append("|").append(e[1]).append("|").append(e[2]).append(";");
+        }
+
         SharedPreferences.Editor ed = prefs.edit();
         ed.putString("special_locations", sb.toString());
         ed.commit();
@@ -939,4 +973,4 @@ public class MainActivity extends Activity {
             return def;
         }
     }
-}
+    }
