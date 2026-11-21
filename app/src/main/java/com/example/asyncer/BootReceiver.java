@@ -17,11 +17,15 @@ public class BootReceiver extends BroadcastReceiver {
         if (intent == null || intent.getAction() == null) return;
         String action = intent.getAction();
 
-        if (action.equals(Intent.ACTION_BOOT_COMPLETED) ||
-            action.equals("android.intent.action.QUICKBOOT_POWERON")) {
+        if (Intent.ACTION_BOOT_COMPLETED.equals(action) ||
+            "android.intent.action.LOCKED_BOOT_COMPLETED".equals(action) ||
+            "android.intent.action.QUICKBOOT_POWERON".equals(action) ||
+            "com.htc.intent.action.QUICKBOOT_POWERON".equals(action) ||
+            Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
 
             if (shouldRunOnStart(context)) {
                 Intent serviceIntent = new Intent(context, AsyncerService.class);
+                serviceIntent.putExtra("from_boot", true);
                 startServiceCompat(context, serviceIntent);
             }
         }
@@ -38,29 +42,31 @@ public class BootReceiver extends BroadcastReceiver {
         context.startService(serviceIntent);
     }
 
-    private boolean shouldRunOnStart(Context context) {
-        File iniFile = new File(context.getFilesDir(), "asyncer.ini");
-        if (!iniFile.exists()) return false;
-        BufferedReader br = null;
+    public static boolean shouldRunOnStart(Context context) {
         try {
-            br = new BufferedReader(new FileReader(iniFile));
-            String line;
-            boolean inGlobal = false;
-            while ((line = br.readLine()) != null) {
-                line = line.trim();
-                if (line.equalsIgnoreCase("[GLOBAL]")) {
-                    inGlobal = true;
-                } else if (line.startsWith("[")) {
-                    inGlobal = false;
-                } else if (inGlobal && line.toLowerCase().startsWith("run_on_start=")) {
-                    String val = line.substring(line.indexOf('=') + 1).trim();
-                    return val.equals("1") || val.equalsIgnoreCase("true");
+            File iniFile = new File(context.getFilesDir(), "asyncer.ini");
+            if (!iniFile.exists()) return true; // Default enabled on fresh install
+
+            BufferedReader br = null;
+            try {
+                br = new BufferedReader(new FileReader(iniFile));
+                String line;
+                boolean inGlobal = false;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (line.equalsIgnoreCase("[GLOBAL]")) {
+                        inGlobal = true;
+                    } else if (line.startsWith("[")) {
+                        inGlobal = false;
+                    } else if (inGlobal && line.toLowerCase().startsWith("run_on_start=")) {
+                        String val = line.substring(line.indexOf('=') + 1).trim();
+                        return "1".equals(val) || "true".equalsIgnoreCase(val);
+                    }
                 }
+            } finally {
+                try { if (br != null) br.close(); } catch (Exception ignored) {}
             }
-        } catch (Exception ignored) {
-        } finally {
-            try { if (br != null) br.close(); } catch (Exception ignored) {}
-        }
-        return false;
+        } catch (Throwable ignored) {}
+        return true;
     }
 }

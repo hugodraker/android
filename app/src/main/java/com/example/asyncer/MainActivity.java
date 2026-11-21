@@ -18,6 +18,7 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -39,6 +40,7 @@ public class MainActivity extends Activity {
 
     public static final int REQ_PICK_LUA = 9001;
     public static final int REQ_PERMS = 9002;
+    public static final int REQ_PICK_DB = 9003;
 
     private File iniFile;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
@@ -49,6 +51,10 @@ public class MainActivity extends Activity {
     // Global Options
     private CheckBox cbRunOnStart;
     private Spinner spJobSelect;
+
+    // SQL HTTP Server Options
+    private CheckBox cbEnableSqlServer;
+    private EditText etHttpPort, etHttpUser, etHttpPass, etSqlDbPath;
 
     // Connection Fields
     private Spinner spProtocol;
@@ -80,8 +86,8 @@ public class MainActivity extends Activity {
         ensureModernStoragePermissions();
 
         iniFile = new File(getFilesDir(), "asyncer.ini");
-
         File defaultSyncFolder = getDefaultSyncFolder();
+        File defaultDbFile = getDefaultDbFile();
 
         ScrollView scroll = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
@@ -90,9 +96,61 @@ public class MainActivity extends Activity {
 
         // --- GLOBAL SETTINGS ---
         cbRunOnStart = new CheckBox(this);
-        cbRunOnStart.setText("Run background service on start");
+        cbRunOnStart.setText("Start Asyncer automatically when phone boots");
+        cbRunOnStart.setChecked(true);
         root.addView(cbRunOnStart);
 
+        addSeparator(root);
+
+        // --- SQLDROID HTTP SERVER SETTINGS ---
+        TextView lblSqlSrv = new TextView(this);
+        lblSqlSrv.setText("--- SQLDroid HTTP Server & Remote API ---");
+        root.addView(lblSqlSrv);
+
+        cbEnableSqlServer = new CheckBox(this);
+        cbEnableSqlServer.setText("Enable SQL & Sync HTTP Server");
+        root.addView(cbEnableSqlServer);
+
+        etHttpPort = addLabeledInput(root, "HTTP Server Port:", "8080", false);
+        etHttpUser = addLabeledInput(root, "HTTP Login Username:", "admin", false);
+        etHttpPass = addLabeledInput(root, "HTTP Login Password:", "", true);
+
+        TextView lblDb = new TextView(this);
+        lblDb.setText("SQLite Database Path (Internal Storage or SD Card):");
+        root.addView(lblDb);
+
+        LinearLayout dbRow = new LinearLayout(this);
+        dbRow.setOrientation(LinearLayout.HORIZONTAL);
+        etSqlDbPath = new EditText(this);
+        etSqlDbPath.setSingleLine(true);
+        etSqlDbPath.setText(defaultDbFile.getAbsolutePath());
+        dbRow.addView(etSqlDbPath, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        Button btnBrowseDb = new Button(this);
+        btnBrowseDb.setText("Browse...");
+        btnBrowseDb.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                File cur = new File(etSqlDbPath.getText().toString().trim());
+                File startDir = (cur.getParentFile() != null && cur.getParentFile().exists())
+                        ? cur.getParentFile() : getDefaultStartDir();
+                showDbFileBrowser(startDir);
+            }
+        });
+        dbRow.addView(btnBrowseDb);
+        root.addView(dbRow);
+
+        cbEnableSqlServer.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                if (isUpdatingUI) return;
+                saveCurrentJobToMemory();
+                saveAllToIni();
+                applySqlHttpServerState();
+            }
+        });
+
+        addSeparator(root);
+
+        // --- PROFILE SELECTOR ---
         LinearLayout jobRow = new LinearLayout(this);
         jobRow.setOrientation(LinearLayout.HORIZONTAL);
         TextView lblJob = new TextView(this);
@@ -209,7 +267,7 @@ public class MainActivity extends Activity {
 
         // --- SCRIPTS & COMMANDS ---
         TextView lblCmd = new TextView(this);
-        lblCmd.setText("Run LuaJ Script (.lua) or External Command:");
+        lblCmd.setText("Associated LuaJ Script (.lua) or External Command:");
         root.addView(lblCmd);
 
         LinearLayout cmdRow = new LinearLayout(this);
@@ -253,6 +311,7 @@ public class MainActivity extends Activity {
             public void onClick(View v) {
                 saveCurrentJobToMemory();
                 saveAllToIni();
+                applySqlHttpServerState();
                 Toast.makeText(MainActivity.this, "Settings Saved", Toast.LENGTH_SHORT).show();
             }
         });
@@ -276,7 +335,7 @@ public class MainActivity extends Activity {
         root.addView(btnRow);
 
         Button btnSyncNow = new Button(this);
-        btnSyncNow.setText("Sync Now (Foreground)");
+        btnSyncNow.setText("Sync Current Job & Script Now");
         btnSyncNow.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 saveCurrentJobToMemory();
@@ -309,20 +368,58 @@ public class MainActivity extends Activity {
         });
 
         loadAllFromIni();
+        applySqlHttpServerState();
 
-        if (savedInstanceState == null && cbRunOnStart.isChecked()) {
-            appendLog("Run on start enabled. Launching AsyncerService...");
+        if (savedInstanceState == null && (cbRunOnStart.isChecked() || cbEnableSqlServer.isChecked())) {
             try {
                 BootReceiver.startServiceCompat(this, new Intent(this, AsyncerService.class));
             } catch (Exception ignored) {}
         }
     }
 
-    // Requests runtime storage & notification permissions on Android 6 - 15+ via reflection (safe on Android 1.6)
+    private void applySqlHttpServerState() {
+        SqlHttpServer srv = SqlHttpServer.getInstance(this);
+        srv.setLogger(new SyncRunner.LogCallback() {
+            public void onLog(String msg) {
+                appendLog(msg);
+            }
+        });
+        if (cbEnableSqlServer.isChecked()) {
+            int port = parseIntSafe(etHttpPort.getText().toString().trim(), 8080);
+            srv.start(port);
+            appendLog("SQL HTTP Server enabled on port " + port);
+            try {
+                BootReceiver.startServiceCompat(this, new Intent(this, AsyncerService.class));
+            } catch (Exception ignored) {}
+        } else {
+            if (srv.isRunning()) {
+                srv.stop();
+                appendLog("SQL HTTP Server stopped.");
+            }
+        }
+    }
+
+    private File getDefaultDbFile() {
+        try {
+            File ext = Environment.getExternalStorageDirectory();
+            if (ext != null) {
+                return new File(ext, "asyncer.db");
+            }
+        } catch (Throwable ignored) {}
+        return new File(getFilesDir(), "asyncer.db");
+    }
+
+    private File getDefaultStartDir() {
+        try {
+            File ext = Environment.getExternalStorageDirectory();
+            if (ext != null && ext.exists()) return ext;
+        } catch (Throwable ignored) {}
+        return getFilesDir();
+    }
+
     private void ensureModernStoragePermissions() {
         try {
             if (Build.VERSION.SDK_INT >= 30) {
-                // Check Environment.isExternalStorageManager() on Android 11+ (API 30+)
                 Method isMgr = Environment.class.getMethod("isExternalStorageManager");
                 Boolean granted = (Boolean) isMgr.invoke(null);
                 if (granted != null && !granted.booleanValue()) {
@@ -412,10 +509,13 @@ public class MainActivity extends Activity {
 
     private void loadAllFromIni() {
         if (!iniFile.exists()) {
+            saveCurrentJobToMemory();
+            saveAllToIni();
             loadJobToUI(0);
             return;
         }
         BufferedReader br = null;
+        isUpdatingUI = true;
         try {
             br = new BufferedReader(new FileReader(iniFile));
             String line;
@@ -445,6 +545,11 @@ public class MainActivity extends Activity {
                 if ("GLOBAL".equals(currentSection)) {
                     if ("run_on_start".equals(k)) cbRunOnStart.setChecked("1".equals(v) || "true".equalsIgnoreCase(v));
                     else if ("last_job".equals(k)) currentJobIndex = parseIntSafe(v, 0);
+                    else if ("sql_server_enabled".equals(k)) cbEnableSqlServer.setChecked("1".equals(v) || "true".equalsIgnoreCase(v));
+                    else if ("http_port".equals(k) && v.length() > 0) etHttpPort.setText(v);
+                    else if ("http_user".equals(k)) etHttpUser.setText(v);
+                    else if ("http_pass".equals(k)) etHttpPass.setText(v);
+                    else if ("sql_db_path".equals(k) && v.length() > 0) etSqlDbPath.setText(v);
                 } else if (currentMap != null) {
                     currentMap.put(k, v);
                 }
@@ -452,6 +557,7 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             appendLog("Failed to load INI: " + e.getMessage());
         } finally {
+            isUpdatingUI = false;
             try { if (br != null) br.close(); } catch (Exception ignored) {}
         }
 
@@ -470,7 +576,12 @@ public class MainActivity extends Activity {
 
             sb.append("[GLOBAL]\r\n");
             sb.append("run_on_start=").append(cbRunOnStart.isChecked() ? "1" : "0").append("\r\n");
-            sb.append("last_job=").append(currentJobIndex).append("\r\n\r\n");
+            sb.append("last_job=").append(currentJobIndex).append("\r\n");
+            sb.append("sql_server_enabled=").append(cbEnableSqlServer.isChecked() ? "1" : "0").append("\r\n");
+            sb.append("http_port=").append(etHttpPort.getText().toString().trim()).append("\r\n");
+            sb.append("http_user=").append(etHttpUser.getText().toString().trim()).append("\r\n");
+            sb.append("http_pass=").append(etHttpPass.getText().toString()).append("\r\n");
+            sb.append("sql_db_path=").append(etSqlDbPath.getText().toString().trim()).append("\r\n\r\n");
 
             for (int i = 0; i < 5; i++) {
                 sb.append("[JOB_").append(i).append("]\r\n");
@@ -705,269 +816,21 @@ public class MainActivity extends Activity {
     }
 
     // =========================================================================
-    // FOREGROUND SYNC (SMB & FTP)
+    // FOREGROUND SYNC + ASSOCIATED SCRIPT
     // =========================================================================
 
     private void runSyncForegroundThread() {
-        final int proto = spProtocol.getSelectedItemPosition();
-        final String host = etHost.getText().toString().trim();
-        final int port = parseIntSafe(etPort.getText().toString().trim(), proto == 1 ? 21 : 445);
-        final String user = etUser.getText().toString().trim();
-        final String pass = etPass.getText().toString();
-        final String remotePath = getEffectiveRemotePath();
-        final File localFolder = new File(etLocalDir.getText().toString().trim());
-        final int direction = spDirection.getSelectedItemPosition();
-        final int mode = spMode.getSelectedItemPosition();
-        final boolean recursive = cbRecursive.isChecked();
-        final boolean deleteExtras = cbDeleteExtras.isChecked();
-
-        if (host.length() == 0 || (proto == 0 && remotePath.length() == 0)) {
-            appendLog("Error: Missing Host or Share.");
-            return;
-        }
-
-        if (!localFolder.exists()) {
-            try {
-                if (localFolder.mkdirs()) {
-                    appendLog("Created local folder: " + localFolder.getAbsolutePath());
-                } else {
-                    appendLog("Cannot create " + localFolder.getAbsolutePath() + " - grant All Files Access permission.");
-                    ensureModernStoragePermissions();
-                }
-            } catch (Throwable t) {
-                appendLog("Warning: Could not create local folder.");
-            }
-        }
-
+        final int jobIdx = currentJobIndex;
         new Thread(new Runnable() {
             public void run() {
-                if (proto == 1) {
-                    FtpClient ftp = new FtpClient();
-                    ftp.setLogListener(new FtpClient.LogListener() {
-                        public void onLog(String msg) { appendLog(msg); }
-                    });
-                    try {
-                        String ftpPath = (remotePath.length() == 0 || "PUBLIC".equalsIgnoreCase(remotePath)) ? "/" : remotePath;
-                        appendLog("Connecting to FTP " + host + ":" + port + "...");
-                        if (!ftp.connect(host, port, user, pass)) {
-                            throw new Exception("FTP login failed (" + ftp.getLastReply() + ")");
-                        }
-                        if (direction == 0) {
-                            int up = syncLocalToFtpForeground(ftp, localFolder, ftpPath, recursive, mode, deleteExtras);
-                            appendLog("FTP Upload finished: " + up + " file(s).");
-                        } else if (direction == 1) {
-                            int down = syncFtpToLocalForeground(ftp, ftpPath, localFolder, recursive, mode, deleteExtras);
-                            appendLog("FTP Download finished: " + down + " file(s).");
-                        } else {
-                            int up = syncLocalToFtpForeground(ftp, localFolder, ftpPath, recursive, 0, false);
-                            int down = syncFtpToLocalForeground(ftp, ftpPath, localFolder, recursive, 0, false);
-                            appendLog("FTP Two-Way Sync finished: " + up + " up, " + down + " down.");
-                        }
-                    } catch (Exception e) {
-                        appendLog("FTP Sync failed: " + e.getMessage());
-                    } finally {
-                        ftp.disconnect();
+                String status = SyncRunner.runJobAndScript(MainActivity.this, MainActivity.this, jobIdx, true, new SyncRunner.LogCallback() {
+                    public void onLog(String msg) {
+                        appendLog(msg);
                     }
-                } else {
-                    SmbClient smb = new SmbClient();
-                    try {
-                        appendLog("Connecting to SMB \\\\" + host + "\\" + remotePath + "...");
-                        SmbClient.ConnectionProfile prof = new SmbClient.ConnectionProfile();
-                        prof.host = host;
-                        prof.server = host;
-                        prof.port = port;
-                        prof.share = remotePath;
-                        prof.username = user;
-                        prof.user = user;
-                        prof.password = pass;
-                        prof.pass = pass;
-
-                        if (!smb.connect(prof)) {
-                            throw new Exception("SMB connect/auth failed");
-                        }
-                        if (direction == 0) {
-                            int up = syncLocalToSmbForeground(smb, localFolder, "", recursive, mode, deleteExtras);
-                            appendLog("SMB Upload finished: " + up + " file(s).");
-                        } else if (direction == 1) {
-                            int down = syncSmbToLocalForeground(smb, "", localFolder, recursive, mode);
-                            appendLog("SMB Download finished: " + down + " file(s).");
-                        } else {
-                            int up = syncLocalToSmbForeground(smb, localFolder, "", recursive, 0, false);
-                            int down = syncSmbToLocalForeground(smb, "", localFolder, recursive, 0);
-                            appendLog("SMB Two-Way Sync finished: " + up + " up, " + down + " down.");
-                        }
-                    } catch (Exception e) {
-                        appendLog("SMB Sync failed: " + e.getMessage());
-                    } finally {
-                        smb.disconnect();
-                    }
-                }
+                });
+                appendLog(status);
             }
         }).start();
-    }
-
-    private int syncLocalToSmbForeground(SmbClient smb, File localDir, String remoteRel,
-                                         boolean recursive, int mode, boolean deleteExtras) {
-        File[] files = localDir.listFiles();
-        if (files == null) {
-            appendLog("Cannot read local folder (grant storage permission): " + localDir.getAbsolutePath());
-            return 0;
-        }
-        if (remoteRel.length() > 0) smb.mkdirRecursive(remoteRel);
-        int uploaded = 0;
-        for (int i = 0; i < files.length; i++) {
-            File f = files[i];
-            String targetRel = remoteRel.length() > 0 ? (remoteRel + "\\" + f.getName()) : f.getName();
-            if (f.isDirectory()) {
-                if (recursive) {
-                    uploaded += syncLocalToSmbForeground(smb, f, targetRel, true, mode, deleteExtras);
-                }
-            } else if (f.isFile()) {
-                appendLog("SMB Uploading: " + targetRel + " (" + f.length() + " B)");
-                if (smb.copySingleL2r(f.getAbsolutePath(), targetRel)) uploaded++;
-            }
-        }
-        return uploaded;
-    }
-
-    private int syncSmbToLocalForeground(SmbClient smb, String remoteRel, File localDir,
-                                         boolean recursive, int mode) {
-        if (!localDir.exists()) localDir.mkdirs();
-        List<SmbClient.DirectoryItem> items = smb.fetchRemoteDirContents(remoteRel);
-        int downloaded = 0;
-        for (int i = 0; i < items.size(); i++) {
-            SmbClient.DirectoryItem item = items.get(i);
-            if (!recursive && item.path.indexOf('\\') >= 0) continue;
-            File dest = new File(localDir, item.path.replace('\\', File.separatorChar));
-            if (item.isDirectory) {
-                dest.mkdirs();
-            } else {
-                if (mode == 2 && dest.exists()) continue;
-                if (mode == 0 && dest.exists() && dest.length() == item.size) continue;
-                String fullRemote = remoteRel.length() > 0 ? (remoteRel + "\\" + item.path) : item.path;
-                appendLog("SMB Downloading: " + item.path + " (" + item.size + " B)");
-                if (smb.copySingleR2l(fullRemote, dest.getAbsolutePath())) downloaded++;
-            }
-        }
-        return downloaded;
-    }
-
-    private int syncLocalToFtpForeground(FtpClient ftp, File localDir, String remoteBaseDir,
-                                         boolean recursive, int mode, boolean deleteExtras) {
-        String normBase = FtpClient.normalizeFtpPath(remoteBaseDir);
-        ftp.mkdirRecursive(normBase);
-
-        List<FtpClient.FtpItem> remoteItems = ftp.fetchRemoteDirContents(normBase, recursive);
-        Map<String, FtpClient.FtpItem> remoteMap = new HashMap<String, FtpClient.FtpItem>();
-        for (int i = 0; i < remoteItems.size(); i++) {
-            FtpClient.FtpItem it = remoteItems.get(i);
-            remoteMap.put(it.path.toLowerCase(), it);
-        }
-
-        int uploaded = uploadLocalTreeToFtpForeground(ftp, localDir, normBase, "", recursive, mode, remoteMap);
-
-        if (deleteExtras) {
-            for (Map.Entry<String, FtpClient.FtpItem> e : remoteMap.entrySet()) {
-                FtpClient.FtpItem extra = e.getValue();
-                if (!extra.isDirectory) {
-                    String fullRemote = "/".equals(normBase) ? ("/" + extra.path) : (normBase + "/" + extra.path);
-                    appendLog("FTP Deleting extra: " + fullRemote);
-                    ftp.deleteRemote(fullRemote, false);
-                }
-            }
-        }
-        return uploaded;
-    }
-
-    private int uploadLocalTreeToFtpForeground(FtpClient ftp, File curLocalDir, String normBase, String relPrefix,
-                                               boolean recursive, int mode, Map<String, FtpClient.FtpItem> remoteMap) {
-        File[] files = curLocalDir.listFiles();
-        if (files == null) {
-            appendLog("Cannot read local folder (grant storage permission): " + curLocalDir.getAbsolutePath());
-            return 0;
-        }
-        int uploaded = 0;
-        for (int i = 0; i < files.length; i++) {
-            File f = files[i];
-            String relPath = relPrefix.length() > 0 ? (relPrefix + "/" + f.getName()) : f.getName();
-            String fullRemote = "/".equals(normBase) ? ("/" + relPath) : (normBase + "/" + relPath);
-
-            if (f.isDirectory()) {
-                if (recursive) {
-                    ftp.mkdirRecursive(fullRemote);
-                    uploaded += uploadLocalTreeToFtpForeground(ftp, f, normBase, relPath, true, mode, remoteMap);
-                }
-            } else if (f.isFile()) {
-                FtpClient.FtpItem existing = remoteMap.remove(relPath.toLowerCase());
-                boolean shouldUpload = true;
-                if (existing != null) {
-                    if (mode == 2) {
-                        shouldUpload = false;
-                    } else if (mode == 0 && existing.size == f.length()) {
-                        shouldUpload = false;
-                    }
-                }
-                if (shouldUpload) {
-                    appendLog("FTP Uploading: " + relPath + " (" + f.length() + " B)");
-                    if (ftp.uploadFile(f, fullRemote)) uploaded++;
-                }
-            }
-        }
-        return uploaded;
-    }
-
-    private int syncFtpToLocalForeground(FtpClient ftp, String remoteBaseDir, File localFolder,
-                                         boolean recursive, int mode, boolean deleteExtras) {
-        if (!localFolder.exists()) localFolder.mkdirs();
-        String normBase = FtpClient.normalizeFtpPath(remoteBaseDir);
-        List<FtpClient.FtpItem> remoteItems = ftp.fetchRemoteDirContents(normBase, recursive);
-        Map<String, Boolean> seenLocalPaths = new HashMap<String, Boolean>();
-
-        int downloaded = 0;
-        for (int i = 0; i < remoteItems.size(); i++) {
-            FtpClient.FtpItem item = remoteItems.get(i);
-            File localDest = new File(localFolder, item.path.replace('/', File.separatorChar));
-            seenLocalPaths.put(localDest.getAbsolutePath().toLowerCase(), Boolean.TRUE);
-
-            if (item.isDirectory) {
-                localDest.mkdirs();
-            } else {
-                boolean shouldDownload = true;
-                if (localDest.exists()) {
-                    if (mode == 2) {
-                        shouldDownload = false;
-                    } else if (mode == 0 && localDest.length() == item.size) {
-                        shouldDownload = false;
-                    }
-                }
-                if (shouldDownload) {
-                    String fullRemote = "/".equals(normBase) ? ("/" + item.path) : (normBase + "/" + item.path);
-                    appendLog("FTP Downloading: " + item.path + " (" + item.size + " B)");
-                    if (ftp.downloadFile(fullRemote, localDest)) downloaded++;
-                }
-            }
-        }
-
-        if (deleteExtras) {
-            pruneUnseenLocalFiles(localFolder, seenLocalPaths, recursive);
-        }
-        return downloaded;
-    }
-
-    private void pruneUnseenLocalFiles(File dir, Map<String, Boolean> seenMap, boolean recursive) {
-        File[] files = dir.listFiles();
-        if (files == null) return;
-        for (int i = 0; i < files.length; i++) {
-            File f = files[i];
-            if (f.isDirectory()) {
-                if (recursive) pruneUnseenLocalFiles(f, seenMap, true);
-            } else {
-                if (!seenMap.containsKey(f.getAbsolutePath().toLowerCase())) {
-                    appendLog("Deleting extra local file: " + f.getName());
-                    f.delete();
-                }
-            }
-        }
     }
 
     private void appendLog(final String msg) {
@@ -976,6 +839,101 @@ public class MainActivity extends Activity {
                 tvConsole.append(msg + "\n");
             }
         });
+    }
+
+    // =========================================================================
+    // SQLITE DB FILE BROWSER
+    // =========================================================================
+
+    public void showDbFileBrowser(final File dir) {
+        File[] files = null;
+        try { files = dir.listFiles(); } catch (Throwable ignored) {}
+
+        final List<File> entries = new ArrayList<File>();
+        final List<String> labels = new ArrayList<String>();
+
+        // Quick jump shortcuts
+        entries.add(getFilesDir());
+        labels.add("[App Internal Storage: " + getFilesDir().getAbsolutePath() + "]");
+
+        File ext = Environment.getExternalStorageDirectory();
+        if (ext != null && ext.exists()) {
+            entries.add(ext);
+            labels.add("[SD Card / External Storage: " + ext.getAbsolutePath() + "]");
+        }
+
+        if (dir != null && dir.getParentFile() != null) {
+            entries.add(dir.getParentFile());
+            labels.add(".. (Parent Directory)");
+        }
+
+        if (files != null) {
+            for (int i = 0; i < files.length; i++) {
+                if (files[i].isDirectory()) {
+                    entries.add(files[i]);
+                    labels.add("[" + files[i].getName() + "]");
+                }
+            }
+            for (int i = 0; i < files.length; i++) {
+                if (!files[i].isDirectory()) {
+                    String n = files[i].getName().toLowerCase();
+                    if (n.endsWith(".db") || n.endsWith(".sqlite") || n.endsWith(".sqlite3") || n.endsWith(".db3")) {
+                        entries.add(files[i]);
+                        labels.add(files[i].getName());
+                    }
+                }
+            }
+        }
+        labels.add("Create New Database in This Folder...");
+        labels.add("Use System File Picker...");
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle(dir != null ? dir.getAbsolutePath() : "/");
+        b.setItems(labels.toArray(new String[labels.size()]), new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface dialog, int which) {
+                if (which == labels.size() - 1) {
+                    try {
+                        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                        intent.setType("*/*");
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);
+                        startActivityForResult(Intent.createChooser(intent, "Select SQLite Database"), REQ_PICK_DB);
+                    } catch (Exception ignored) {}
+                    return;
+                }
+                if (which == labels.size() - 2) {
+                    final EditText etName = new EditText(MainActivity.this);
+                    etName.setText("asyncer.db");
+                    new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("New SQLite Database Filename")
+                            .setView(etName)
+                            .setPositiveButton("Create", new DialogInterface.OnClickListener() {
+                                public void onClick(DialogInterface d, int w) {
+                                    String fn = etName.getText().toString().trim();
+                                    if (fn.length() > 0) {
+                                        File target = new File(dir, fn);
+                                        etSqlDbPath.setText(target.getAbsolutePath());
+                                        saveCurrentJobToMemory();
+                                        saveAllToIni();
+                                    }
+                                }
+                            })
+                            .setNegativeButton("Cancel", null)
+                            .show();
+                    return;
+                }
+
+                File target = entries.get(which);
+                if (target.isDirectory()) {
+                    showDbFileBrowser(target);
+                } else {
+                    etSqlDbPath.setText(target.getAbsolutePath());
+                    saveCurrentJobToMemory();
+                    saveAllToIni();
+                }
+            }
+        });
+        b.setNegativeButton("Cancel", null);
+        b.show();
     }
 
     // =========================================================================
@@ -1042,11 +1000,16 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_PICK_LUA && resultCode == Activity.RESULT_OK && data != null) {
+        if (resultCode == Activity.RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) {
                 String path = uri.getPath();
-                etExternalCmd.setText(path != null ? path : uri.toString());
+                String val = path != null ? path : uri.toString();
+                if (requestCode == REQ_PICK_LUA) {
+                    etExternalCmd.setText(val);
+                } else if (requestCode == REQ_PICK_DB) {
+                    etSqlDbPath.setText(val);
+                }
                 saveCurrentJobToMemory();
                 saveAllToIni();
             }
@@ -1055,32 +1018,15 @@ public class MainActivity extends Activity {
 
     public void executeCommandOrLua(final String cmdOrPath) {
         if (cmdOrPath == null || cmdOrPath.length() == 0) return;
+        final Map<String, String> jobCtx = jobsData.get(currentJobIndex);
         new Thread(new Runnable() {
             public void run() {
-                try {
-                    if (cmdOrPath.toLowerCase().endsWith(".lua")) {
-                        appendLog("Running LuaJ script: " + cmdOrPath);
-                        Class<?> jse = Class.forName("org.luaj.vm2.lib.jse.JsePlatform");
-                        Object globals = jse.getMethod("standardGlobals").invoke(null);
-                        Class<?> luaVal = Class.forName("org.luaj.vm2.LuaValue");
-
-                        luaVal.getMethod("set", String.class, String.class)
-                                .invoke(globals, "SMB_HOST", etHost.getText().toString().trim());
-                        luaVal.getMethod("set", String.class, String.class)
-                                .invoke(globals, "SMB_SHARE", getEffectiveRemotePath());
-
-                        Object chunk = globals.getClass().getMethod("loadfile", String.class).invoke(globals, cmdOrPath);
-                        Object res = luaVal.getMethod("call").invoke(chunk);
-                        appendLog("LuaJ finished: " + (res != null ? res.toString() : "OK"));
-                    } else {
-                        appendLog("Running shell command: " + cmdOrPath);
-                        Process proc = Runtime.getRuntime().exec(cmdOrPath);
-                        proc.waitFor();
-                        appendLog("Exit code " + proc.exitValue());
+                String res = SyncRunner.executeCommandOrLua(MainActivity.this, MainActivity.this, cmdOrPath, jobCtx, new SyncRunner.LogCallback() {
+                    public void onLog(String msg) {
+                        appendLog(msg);
                     }
-                } catch (Exception e) {
-                    appendLog("Execution error: " + e.getMessage());
-                }
+                });
+                appendLog("Finished: " + res);
             }
         }).start();
     }
@@ -1092,4 +1038,4 @@ public class MainActivity extends Activity {
             return def;
         }
     }
-    }
+}
