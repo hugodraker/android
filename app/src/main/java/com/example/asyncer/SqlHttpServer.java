@@ -128,11 +128,9 @@ public class SqlHttpServer {
             String rawTarget = reqParts[1];
 
             String path = rawTarget;
-            String queryString = "";
             int qIdx = rawTarget.indexOf('?');
             if (qIdx >= 0) {
                 path = rawTarget.substring(0, qIdx);
-                queryString = rawTarget.substring(qIdx + 1);
             }
 
             Map<String, String> headers = new HashMap<String, String>();
@@ -169,39 +167,55 @@ public class SqlHttpServer {
                 return;
             }
 
+            // GET / -> Show login form only (no console access until authenticated via POST)
             if ("GET".equals(method) && "/".equals(path)) {
-                sendResponse(out, 200, "text/html; charset=UTF-8", buildConsoleHtml());
+                sendResponse(out, 200, "text/html; charset=UTF-8", buildLoginHtml(null));
                 return;
             }
 
             if (!"POST".equals(method)) {
                 sendResponse(out, 405, "application/json; charset=UTF-8",
-                        "{\"ok\":false,\"error\":\"Use POST for /sql and /run_job, or GET /\"}");
+                        "{\"ok\":false,\"error\":\"Method not allowed: POST required\"}");
                 return;
             }
 
-            Map<String, String> params = new HashMap<String, String>();
-            parseUrlEncodedParams(queryString, params);
-
+            // Parse credentials & parameters strictly from POST body (and optional auth headers)
+            Map<String, String> postParams = new HashMap<String, String>();
             String contentType = headers.get("content-type");
             String bodyStr = new String(bodyBytes, "UTF-8");
             boolean isRawSqlBody = contentType != null &&
                     (contentType.toLowerCase().contains("application/sql") || contentType.toLowerCase().contains("text/plain"));
 
             if (!isRawSqlBody) {
-                parseUrlEncodedParams(bodyStr, params);
+                parseUrlEncodedParams(bodyStr, postParams);
             }
 
-            if (!authenticateRequest(cfg.global, headers, params)) {
+            String[] creds = extractCredentials(headers, postParams);
+            boolean hasCreds = (creds != null);
+            boolean validCreds = hasCreds && verifyCredentials(cfg.global, creds[0], creds[1]);
+
+            if ("/".equals(path)) {
+                if (!hasCreds) {
+                    sendResponse(out, 401, "text/html; charset=UTF-8", buildLoginHtml(null));
+                } else if (!validCreds) {
+                    sendResponse(out, 401, "text/html; charset=UTF-8", buildLoginHtml("Invalid username or password."));
+                } else {
+                    // Authenticated: render console WITHOUT login/password fields
+                    sendResponse(out, 200, "text/html; charset=UTF-8", buildAuthenticatedConsoleHtml(creds[0], creds[1]));
+                }
+                return;
+            }
+
+            if (!validCreds) {
                 sendResponse(out, 401, "application/json; charset=UTF-8",
-                        "{\"ok\":false,\"error\":\"Unauthorized: invalid login or password\"}");
+                        "{\"ok\":false,\"error\":\"Unauthorized: missing or invalid username/password in POST\"}");
                 return;
             }
 
             if ("/sql".equals(path)) {
-                handleSqlPost(out, cfg.global, params, isRawSqlBody ? bodyStr : null);
+                handleSqlPost(out, cfg.global, postParams, isRawSqlBody ? bodyStr : null);
             } else if ("/run_job".equals(path)) {
-                handleRunJobPost(out, params);
+                handleRunJobPost(out, postParams);
             } else {
                 sendResponse(out, 404, "application/json; charset=UTF-8",
                         "{\"ok\":false,\"error\":\"Unknown endpoint: " + escapeJson(path) + "\"}");
@@ -220,18 +234,15 @@ public class SqlHttpServer {
         }
     }
 
-    private boolean authenticateRequest(Map<String, String> globalCfg, Map<String, String> headers, Map<String, String> params) {
-        String expectedUser = globalCfg.containsKey("http_user") ? globalCfg.get("http_user") : "admin";
-        String expectedPass = globalCfg.containsKey("http_pass") ? globalCfg.get("http_pass") : "";
-
-        String reqUser = params.get("user");
-        String reqPass = params.get("pass");
-
-        if (reqUser == null && headers.containsKey("x-user")) reqUser = headers.get("x-user");
-        if (reqPass == null && headers.containsKey("x-pass")) reqPass = headers.get("x-pass");
-
-        // Also support HTTP Basic Auth header if provided
-        if ((reqUser == null || reqPass == null) && headers.containsKey("authorization")) {
+    // Returns [user, pass] only if BOTH user and pass were explicitly supplied in POST or Auth headers
+    private String[] extractCredentials(Map<String, String> headers, Map<String, String> postParams) {
+        if (postParams.containsKey("user") && postParams.containsKey("pass")) {
+            return new String[] { postParams.get("user"), postParams.get("pass") };
+        }
+        if (headers.containsKey("x-user") && headers.containsKey("x-pass")) {
+            return new String[] { headers.get("x-user"), headers.get("x-pass") };
+        }
+        if (headers.containsKey("authorization")) {
             String auth = headers.get("authorization");
             if (auth != null && auth.toLowerCase().startsWith("basic ")) {
                 try {
@@ -239,15 +250,19 @@ public class SqlHttpServer {
                     String pair = new String(decoded, "UTF-8");
                     int sep = pair.indexOf(':');
                     if (sep >= 0) {
-                        reqUser = pair.substring(0, sep);
-                        reqPass = pair.substring(sep + 1);
+                        return new String[] { pair.substring(0, sep), pair.substring(sep + 1) };
                     }
                 } catch (Exception ignored) {}
             }
         }
+        return null;
+    }
 
-        if (reqUser == null) reqUser = "";
-        if (reqPass == null) reqPass = "";
+    private boolean verifyCredentials(Map<String, String> globalCfg, String reqUser, String reqPass) {
+        String expectedUser = globalCfg.containsKey("http_user") ? globalCfg.get("http_user") : "admin";
+        String expectedPass = globalCfg.containsKey("http_pass") ? globalCfg.get("http_pass") : "";
+        if (reqUser == null || reqPass == null) return false;
+        if (expectedUser.length() == 0) return false;
         return expectedUser.equals(reqUser) && expectedPass.equals(reqPass);
     }
 
@@ -436,7 +451,6 @@ public class SqlHttpServer {
         return res;
     }
 
-    // Splits SQL on semicolons only outside single/double/backtick quotes and comments
     private static List<String> splitSqlStatements(String sql) {
         List<String> out = new ArrayList<String>();
         StringBuilder cur = new StringBuilder();
@@ -545,7 +559,6 @@ public class SqlHttpServer {
         }
     }
 
-    // Pure-Java Base64 decoder supporting standard (+/) and URL-safe (-_) Base64 on Android 1.6+
     public static byte[] decodeBase64Flexible(String input) {
         if (input == null) return new byte[0];
         String s = input.trim().replace('-', '+').replace('_', '/');
@@ -561,7 +574,7 @@ public class SqlHttpServer {
             else if (c == '+') val = 62;
             else if (c == '/') val = 63;
             else if (c == '=') break;
-            else continue; // skip whitespace/newlines
+            else continue;
 
             buf = (buf << 6) | val;
             bits += 6;
@@ -628,15 +641,30 @@ public class SqlHttpServer {
         return sb.toString();
     }
 
-    private static String buildConsoleHtml() {
+    private static String buildLoginHtml(String errorMsg) {
+        String errBlock = (errorMsg != null && errorMsg.length() > 0)
+                ? "<p style='color:#c62828;font-weight:bold'>" + errorMsg + "</p>" : "";
+        return "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                + "<title>Asyncer Login</title>"
+                + "<style>body{font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px}"
+                + "input,button{width:100%;margin:8px 0;padding:10px;box-sizing:border-box}</style></head><body>"
+                + "<h2>Asyncer Login</h2>"
+                + errBlock
+                + "<form method='POST' action='/'>"
+                + "<label>Username:</label><input name='user' required autofocus>"
+                + "<label>Password:</label><input name='pass' type='password'>"
+                + "<button type='submit'>Sign In</button>"
+                + "</form></body></html>";
+    }
+
+    // Rendered ONLY after valid user & pass were POSTed; contains NO login/password boxes
+    private static String buildAuthenticatedConsoleHtml(String authUser, String authPass) {
         return "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
                 + "<title>Asyncer SQL & Sync Server</title>"
                 + "<style>body{font-family:sans-serif;max-width:760px;margin:20px auto;padding:0 12px}"
-                + "input,textarea,select,button{width:100%;margin:6px 0;padding:8px;box-sizing:border-box}"
+                + "textarea,select,button{width:100%;margin:6px 0;padding:8px;box-sizing:border-box}"
                 + "pre{background:#111;color:#0f0;padding:12px;overflow:auto;min-height:120px}</style></head><body>"
-                + "<h2>Asyncer SQLDroid & Sync HTTP API</h2>"
-                + "<label>Login:</label><input id='u' value='admin'>"
-                + "<label>Password:</label><input id='p' type='password'>"
+                + "<h2>Asyncer SQLDroid & Sync Console</h2>"
                 + "<h3>1. Run SQL Query (Base64 UTF-8 Encoded)</h3>"
                 + "<textarea id='q' rows='5'>SELECT sqlite_version() AS version;</textarea>"
                 + "<button onclick='runSql()'>Execute SQL (POST /sql)</button>"
@@ -645,15 +673,17 @@ public class SqlHttpServer {
                 + "<option value='3'>Job 3</option><option value='4'>Job 4</option><option value='5'>Job 5</option>"
                 + "<option value='all'>All Jobs</option></select>"
                 + "<button onclick='runJob()'>Run Sync Job (POST /run_job)</button>"
-                + "<pre id='out'>Ready.</pre>"
+                + "<pre id='out'>Authenticated.</pre>"
                 + "<script>"
+                + "const AUTH_U=\"" + escapeJson(authUser) + "\";"
+                + "const AUTH_P=\"" + escapeJson(authPass) + "\";"
                 + "function b64Utf8(str){const bytes=new TextEncoder().encode(str);let bin='';for(let i=0;i<bytes.length;i++)bin+=String.fromCharCode(bytes[i]);return btoa(bin);}"
                 + "async function runSql(){"
-                + "const body=new URLSearchParams({user:u.value,pass:p.value,query_b64:b64Utf8(q.value)});"
+                + "const body=new URLSearchParams({user:AUTH_U,pass:AUTH_P,query_b64:b64Utf8(q.value)});"
                 + "const r=await fetch('/sql',{method:'POST',body});out.textContent=await r.text();}"
                 + "async function runJob(){"
-                + "const body=new URLSearchParams({user:u.value,pass:p.value,job:j.value});"
+                + "const body=new URLSearchParams({user:AUTH_U,pass:AUTH_P,job:j.value});"
                 + "const r=await fetch('/run_job',{method:'POST',body});out.textContent=await r.text();}"
                 + "</script></body></html>";
     }
-}
+                        }
