@@ -1728,7 +1728,7 @@ public class LuaAndroidBridge {
         }
     }
 
-    private static byte[] extractRawBytes(LuaValue val) throws Exception {
+    private static byte[] extractRawBytes(LuaValue val) {
         if (val.istable()) {
             LuaTable tbl = val.checktable();
             int len = tbl.length();
