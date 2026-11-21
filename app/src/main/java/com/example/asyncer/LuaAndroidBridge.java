@@ -40,6 +40,7 @@ import android.view.WindowManager;
 import android.webkit.WebView;
 import android.widget.DatePicker;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.TimePicker;
 import android.widget.Toast;
 
@@ -66,6 +67,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -97,6 +99,60 @@ public class LuaAndroidBridge {
     private static TextToSpeech ttsEngine;
     private static volatile boolean ttsReady = false;
     private static MediaPlayer mediaPlayer;
+    private static volatile WeakReference<Activity> activeActivityRef = new WeakReference<Activity>(null);
+
+    public static void setCurrentActivity(Activity act) {
+        activeActivityRef = new WeakReference<Activity>(act);
+    }
+
+    private static Activity resolveActivity(Activity passed) {
+        if (passed != null && !passed.isFinishing()) return passed;
+        Activity ref = activeActivityRef.get();
+        if (ref != null && !ref.isFinishing()) return ref;
+        return null;
+    }
+
+    private interface UiAction {
+        void run(Activity uiActivity, boolean isTempHost) throws Exception;
+    }
+
+    private static boolean runOnUiActivity(final Context appCtx, final Activity passedActivity,
+                                           final Handler mainHandler, final SyncRunner.LogCallback logger,
+                                           final UiAction action) {
+        final Activity existing = resolveActivity(passedActivity);
+        if (existing != null) {
+            mainHandler.post(new Runnable() {
+                public void run() {
+                    try {
+                        action.run(existing, false);
+                    } catch (Throwable t) {
+                        if (logger != null) logger.onLog("[Lua GUI Error] " + t.getMessage());
+                    }
+                }
+            });
+            return true;
+        }
+
+        try {
+            LuaDialogActivity.setPendingCallback(new LuaDialogActivity.DialogHostCallback() {
+                public void onHostReady(Activity hostActivity) {
+                    try {
+                        action.run(hostActivity, true);
+                    } catch (Throwable t) {
+                        if (logger != null) logger.onLog("[Lua GUI Error] " + t.getMessage());
+                        hostActivity.finish();
+                    }
+                }
+            });
+            Intent intent = new Intent(appCtx, LuaDialogActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            appCtx.startActivity(intent);
+            return true;
+        } catch (Throwable t) {
+            if (logger != null) logger.onLog("[Lua GUI Error] " + t.getMessage());
+            return false;
+        }
+    }
 
     public static String runLuaFile(final Context ctx, final Activity activity, String luaPath,
                                     Map<String, String> jobContext, final SyncRunner.LogCallback logger) throws Exception {
@@ -105,8 +161,9 @@ public class LuaAndroidBridge {
         final Globals globals = JsePlatform.standardGlobals();
 
         globals.set("CONTEXT", CoerceJavaToLua.coerce(appCtx));
-        if (activity != null) {
-            globals.set("ACTIVITY", CoerceJavaToLua.coerce(activity));
+        Activity resolvedAct = resolveActivity(activity);
+        if (resolvedAct != null) {
+            globals.set("ACTIVITY", CoerceJavaToLua.coerce(resolvedAct));
         }
 
         if (jobContext != null) {
@@ -155,45 +212,59 @@ public class LuaAndroidBridge {
         globals.set("dialog", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue titleArg, LuaValue msgArg) {
-                if (activity == null || activity.isFinishing()) return LuaValue.FALSE;
                 final String title = titleArg.isnil() ? "Asyncer" : titleArg.tojstring();
                 final String msg = msgArg.isnil() ? "" : msgArg.tojstring();
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        new AlertDialog.Builder(activity)
+                boolean ok = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        AlertDialog dlg = new AlertDialog.Builder(act)
                                 .setTitle(title)
                                 .setMessage(msg)
                                 .setPositiveButton("OK", null)
-                                .show();
+                                .create();
+                        if (isTemp) {
+                            dlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                                public void onDismiss(DialogInterface d) { act.finish(); }
+                            });
+                        }
+                        dlg.show();
                     }
                 });
-                return LuaValue.TRUE;
+                return LuaValue.valueOf(ok);
             }
         });
 
         globals.set("confirm", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue titleArg, LuaValue msgArg) {
-                if (activity == null || activity.isFinishing()) return LuaValue.FALSE;
                 final String title = titleArg.isnil() ? "Confirm" : titleArg.tojstring();
                 final String msg = msgArg.isnil() ? "" : msgArg.tojstring();
                 final CountDownLatch latch = new CountDownLatch(1);
                 final AtomicBoolean result = new AtomicBoolean(false);
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        new AlertDialog.Builder(activity)
+                boolean launched = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        AlertDialog dlg = new AlertDialog.Builder(act)
                                 .setTitle(title)
                                 .setMessage(msg)
                                 .setCancelable(false)
                                 .setPositiveButton("Yes", new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface d, int w) { result.set(true); latch.countDown(); }
+                                    public void onClick(DialogInterface d, int w) {
+                                        result.set(true);
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
                                 .setNegativeButton("No", new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface d, int w) { result.set(false); latch.countDown(); }
+                                    public void onClick(DialogInterface d, int w) {
+                                        result.set(false);
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
-                                .show();
+                                .create();
+                        dlg.show();
                     }
                 });
+                if (!launched) return LuaValue.FALSE;
                 try { latch.await(); } catch (InterruptedException ignored) {}
                 return LuaValue.valueOf(result.get());
             }
@@ -202,30 +273,38 @@ public class LuaAndroidBridge {
         globals.set("prompt", new ThreeArgFunction() {
             @Override
             public LuaValue call(LuaValue titleArg, LuaValue msgArg, LuaValue defArg) {
-                if (activity == null || activity.isFinishing()) return LuaValue.NIL;
                 final String title = titleArg.isnil() ? "Input" : titleArg.tojstring();
                 final String msg = msgArg.isnil() ? "" : msgArg.tojstring();
                 final String defVal = defArg.isnil() ? "" : defArg.tojstring();
                 final CountDownLatch latch = new CountDownLatch(1);
                 final AtomicReference<String> result = new AtomicReference<String>(null);
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        final EditText input = new EditText(activity);
+                boolean launched = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        final EditText input = new EditText(act);
                         input.setText(defVal);
-                        new AlertDialog.Builder(activity)
+                        new AlertDialog.Builder(act)
                                 .setTitle(title)
                                 .setMessage(msg)
                                 .setView(input)
                                 .setCancelable(false)
                                 .setPositiveButton("OK", new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface d, int w) { result.set(input.getText().toString()); latch.countDown(); }
+                                    public void onClick(DialogInterface d, int w) {
+                                        result.set(input.getText().toString());
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
                                 .setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface d, int w) { result.set(null); latch.countDown(); }
+                                    public void onClick(DialogInterface d, int w) {
+                                        result.set(null);
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
                                 .show();
                     }
                 });
+                if (!launched) return LuaValue.NIL;
                 try { latch.await(); } catch (InterruptedException ignored) {}
                 String out = result.get();
                 return out != null ? LuaValue.valueOf(out) : LuaValue.NIL;
@@ -235,7 +314,6 @@ public class LuaAndroidBridge {
         globals.set("choose", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
-                if (activity == null || activity.isFinishing()) return LuaValue.NIL;
                 final String title = args.arg(1).isnil() ? "Select" : args.arg(1).tojstring();
                 LuaTable tbl = args.arg(2).checktable();
                 int len = tbl.length();
@@ -243,19 +321,28 @@ public class LuaAndroidBridge {
                 for (int i = 0; i < len; i++) items[i] = tbl.get(i + 1).tojstring();
                 final CountDownLatch latch = new CountDownLatch(1);
                 final AtomicInteger chosen = new AtomicInteger(-1);
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        new AlertDialog.Builder(activity)
+                boolean launched = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        new AlertDialog.Builder(act)
                                 .setTitle(title)
                                 .setItems(items, new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface d, int which) { chosen.set(which); latch.countDown(); }
+                                    public void onClick(DialogInterface d, int which) {
+                                        chosen.set(which);
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
                                 .setOnCancelListener(new DialogInterface.OnCancelListener() {
-                                    public void onCancel(DialogInterface d) { chosen.set(-1); latch.countDown(); }
+                                    public void onCancel(DialogInterface d) {
+                                        chosen.set(-1);
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
                                 .show();
                     }
                 });
+                if (!launched) return LuaValue.NIL;
                 try { latch.await(); } catch (InterruptedException ignored) {}
                 int idx = chosen.get();
                 if (idx < 0 || idx >= items.length) return LuaValue.NIL;
@@ -263,11 +350,9 @@ public class LuaAndroidBridge {
             }
         });
 
-        // multi_choose(title, itemsTable, checkedTable) -> selectedIndicesTable, selectedLabelsTable
         globals.set("multi_choose", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
-                if (activity == null || activity.isFinishing()) return LuaValue.NIL;
                 final String title = args.arg(1).isnil() ? "Select Items" : args.arg(1).tojstring();
                 LuaTable tbl = args.arg(2).checktable();
                 LuaTable pre = args.arg(3).istable() ? args.arg(3).checktable() : null;
@@ -280,9 +365,9 @@ public class LuaAndroidBridge {
                 }
                 final CountDownLatch latch = new CountDownLatch(1);
                 final AtomicBoolean confirmed = new AtomicBoolean(false);
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        new AlertDialog.Builder(activity)
+                boolean launched = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        new AlertDialog.Builder(act)
                                 .setTitle(title)
                                 .setMultiChoiceItems(items, checked, new DialogInterface.OnMultiChoiceClickListener() {
                                     public void onClick(DialogInterface d, int which, boolean isChecked) {
@@ -290,14 +375,23 @@ public class LuaAndroidBridge {
                                     }
                                 })
                                 .setPositiveButton("OK", new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface d, int w) { confirmed.set(true); latch.countDown(); }
+                                    public void onClick(DialogInterface d, int w) {
+                                        confirmed.set(true);
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
                                 .setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface d, int w) { confirmed.set(false); latch.countDown(); }
+                                    public void onClick(DialogInterface d, int w) {
+                                        confirmed.set(false);
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
                                 })
                                 .show();
                     }
                 });
+                if (!launched) return LuaValue.NIL;
                 try { latch.await(); } catch (InterruptedException ignored) {}
                 if (!confirmed.get()) return LuaValue.NIL;
                 LuaTable idxTbl = new LuaTable();
@@ -314,104 +408,104 @@ public class LuaAndroidBridge {
             }
         });
 
-        // date_picker(year, month1To12, day) -> "YYYY-MM-DD", year, month, day
         globals.set("date_picker", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
-                if (activity == null || activity.isFinishing()) return LuaValue.NIL;
                 Calendar cal = Calendar.getInstance();
                 final int initY = args.arg(1).isint() ? args.arg(1).toint() : cal.get(Calendar.YEAR);
                 final int initM = args.arg(2).isint() ? (args.arg(2).toint() - 1) : cal.get(Calendar.MONTH);
                 final int initD = args.arg(3).isint() ? args.arg(3).toint() : cal.get(Calendar.DAY_OF_MONTH);
-
                 final CountDownLatch latch = new CountDownLatch(1);
                 final AtomicReference<int[]> picked = new AtomicReference<int[]>(null);
 
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        DatePickerDialog dlg = new DatePickerDialog(activity, new DatePickerDialog.OnDateSetListener() {
+                boolean launched = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        DatePickerDialog dlg = new DatePickerDialog(act, new DatePickerDialog.OnDateSetListener() {
                             public void onDateSet(DatePicker view, int year, int monthOfYear, int dayOfMonth) {
                                 picked.set(new int[] { year, monthOfYear + 1, dayOfMonth });
+                                if (isTemp) act.finish();
                                 latch.countDown();
                             }
                         }, initY, initM, initD);
                         dlg.setOnCancelListener(new DialogInterface.OnCancelListener() {
-                            public void onCancel(DialogInterface d) { latch.countDown(); }
+                            public void onCancel(DialogInterface d) {
+                                if (isTemp) act.finish();
+                                latch.countDown();
+                            }
                         });
                         dlg.show();
                     }
                 });
+                if (!launched) return LuaValue.NIL;
                 try { latch.await(); } catch (InterruptedException ignored) {}
                 int[] res = picked.get();
                 if (res == null) return LuaValue.NIL;
                 String formatted = String.format(Locale.US, "%04d-%02d-%02d", res[0], res[1], res[2]);
                 return LuaValue.varargsOf(new LuaValue[] {
-                        LuaValue.valueOf(formatted),
-                        LuaValue.valueOf(res[0]),
-                        LuaValue.valueOf(res[1]),
-                        LuaValue.valueOf(res[2])
+                        LuaValue.valueOf(formatted), LuaValue.valueOf(res[0]), LuaValue.valueOf(res[1]), LuaValue.valueOf(res[2])
                 });
             }
         });
 
-        // time_picker(hour, minute, is24Hour) -> "HH:MM", hour, minute
         globals.set("time_picker", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
-                if (activity == null || activity.isFinishing()) return LuaValue.NIL;
                 Calendar cal = Calendar.getInstance();
                 final int initH = args.arg(1).isint() ? args.arg(1).toint() : cal.get(Calendar.HOUR_OF_DAY);
                 final int initMin = args.arg(2).isint() ? args.arg(2).toint() : cal.get(Calendar.MINUTE);
                 final boolean is24 = args.arg(3).isnil() ? true : args.arg(3).toboolean();
-
                 final CountDownLatch latch = new CountDownLatch(1);
                 final AtomicReference<int[]> picked = new AtomicReference<int[]>(null);
 
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        TimePickerDialog dlg = new TimePickerDialog(activity, new TimePickerDialog.OnTimeSetListener() {
+                boolean launched = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        TimePickerDialog dlg = new TimePickerDialog(act, new TimePickerDialog.OnTimeSetListener() {
                             public void onTimeSet(TimePicker view, int hourOfDay, int minute) {
                                 picked.set(new int[] { hourOfDay, minute });
+                                if (isTemp) act.finish();
                                 latch.countDown();
                             }
                         }, initH, initMin, is24);
                         dlg.setOnCancelListener(new DialogInterface.OnCancelListener() {
-                            public void onCancel(DialogInterface d) { latch.countDown(); }
+                            public void onCancel(DialogInterface d) {
+                                if (isTemp) act.finish();
+                                latch.countDown();
+                            }
                         });
                         dlg.show();
                     }
                 });
+                if (!launched) return LuaValue.NIL;
                 try { latch.await(); } catch (InterruptedException ignored) {}
                 int[] res = picked.get();
                 if (res == null) return LuaValue.NIL;
                 String formatted = String.format(Locale.US, "%02d:%02d", res[0], res[1]);
                 return LuaValue.varargsOf(new LuaValue[] {
-                        LuaValue.valueOf(formatted),
-                        LuaValue.valueOf(res[0]),
-                        LuaValue.valueOf(res[1])
+                        LuaValue.valueOf(formatted), LuaValue.valueOf(res[0]), LuaValue.valueOf(res[1])
                 });
             }
         });
 
-        // progress_dialog(title, message) -> controller table { update(msg), close() }
         globals.set("progress_dialog", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue titleArg, LuaValue msgArg) {
                 final String title = titleArg.isnil() ? "Working..." : titleArg.tojstring();
                 final String msg = msgArg.isnil() ? "" : msgArg.tojstring();
                 final AtomicReference<ProgressDialog> dlgRef = new AtomicReference<ProgressDialog>(null);
-                if (activity != null && !activity.isFinishing()) {
-                    mainHandler.post(new Runnable() {
-                        public void run() {
-                            ProgressDialog pd = new ProgressDialog(activity);
-                            pd.setTitle(title);
-                            pd.setMessage(msg);
-                            pd.setCancelable(false);
-                            pd.show();
-                            dlgRef.set(pd);
-                        }
-                    });
-                }
+                final AtomicReference<Activity> tempActRef = new AtomicReference<Activity>(null);
+
+                runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(Activity act, boolean isTemp) {
+                        if (isTemp) tempActRef.set(act);
+                        ProgressDialog pd = new ProgressDialog(act);
+                        pd.setTitle(title);
+                        pd.setMessage(msg);
+                        pd.setCancelable(false);
+                        pd.show();
+                        dlgRef.set(pd);
+                    }
+                });
+
                 LuaTable ctrl = new LuaTable();
                 ctrl.set("update", new OneArgFunction() {
                     @Override
@@ -433,6 +527,8 @@ public class LuaAndroidBridge {
                             public void run() {
                                 ProgressDialog pd = dlgRef.get();
                                 if (pd != null && pd.isShowing()) pd.dismiss();
+                                Activity temp = tempActRef.get();
+                                if (temp != null && !temp.isFinishing()) temp.finish();
                             }
                         });
                         return LuaValue.NIL;
@@ -442,30 +538,43 @@ public class LuaAndroidBridge {
             }
         });
 
-        // html_dialog(title, htmlOrUrl) -> renders HTML string or URL inside a WebView dialog
         globals.set("html_dialog", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue titleArg, LuaValue contentArg) {
-                if (activity == null || activity.isFinishing()) return LuaValue.FALSE;
                 final String title = titleArg.isnil() ? "Asyncer" : titleArg.tojstring();
                 final String content = contentArg.tojstring();
-                mainHandler.post(new Runnable() {
-                    public void run() {
-                        WebView wv = new WebView(activity);
+                boolean ok = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                    public void run(final Activity act, final boolean isTemp) {
+                        LinearLayout container = new LinearLayout(act);
+                        container.setOrientation(LinearLayout.VERTICAL);
+                        int minHeightPx = (int) (260 * act.getResources().getDisplayMetrics().density);
+
+                        WebView wv = new WebView(act);
                         wv.getSettings().setJavaScriptEnabled(true);
+                        wv.setMinimumHeight(minHeightPx);
+                        container.addView(wv, new LinearLayout.LayoutParams(
+                                LinearLayout.LayoutParams.MATCH_PARENT, minHeightPx));
+
                         if (content.startsWith("http://") || content.startsWith("https://") || content.startsWith("file://")) {
                             wv.loadUrl(content);
                         } else {
                             wv.loadDataWithBaseURL(null, content, "text/html", "UTF-8", null);
                         }
-                        new AlertDialog.Builder(activity)
+
+                        AlertDialog dlg = new AlertDialog.Builder(act)
                                 .setTitle(title)
-                                .setView(wv)
+                                .setView(container)
                                 .setPositiveButton("Close", null)
-                                .show();
+                                .create();
+                        if (isTemp) {
+                            dlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                                public void onDismiss(DialogInterface d) { act.finish(); }
+                            });
+                        }
+                        dlg.show();
                     }
                 });
-                return LuaValue.TRUE;
+                return LuaValue.valueOf(ok);
             }
         });
 
@@ -485,12 +594,13 @@ public class LuaAndroidBridge {
         globals.set("keep_screen_on", new OneArgFunction() {
             @Override
             public LuaValue call(LuaValue onArg) {
-                if (activity == null) return LuaValue.FALSE;
+                final Activity act = resolveActivity(activity);
+                if (act == null) return LuaValue.FALSE;
                 final boolean on = onArg.toboolean();
                 mainHandler.post(new Runnable() {
                     public void run() {
-                        if (on) activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                        else activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        if (on) act.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        else act.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     }
                 });
                 return LuaValue.TRUE;
@@ -559,7 +669,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // http_get(url, headersTable, trustAllCerts) -> statusCode, body
         globals.set("http_get", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -570,7 +679,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // http_post(url, body, contentType, headersTable, trustAllCerts) -> statusCode, body
         globals.set("http_post", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -583,7 +691,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // http_request(method, url, body, contentType, headersTable, trustAllCerts) -> statusCode, body
         globals.set("http_request", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -616,7 +723,6 @@ public class LuaAndroidBridge {
         // =====================================================================
         // 4. FTP CLIENT FUNCTIONS
         // =====================================================================
-        // ftp_upload(host, port, user, pass, localPath, remotePath) -> ok, reply
         globals.set("ftp_upload", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -641,7 +747,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // ftp_download(host, port, user, pass, remotePath, localPath) -> ok, reply
         globals.set("ftp_download", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -666,7 +771,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // ftp_list(host, port, user, pass, remoteDir, recursive) -> itemsTable, error
         globals.set("ftp_list", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -701,7 +805,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // ftp_delete(host, port, user, pass, remotePath, isDir) -> boolean
         globals.set("ftp_delete", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -723,7 +826,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // ftp_mkdir(host, port, user, pass, remoteDir) -> boolean
         globals.set("ftp_mkdir", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -747,7 +849,6 @@ public class LuaAndroidBridge {
         // =====================================================================
         // 5. SMB CLIENT FUNCTIONS
         // =====================================================================
-        // smb_shares(host, port, user, pass) -> sharesTable, error
         globals.set("smb_shares", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -769,7 +870,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // smb_upload(host, port, user, pass, share, localPath, remoteRelPath) -> boolean
         globals.set("smb_upload", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -788,7 +888,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // smb_download(host, port, user, pass, share, remoteRelPath, localPath) -> boolean
         globals.set("smb_download", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -807,7 +906,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // smb_list(host, port, user, pass, share, remoteRelDir) -> itemsTable, error
         globals.set("smb_list", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -839,7 +937,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // smb_delete(host, port, user, pass, share, remoteRelPath) -> boolean
         globals.set("smb_delete", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -856,7 +953,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // smb_mkdir(host, port, user, pass, share, remoteRelDir) -> boolean
         globals.set("smb_mkdir", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
@@ -876,7 +972,6 @@ public class LuaAndroidBridge {
         // =====================================================================
         // 6. TEXT-TO-SPEECH (SPEAK) & AUDIO PLAYBACK
         // =====================================================================
-        // speak(text, rate, pitch) -> boolean
         globals.set("speak", new ThreeArgFunction() {
             @Override
             public LuaValue call(LuaValue textArg, LuaValue rateArg, LuaValue pitchArg) {
@@ -895,7 +990,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // play_sound(filePathOrUrl, loop) -> boolean
         globals.set("play_sound", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue srcArg, LuaValue loopArg) {
@@ -940,7 +1034,6 @@ public class LuaAndroidBridge {
         // =====================================================================
         // 7. BINARY, BASE64, HEX & CRYPTOGRAPHIC HASH HELPERS
         // =====================================================================
-        // read_binary(path) -> raw byte LuaString
         globals.set("read_binary", new OneArgFunction() {
             @Override
             public LuaValue call(LuaValue pathArg) {
@@ -951,7 +1044,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // write_binary(path, luaStringOrByteTable, append) -> boolean
         globals.set("write_binary", new ThreeArgFunction() {
             @Override
             public LuaValue call(LuaValue pathArg, LuaValue dataArg, LuaValue appendArg) {
@@ -972,7 +1064,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // read_bytes(path) -> 1-based Lua table of integer bytes (0..255)
         globals.set("read_bytes", new OneArgFunction() {
             @Override
             public LuaValue call(LuaValue pathArg) {
@@ -987,7 +1078,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // write_bytes(path, byteTable, append) -> boolean
         globals.set("write_bytes", new ThreeArgFunction() {
             @Override
             public LuaValue call(LuaValue pathArg, LuaValue tblArg, LuaValue appendArg) {
@@ -1045,7 +1135,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // hash_data(algorithm, data) -> hex digest ("MD5", "SHA-1", "SHA-256")
         globals.set("hash_data", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue algoArg, LuaValue dataArg) {
@@ -1057,7 +1146,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // hash_file(algorithm, path) -> hex digest
         globals.set("hash_file", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue algoArg, LuaValue pathArg) {
@@ -1122,7 +1210,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // copy_file(srcPath, dstPath) -> recursive copy for directories or buffered stream copy for files
         globals.set("copy_file", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue srcArg, LuaValue dstArg) {
@@ -1133,7 +1220,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // move_file(srcPath, dstPath) -> tries renameTo(), falls back to copy + delete across volumes
         globals.set("move_file", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue srcArg, LuaValue dstArg) {
@@ -1150,7 +1236,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // rename_file(srcPath, newNameOrFullPath) -> boolean
         globals.set("rename_file", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue srcArg, LuaValue newArg) {
@@ -1246,7 +1331,6 @@ public class LuaAndroidBridge {
             }
         });
 
-        // read_sensor(typeOrName, timeoutMs) -> {x, y, z, values={...}, accuracy, name}
         globals.set("read_sensor", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue typeArg, LuaValue timeoutArg) {
@@ -1322,7 +1406,7 @@ public class LuaAndroidBridge {
             public LuaValue call(LuaValue jobArg) {
                 int j = jobArg.toint();
                 if (j >= 1 && j <= 5) j = j - 1;
-                return LuaValue.valueOf(SyncRunner.runJobAndScript(appCtx, activity, j, false, logger));
+                return LuaValue.valueOf(SyncRunner.runJobAndScript(appCtx, resolveActivity(activity), j, false, logger));
             }
         });
 
@@ -1983,4 +2067,4 @@ public class LuaAndroidBridge {
             if (notif != null) nm.notify(id, notif);
         } catch (Throwable ignored) {}
     }
-}
+                                                         }
