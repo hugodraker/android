@@ -4,9 +4,16 @@
     android:versionCode="1"
     android:versionName="1.0">
 
-    <!-- Network Permissions -->
+    <!-- Network & System Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Location Permissions -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <!-- Storage Permissions (Android 1.6 to Android 15+) -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
@@ -43,10 +50,15 @@
 
         <receiver
             android:name=".BootReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
