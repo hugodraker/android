@@ -5,9 +5,12 @@ import android.content.Context;
 import android.os.Environment;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.FileReader;
-import java.io.InputStreamReader;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -21,6 +24,12 @@ public class SyncRunner {
     public static class IniConfig {
         public Map<String, String> global = new HashMap<String, String>();
         public Map<Integer, Map<String, String>> jobs = new HashMap<Integer, Map<String, String>>();
+    }
+
+    public static class ShellResult {
+        public int exitCode;
+        public String stdout;
+        public String stderr;
     }
 
     public static IniConfig loadIniConfig(File iniFile) {
@@ -203,25 +212,71 @@ public class SyncRunner {
                 return LuaAndroidBridge.runLuaFile(ctx, activity, cmdOrPath, jobContext, logger);
             } else {
                 if (logger != null) logger.onLog("Running shell command: " + cmdOrPath);
-                Process proc = Runtime.getRuntime().exec(new String[] { "sh", "-c", cmdOrPath });
-                BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()));
-                StringBuilder out = new StringBuilder();
-                String line;
-                while ((line = br.readLine()) != null) {
-                    if (out.length() > 0) out.append('\n');
-                    out.append(line);
-                }
-                br.close();
-                int code = proc.waitFor();
-                String res = "exit=" + code + (out.length() > 0 ? (" output=" + out.toString()) : "");
-                if (logger != null) logger.onLog("Shell finished: " + res);
-                return res;
+                ShellResult sr = runAndroidShell(ctx, cmdOrPath);
+                StringBuilder res = new StringBuilder();
+                res.append("exit=").append(sr.exitCode);
+                if (sr.stdout.length() > 0) res.append("\n").append(sr.stdout);
+                if (sr.stderr.length() > 0) res.append("\n[stderr] ").append(sr.stderr);
+                String outStr = res.toString();
+                if (logger != null) logger.onLog("Shell finished: " + outStr);
+                return outStr;
             }
         } catch (Exception e) {
             String err = "Error: " + e.getMessage();
             if (logger != null) logger.onLog(err);
             return err;
         }
+    }
+
+    public static ShellResult runAndroidShell(Context ctx, String cmdOrScript) throws Exception {
+        ShellResult sr = new ShellResult();
+        String shBin = new File("/system/bin/sh").exists() ? "/system/bin/sh" : "sh";
+        String trimmed = cmdOrScript.trim();
+
+        String[] argv;
+        File maybeScript = new File(trimmed);
+        if (maybeScript.exists() && maybeScript.isFile()) {
+            // Normalize CRLF to LF into cacheDir so /sdcard noexec and Windows line endings work cleanly
+            File tmpScript = new File(ctx.getCacheDir(), "asyncer_run.sh");
+            FileInputStream fis = new FileInputStream(maybeScript);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = fis.read(buf)) > 0) {
+                for (int i = 0; i < n; i++) {
+                    if (buf[i] != '\r') baos.write(buf[i]);
+                }
+            }
+            fis.close();
+            FileOutputStream fos = new FileOutputStream(tmpScript, false);
+            fos.write(baos.toByteArray());
+            fos.flush();
+            fos.close();
+            argv = new String[] { shBin, tmpScript.getAbsolutePath() };
+        } else {
+            String cleanCmd = trimmed.replace("\r\n", "\n").replace('\r', '\n');
+            argv = new String[] { shBin, "-c", cleanCmd };
+        }
+
+        String[] envp = new String[] {
+                "PATH=/system/bin:/system/xbin:/sbin:/vendor/bin:/su/bin",
+                "TMPDIR=" + ctx.getCacheDir().getAbsolutePath()
+        };
+
+        Process proc = Runtime.getRuntime().exec(argv, envp, ctx.getFilesDir());
+        sr.stdout = readAllUtf8(proc.getInputStream());
+        sr.stderr = readAllUtf8(proc.getErrorStream());
+        sr.exitCode = proc.waitFor();
+        return sr;
+    }
+
+    private static String readAllUtf8(InputStream is) throws Exception {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
+        int n;
+        while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
+        is.close();
+        return baos.toString("UTF-8").trim();
     }
 
     private static int syncLocalToSmb(SmbClient client, File localFolder, String remoteSubPath,
@@ -401,4 +456,4 @@ public class SyncRunner {
             return def;
         }
     }
-}
+                        }
