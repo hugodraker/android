@@ -35,12 +35,15 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Vibrator;
 import android.speech.tts.TextToSpeech;
+import android.text.Html;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
 import android.webkit.WebView;
 import android.widget.DatePicker;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.TimePicker;
 import android.widget.Toast;
 
@@ -102,7 +105,9 @@ public class LuaAndroidBridge {
     private static volatile WeakReference<Activity> activeActivityRef = new WeakReference<Activity>(null);
 
     public static void setCurrentActivity(Activity act) {
-        activeActivityRef = new WeakReference<Activity>(act);
+        if (act != null) {
+            activeActivityRef = new WeakReference<Activity>(act);
+        }
     }
 
     private static Activity resolveActivity(Activity passed) {
@@ -126,7 +131,7 @@ public class LuaAndroidBridge {
                     try {
                         action.run(existing, false);
                     } catch (Throwable t) {
-                        if (logger != null) logger.onLog("[Lua GUI Error] " + t.getMessage());
+                        if (logger != null) logger.onLog("[Lua GUI Error] " + t.toString());
                     }
                 }
             });
@@ -139,7 +144,7 @@ public class LuaAndroidBridge {
                     try {
                         action.run(hostActivity, true);
                     } catch (Throwable t) {
-                        if (logger != null) logger.onLog("[Lua GUI Error] " + t.getMessage());
+                        if (logger != null) logger.onLog("[Lua GUI Error] " + t.toString());
                         hostActivity.finish();
                     }
                 }
@@ -149,7 +154,7 @@ public class LuaAndroidBridge {
             appCtx.startActivity(intent);
             return true;
         } catch (Throwable t) {
-            if (logger != null) logger.onLog("[Lua GUI Error] " + t.getMessage());
+            if (logger != null) logger.onLog("[Lua GUI Error] " + t.toString());
             return false;
         }
     }
@@ -195,7 +200,7 @@ public class LuaAndroidBridge {
         });
 
         // =====================================================================
-        // 2. ANDROID GUI DIALOGS, PICKERS, PROGRESS, WEBVIEW & DISPLAY
+        // 2. ANDROID GUI DIALOGS, PICKERS, PROGRESS, HTML POPUP & DISPLAY
         // =====================================================================
         globals.set("toast", new TwoArgFunction() {
             @Override
@@ -209,27 +214,38 @@ public class LuaAndroidBridge {
             }
         });
 
+        // dialog(title, message) -> blocks until user taps OK so dialogs never vanish prematurely
         globals.set("dialog", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue titleArg, LuaValue msgArg) {
                 final String title = titleArg.isnil() ? "Asyncer" : titleArg.tojstring();
                 final String msg = msgArg.isnil() ? "" : msgArg.tojstring();
-                boolean ok = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
+                final CountDownLatch latch = new CountDownLatch(1);
+                boolean launched = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
                     public void run(final Activity act, final boolean isTemp) {
                         AlertDialog dlg = new AlertDialog.Builder(act)
                                 .setTitle(title)
                                 .setMessage(msg)
-                                .setPositiveButton("OK", null)
+                                .setCancelable(true)
+                                .setPositiveButton("OK", new DialogInterface.OnClickListener() {
+                                    public void onClick(DialogInterface d, int w) {
+                                        if (isTemp) act.finish();
+                                        latch.countDown();
+                                    }
+                                })
                                 .create();
-                        if (isTemp) {
-                            dlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
-                                public void onDismiss(DialogInterface d) { act.finish(); }
-                            });
-                        }
+                        dlg.setOnCancelListener(new DialogInterface.OnCancelListener() {
+                            public void onCancel(DialogInterface d) {
+                                if (isTemp) act.finish();
+                                latch.countDown();
+                            }
+                        });
                         dlg.show();
                     }
                 });
-                return LuaValue.valueOf(ok);
+                if (!launched) return LuaValue.FALSE;
+                try { latch.await(); } catch (InterruptedException ignored) {}
+                return LuaValue.TRUE;
             }
         });
 
@@ -538,43 +554,58 @@ public class LuaAndroidBridge {
             }
         });
 
+        // html_dialog(title, htmlOrUrl) -> blocks until closed; renders HTML reliably with ScrollView + Html.fromHtml (or WebView for URLs)
         globals.set("html_dialog", new TwoArgFunction() {
             @Override
             public LuaValue call(LuaValue titleArg, LuaValue contentArg) {
                 final String title = titleArg.isnil() ? "Asyncer" : titleArg.tojstring();
                 final String content = contentArg.tojstring();
+                final CountDownLatch latch = new CountDownLatch(1);
+
                 boolean ok = runOnUiActivity(appCtx, activity, mainHandler, logger, new UiAction() {
                     public void run(final Activity act, final boolean isTemp) {
-                        LinearLayout container = new LinearLayout(act);
-                        container.setOrientation(LinearLayout.VERTICAL);
-                        int minHeightPx = (int) (260 * act.getResources().getDisplayMetrics().density);
-
-                        WebView wv = new WebView(act);
-                        wv.getSettings().setJavaScriptEnabled(true);
-                        wv.setMinimumHeight(minHeightPx);
-                        container.addView(wv, new LinearLayout.LayoutParams(
-                                LinearLayout.LayoutParams.MATCH_PARENT, minHeightPx));
+                        AlertDialog.Builder b = new AlertDialog.Builder(act).setTitle(title);
 
                         if (content.startsWith("http://") || content.startsWith("https://") || content.startsWith("file://")) {
+                            LinearLayout container = new LinearLayout(act);
+                            container.setOrientation(LinearLayout.VERTICAL);
+                            int minHeightPx = (int) (320 * act.getResources().getDisplayMetrics().density);
+                            WebView wv = new WebView(act);
+                            wv.getSettings().setJavaScriptEnabled(true);
+                            wv.setMinimumHeight(minHeightPx);
+                            container.addView(wv, new LinearLayout.LayoutParams(
+                                    LinearLayout.LayoutParams.MATCH_PARENT, minHeightPx));
                             wv.loadUrl(content);
+                            b.setView(container);
                         } else {
-                            wv.loadDataWithBaseURL(null, content, "text/html", "UTF-8", null);
+                            ScrollView sv = new ScrollView(act);
+                            TextView tv = new TextView(act);
+                            tv.setPadding(24, 16, 24, 16);
+                            tv.setTextSize(15.0f);
+                            tv.setText(Html.fromHtml(content));
+                            sv.addView(tv);
+                            b.setView(sv);
                         }
 
-                        AlertDialog dlg = new AlertDialog.Builder(act)
-                                .setTitle(title)
-                                .setView(container)
-                                .setPositiveButton("Close", null)
-                                .create();
-                        if (isTemp) {
-                            dlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
-                                public void onDismiss(DialogInterface d) { act.finish(); }
-                            });
-                        }
+                        b.setPositiveButton("Close", new DialogInterface.OnClickListener() {
+                            public void onClick(DialogInterface d, int w) {
+                                if (isTemp) act.finish();
+                                latch.countDown();
+                            }
+                        });
+                        AlertDialog dlg = b.create();
+                        dlg.setOnCancelListener(new DialogInterface.OnCancelListener() {
+                            public void onCancel(DialogInterface d) {
+                                if (isTemp) act.finish();
+                                latch.countDown();
+                            }
+                        });
                         dlg.show();
                     }
                 });
-                return LuaValue.valueOf(ok);
+                if (!ok) return LuaValue.FALSE;
+                try { latch.await(); } catch (InterruptedException ignored) {}
+                return LuaValue.TRUE;
             }
         });
 
@@ -1431,17 +1462,15 @@ public class LuaAndroidBridge {
             }
         });
 
+        // shell(cmdOrScriptPath) -> exitCode, stdout, stderr (uses /system/bin/sh + full PATH)
         globals.set("shell", new VarArgFunction() {
             @Override
             public Varargs invoke(Varargs args) {
                 String cmd = args.arg(1).checkjstring();
                 try {
-                    Process p = Runtime.getRuntime().exec(new String[] { "sh", "-c", cmd });
-                    String stdout = readStreamUtf8(p.getInputStream());
-                    String stderr = readStreamUtf8(p.getErrorStream());
-                    int code = p.waitFor();
+                    SyncRunner.ShellResult sr = SyncRunner.runAndroidShell(appCtx, cmd);
                     return LuaValue.varargsOf(new LuaValue[] {
-                            LuaValue.valueOf(code), LuaValue.valueOf(stdout), LuaValue.valueOf(stderr)
+                            LuaValue.valueOf(sr.exitCode), LuaValue.valueOf(sr.stdout), LuaValue.valueOf(sr.stderr)
                     });
                 } catch (Exception e) {
                     return LuaValue.varargsOf(new LuaValue[] {
@@ -2067,4 +2096,4 @@ public class LuaAndroidBridge {
             if (notif != null) nm.notify(id, notif);
         } catch (Throwable ignored) {}
     }
-                                                         }
+    }
