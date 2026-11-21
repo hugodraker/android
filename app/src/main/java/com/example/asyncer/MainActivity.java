@@ -78,6 +78,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        LuaAndroidBridge.setCurrentActivity(this);
         try {
             requestWindowFeature(Window.FEATURE_LEFT_ICON);
         } catch (Throwable ignored) {}
@@ -375,6 +376,12 @@ public class MainActivity extends Activity {
                 BootReceiver.startServiceCompat(this, new Intent(this, AsyncerService.class));
             } catch (Exception ignored) {}
         }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        LuaAndroidBridge.setCurrentActivity(this);
     }
 
     private void applySqlHttpServerState() {
@@ -852,7 +859,6 @@ public class MainActivity extends Activity {
         final List<File> entries = new ArrayList<File>();
         final List<String> labels = new ArrayList<String>();
 
-        // Quick jump shortcuts
         entries.add(getFilesDir());
         labels.add("[App Internal Storage: " + getFilesDir().getAbsolutePath() + "]");
 
@@ -1038,4 +1044,4 @@ public class MainActivity extends Activity {
             return def;
         }
     }
-}
+                                                   }
